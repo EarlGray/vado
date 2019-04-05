@@ -55,6 +55,7 @@ data Style = Style
   , styleFontSize :: !(Maybe Double)
   , styleLineHeight :: !(Maybe Double)
   , styleFontStyle :: !(Maybe FontStyle)
+  , styleFontFamily :: !(Maybe String)
   } deriving (Show)
 
 -- | Display style.
@@ -89,6 +90,7 @@ data TextBox = Text
   { textXY :: !(V2 Double)
   , textWH :: !(V2 Double)
   , textColor :: !Canvas.Color
+  , textFont :: !String
   , textWeight :: !FontWeight
   , textStyle :: !FontStyle
   , textSize :: !Double
@@ -445,6 +447,7 @@ textToBoxes ls0 events style maxWidth t = do
               , textWH = wh
               , textColor = color
               , textWeight = weight
+              , textFont = font
               , textSize = fontSize scale
               , textText = word
               , textStyle = fontStyle
@@ -452,6 +455,7 @@ textToBoxes ls0 events style maxWidth t = do
     ls0
     (T.words t)
   where
+    font = fromMaybe defaultFontFace (styleFontFamily style)
     fontStyle = fromMaybe defaultFontStyle (styleFontStyle style)
     space scale = (fontSize scale / 2)
     color = fromMaybe defaultColor (styleColor style)
@@ -470,7 +474,7 @@ textToBoxes ls0 events style maxWidth t = do
     measure w =
       Measuring
         (do scale <- ask
-            lift (Canvas.textFont (Canvas.Font defaultFontFace (fontSize scale) bold italic))
+            lift (Canvas.textFont (Canvas.Font font (fontSize scale) bold italic))
             lift (Canvas.textSize (T.unpack w)))
     extents = Measuring (lift Canvas.fontExtents)
 
@@ -517,7 +521,7 @@ rerender scale ev = do
                Canvas.stroke (textColor text)
                Canvas.textFont
                  (Canvas.Font
-                    "Arial"
+                    (textFont text)
                     (textSize text)
                     (case textWeight text of
                        BoldWeight -> True
@@ -554,6 +558,7 @@ mergeStyles inherited element =
   , styleBackgroundColor =
       styleBackgroundColor element <|> styleBackgroundColor inherited
   , styleColor = styleColor element <|> styleColor inherited
+  , styleFontFamily = styleFontFamily element <|> styleFontFamily inherited
   , styleFontWeight = styleFontWeight element <|> styleFontWeight inherited
   , styleDisplay = styleDisplay element
   , styleFontSize = styleFontSize element <|> styleFontSize inherited
@@ -572,6 +577,7 @@ defaultStyle =
   , styleColor = Nothing
   , styleFontWeight = Nothing
   , styleDisplay = BlockDisplay
+  , styleFontFamily = Nothing
   , styleFontSize = Nothing
   , styleWidth = Nothing
   , styleLineHeight = Nothing
@@ -596,7 +602,7 @@ elementStyles =
      , inline "abbr"
      , inline "acronym"
      , inline "cite"
-     , inline "code"
+     , inline' "code" (\s -> s {styleFontFamily = Just "monospace"})
      , inline "dfn"
      , inline' "em" (\s -> s {styleFontStyle = Just ItalicStyle})
      , inline "kbd"
@@ -609,6 +615,7 @@ elementStyles =
      , inline "img"
      , inline "map"
      , inline "object"
+     , inline' "pre" (\s -> s {styleFontFamily = Just "monospace"})
      , inline "q"
      , inline "script"
      , inline "span"
