@@ -11,7 +11,6 @@ import           Control.Arrow
 import           Control.Monad
 import           Control.Monad.Reader
 import qualified Data.ByteString.Lazy as B
-import           Data.Char
 import qualified Data.HashMap.Strict as HM
 import           Data.List
 import qualified Data.Map.Strict as M
@@ -42,6 +41,7 @@ data Content
   = ElementContent !Text !Events !Style ![Content]
   | TextContent !Text
   | ImageContent !Text !(Maybe (V2 Double)) !(Maybe SDL.Surface) -- !(Maybe Text)
+  | NewlineContent
 
 -- | Style for an element. Inheritable values are Maybes.
 data Style = Style
@@ -293,8 +293,9 @@ getClickEvent =
 xmlToContent :: XML.Node -> Maybe Content
 xmlToContent =
   \case
-    XML.NodeElement element ->
-      if T.toLower (XML.nameLocalName (XML.elementName element)) == "img"
+    XML.NodeElement element -> do
+      let tag = T.toLower (XML.nameLocalName (XML.elementName element))
+      if tag == "img"
       then do
         let lookupAttribute attr node =
               M.lookup (XML.Name attr Nothing Nothing) (XML.elementAttributes node)
@@ -302,54 +303,38 @@ xmlToContent =
         let w = (read . T.unpack) <$> lookupAttribute "width" element
         let h = (read . T.unpack) <$> lookupAttribute "height" element
         let dim = V2 <$> w <*> h
-        Just (ImageContent src dim Nothing)
-      else if elem
-           (T.toLower (XML.nameLocalName (XML.elementName element)))
-           ignoreElements
+        Just $ ImageContent src dim Nothing
+      else if tag `elem` ignoreElements
         then Nothing
         else Just (elementToContent element)
     XML.NodeContent t ->
       if T.null (T.strip t)
         then Nothing
         else Just (TextContent (T.unwords (T.words t)))
-    XML.NodeInstruction {} -> Nothing
-    XML.NodeComment {} -> Nothing
+    _ -> Nothing
   where
-    ignoreElements = ["head", "script", "style", "br", "hr", "input"]
+    ignoreElements = ["head", "script", "style", "hr", "input"]
 
 -- | Convert an element to some content.
 elementToContent :: XML.Element -> Content
 elementToContent element =
-  case HM.lookup name elementStyles of
-    Nothing ->
-      ElementContent
-        (T.map toLower (XML.nameLocalName (XML.elementName element)))
-        defaultEvents
-        defaultStyle
-        (mapMaybe xmlToContent (XML.elementNodes element))
-    Just style ->
-      ElementContent
-        (T.map toLower (XML.nameLocalName (XML.elementName element)))
-        defaultEvents
-        { eventsClick =
-            if name == "a"
-              then Just
-                     (\loadUrl continue ->
-                        (case M.lookup "href" (XML.elementAttributes element) of
-                           Nothing -> do
-                             continue
-                           Just url ->
-                             case parseURIReference (T.unpack url) of
-                               Nothing -> do
-                                 continue
-                               Just uri -> do
-                                 loadUrl uri))
-              else Nothing
-        }
-        style
+  if name == "br"
+  then NewlineContent
+  else ElementContent
+        (T.toLower (XML.nameLocalName (XML.elementName element)))
+        (eventsFor name)
+        (maybe defaultStyle id (HM.lookup name elementStyles))
         (mapMaybe xmlToContent (XML.elementNodes element))
   where
     name = XML.nameLocalName (XML.elementName element)
+    eventsFor "a" = defaultEvents { eventsClick = Just (clickLink element) }
+    eventsFor _ = defaultEvents
+
+clickLink :: XML.Element -> (URI -> IO ()) -> IO () -> IO ()
+clickLink element loadUrl continue = maybe continue loadUrl maybeURI
+  where
+    maybeURI = (parseURIReference . T.unpack) =<< maybeAttr
+    maybeAttr = M.lookup "href" $ XML.elementAttributes element
 
 --------------------------------------------------------------------------------
 -- Laying out content to a list of absolutely-positioned boxes
@@ -365,13 +350,19 @@ blockToBoxes ls0 maxWidth events0 inheritedStyle nodes0 =
               (\ls content ->
                  case content of
                    ImageContent _ (Just (V2 dx dy)) (Just img) -> do
-                     let y = lsY ls
-                     let x = lsX ls
-                     let dim = Canvas.D x y dx dy
-                     let ls' = ls { lsX = x + dx, lsLineHeight = max (lsLineHeight ls) dy }
+                     let dim = Canvas.D (lsX ls) (lsY ls) dx dy
+                     let ls' = ls { lsX = (lsX ls) + dx
+                                  , lsLineHeight = max (lsLineHeight ls) dy
+                                  }
                      pure (ls', [ImageBox dim img])
                    ImageContent _ _ _ ->
                      pure (ls, [])
+                   NewlineContent -> do
+                     let ls' = ls { lsX = 0
+                                  , lsY = (lsY ls) + lsLineHeight ls
+                                  , lsLineHeight = 0
+                                  }
+                     pure (ls', [])
                    TextContent t ->
                      textToBoxes ls events0 inheritedStyle maxWidth t
                    ElementContent _ events style nodes ->
@@ -611,11 +602,10 @@ elementStyles =
      , inline "time"
      , inline "var"
      , inline "bdo"
-     , inline "br"
      , inline "img"
      , inline "map"
      , inline "object"
-     , inline' "pre" (\s -> s {styleFontFamily = Just "monospace"})
+     , ("p", defaultStyle)
      , inline "q"
      , inline "script"
      , inline "span"
