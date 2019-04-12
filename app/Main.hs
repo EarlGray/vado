@@ -140,6 +140,7 @@ main = do
   request0 <- HTTP.parseRequest (fromString url)
   content0 <- getContent request0
   -- Initialize SDL and create a window.
+  setEnv "SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR" "0"
   SDL.initialize [SDL.InitVideo, SDL.InitTimer, SDL.InitEvents]
   window <-
     SDL.createWindow
