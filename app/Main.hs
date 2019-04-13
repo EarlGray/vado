@@ -22,6 +22,7 @@ import           Linear.V2 (V2(..))
 import qualified Network.HTTP.Client as HTTP
 import           Network.HTTP.Client.Internal
 import qualified Network.HTTP.Client.TLS as TLS
+import qualified Network.HTTP.Types.Header as HTTP
 import           Network.URI
 import qualified SDL as SDL
 import qualified SDL.Cairo as Cairo
@@ -139,7 +140,7 @@ data EV = EV
 main :: IO ()
 main = do
   url:_ <- getArgs -- Get the URL.
-  request0 <- HTTP.parseRequest (fromString url)
+  request0 <- makeRequest url
   content0 <- getContent request0
   -- Initialize SDL and create a window.
   setEnv "SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR" "0"
@@ -266,6 +267,13 @@ fetchImages (manager, req) (ImageContent src dim0 Nothing) = do
       return $ ImageContent src dim0 Nothing
 fetchImages _ t = return t
 
+makeRequest :: String -> IO Request
+makeRequest url = do
+  request0 <- HTTP.parseRequest (fromString url)
+  let req = request0 { requestHeaders = [ (HTTP.hUserAgent, "github.com/chrisdone/vado") ] }
+  putStrLn ("Downloading: " ++ show req)
+  return req
+
 --------------------------------------------------------------------------------
 -- Mouse events
 
@@ -299,11 +307,9 @@ xmlToContent =
     XML.NodeElement element -> do
       let tag = T.toLower (XML.nameLocalName (XML.elementName element))
       if tag == "img" then do
-        let lookupAttribute attr node =
-              M.lookup (XML.Name attr Nothing Nothing) (XML.elementAttributes node)
-        src <- lookupAttribute "src" element
-        let w = (read . T.unpack) <$> lookupAttribute "width" element
-        let h = (read . T.unpack) <$> lookupAttribute "height" element
+        src <- lookupXMLAttribute "src" element
+        let w = decodeXMLAttribute "width" element
+        let h = decodeXMLAttribute "height" element
         let dim = V2 <$> w <*> h
         Just $ ImageContent src dim Nothing
       else if tag == "hr" then do
@@ -417,6 +423,21 @@ inlineToBoxes ls0 maxWidth events0 inheritedStyle nodes0 = do
                      pure (ls', [ImageBox dim img])
                    ImageContent _ _ _ ->
                      pure (ls, [])
+                   LineContent -> do
+                     let lineY = (lsY ls) + lsLineHeight ls
+                     let ls' = ls { lsX = 0
+                                  , lsY = lineY + defaultFontSize
+                                  , lsLineHeight = 0
+                                  , lsMaxHeight = lsMaxHeight ls - defaultFontSize - lsLineHeight ls
+                                  }
+                     let dim = Canvas.D 0 lineY maxWidth defaultFontSize
+                     pure (ls', [LineBox dim])
+                   NewlineContent -> do
+                     let ls' = ls { lsX = 0
+                                  , lsY = (lsY ls) + lsLineHeight ls
+                                  , lsLineHeight = 0
+                                  }
+                     pure (ls', [])
                    TextContent t ->
                      textToBoxes ls events0 inheritedStyle maxWidth t
                    ElementContent _ events style nodes ->
@@ -512,7 +533,7 @@ rerender scale ev = do
                 defaultStyle {styleWidth = Just width}
                 [(evContent ev)]))
           scale
-      mapM_ (\case
+      forM_ boxes $ \case
              LineBox (Canvas.D x y dx dy) -> do
                let from = V2 x (y + dy/2)
                let to = V2 (x + dx) (y + dy/2)
@@ -531,8 +552,7 @@ rerender scale ev = do
                        ItalicStyle -> True
                        NormalStyle -> False))
                Canvas.textBaseline (T.unpack (textText text)) (textXY text)
-             _ -> return ())
-        boxes
+             _ -> return ()
       pure boxes
   SDL.copy (evRenderer ev) (evTexture ev) Nothing Nothing
   forM_ boxes $ \case
@@ -591,44 +611,42 @@ elementStyles =
     ([ ( T.pack ("h" ++ show n)
        , defaultStyle
          {styleFontSize = Just size, styleFontWeight = Just BoldWeight})
-     | (n :: Int, size :: Double) <- zip [1 .. 6] [40, 35, 20, 25, 20, 18]
+     | (n :: Int, size :: Double) <- zip [1 .. 6] [40, 35, 30, 25, 20, 18]
      ] ++
-     [ inline' "a" (\s -> s {styleColor = Just (Canvas.rgb 0 0 255)})
-     , inline "b"
-     , inline "big"
-     , inline "i"
-     , inline "small"
-     , inline "tt"
-     , inline "abbr"
-     , inline "acronym"
-     , inline "cite"
-     , inline' "code" (\s -> s {styleFontFamily = Just "monospace"})
-     , inline "dfn"
-     , inline' "em" (\s -> s {styleFontStyle = Just ItalicStyle})
-     , inline "kbd"
-     , inline' "strong" (\s -> s {styleFontWeight = Just BoldWeight})
-     , inline "samp"
-     , inline "time"
-     , inline "var"
-     , inline "bdo"
-     , inline "img"
-     , inline "map"
-     , inline "object"
-     , ("p", defaultStyle)
-     , inline "q"
-     , inline "script"
-     , inline "span"
-     , inline "sub"
-     , inline "sup"
-     , inline "button"
-     , inline "input"
-     , inline "label"
-     , inline "select"
-     , inline "textarea"
+     [ ("a",        inline {styleColor = Just (Canvas.blue 255) })
+     , ("abbr",     inline)
+     , ("acronym",  inline)
+     , ("b",        inline)
+     , ("bdo",      inline)
+     , ("big",      inline {styleFontSize = Just (1.2 * defaultFontSize)})
+     , ("button",   inline)
+     , ("cite",     inline)
+     , ("code",     inline {styleFontFamily = Just "monospace"})
+     , ("dfn",      inline)
+     , ("em",       inline {styleFontStyle = Just ItalicStyle})
+     , ("i",        inline {styleFontStyle = Just ItalicStyle})
+     , ("img",      inline)
+     , ("input",    inline)
+     , ("kbd",      inline)
+     , ("label",    inline)
+     , ("map",      inline)
+     , ("object",   inline)
+     , ("q",        inline)
+     , ("samp",     inline)
+     , ("script",   inline)
+     , ("select",   inline)
+     , ("small",    inline {styleFontSize = Just (0.8 * defaultFontSize)})
+     , ("span",     inline)
+     , ("strong",   inline {styleFontWeight = Just BoldWeight})
+     , ("sub",      inline)
+     , ("sup",      inline)
+     , ("time",     inline)
+     , ("textarea", inline)
+     , ("tt",       inline)
+     , ("var",      inline)
      ])
   where
-    inline name = (name, defaultStyle {styleDisplay = InlineDisplay})
-    inline' name f = (name, f (defaultStyle {styleDisplay = InlineDisplay}))
+    inline = defaultStyle {styleDisplay = InlineDisplay}
 
 -- | Default text color.
 defaultColor :: Canvas.Color
@@ -670,3 +688,14 @@ mapAccumM f state0 xs =
           pure (state', y : ys))
        (state0, [])
        xs)
+
+lookupXMLAttribute :: Text -> XML.Element -> Maybe Text
+lookupXMLAttribute attr node = M.lookup xmlattr (XML.elementAttributes node)
+  where xmlattr = XML.Name attr Nothing Nothing
+
+decodeXMLAttribute :: Read a => Text -> XML.Element -> Maybe a
+decodeXMLAttribute attr node = do
+  s <- lookupXMLAttribute attr node
+  case reads (T.unpack s) of
+    [(value, "")] -> Just value
+    _ -> Nothing
