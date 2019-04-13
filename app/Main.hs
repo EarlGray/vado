@@ -42,6 +42,7 @@ data Content
   | TextContent !Text
   | ImageContent !Text !(Maybe (V2 Double)) !(Maybe SDL.Surface) -- !(Maybe Text)
   | NewlineContent
+  | LineContent
 
 -- | Style for an element. Inheritable values are Maybes.
 data Style = Style
@@ -72,9 +73,10 @@ data FontWeight = NormalWeight | BoldWeight
 
 -- | A box to be displayed.
 data Box
-  = RectBox !Canvas.Dim !(Maybe Canvas.Color)
-  | ImageBox !Canvas.Dim SDL.Surface
-  | TextBox !Events !TextBox
+  = TextBox !Events !TextBox
+  | ImageBox !Canvas.Dim SDL.Surface    -- an image
+  | LineBox !Canvas.Dim                 -- a horizontal line
+
 
 -- | A set of events that an element may handle.
 data Events = Events
@@ -296,8 +298,7 @@ xmlToContent =
   \case
     XML.NodeElement element -> do
       let tag = T.toLower (XML.nameLocalName (XML.elementName element))
-      if tag == "img"
-      then do
+      if tag == "img" then do
         let lookupAttribute attr node =
               M.lookup (XML.Name attr Nothing Nothing) (XML.elementAttributes node)
         src <- lookupAttribute "src" element
@@ -305,6 +306,8 @@ xmlToContent =
         let h = (read . T.unpack) <$> lookupAttribute "height" element
         let dim = V2 <$> w <*> h
         Just $ ImageContent src dim Nothing
+      else if tag == "hr" then do
+        Just LineContent
       else if tag `elem` ignoreElements
         then Nothing
         else Just (elementToContent element)
@@ -314,7 +317,7 @@ xmlToContent =
         else Just (TextContent (T.unwords (T.words t)))
     _ -> Nothing
   where
-    ignoreElements = ["head", "script", "style", "hr", "input"]
+    ignoreElements = ["head", "script", "style", "input"]
 
 -- | Convert an element to some content.
 elementToContent :: XML.Element -> Content
@@ -358,6 +361,15 @@ blockToBoxes ls0 maxWidth events0 inheritedStyle nodes0 =
                      pure (ls', [ImageBox dim img])
                    ImageContent _ _ _ ->
                      pure (ls, [])
+                   LineContent -> do
+                     let lineY = (lsY ls) + lsLineHeight ls
+                     let ls' = ls { lsX = 0
+                                  , lsY = lineY + defaultFontSize
+                                  , lsLineHeight = 0
+                                  , lsMaxHeight = lsMaxHeight ls - defaultFontSize - lsLineHeight ls
+                                  }
+                     let dim = Canvas.D 0 lineY maxWidth defaultFontSize
+                     pure (ls', [LineBox dim])
                    NewlineContent -> do
                      let ls' = ls { lsX = 0
                                   , lsY = (lsY ls) + lsLineHeight ls
@@ -500,15 +512,12 @@ rerender scale ev = do
                 defaultStyle {styleWidth = Just width}
                 [(evContent ev)]))
           scale
-      mapM_
-        (\box ->
-           case box of
-             RectBox dim mcolor -> do
-               case mcolor of
-                 Just color -> do
-                   Canvas.fill color
-                   Canvas.rect dim
-                 Nothing -> pure ()
+      mapM_ (\case
+             LineBox (Canvas.D x y dx dy) -> do
+               let from = V2 x (y + dy/2)
+               let to = V2 (x + dx) (y + dy/2)
+               Canvas.stroke defaultColor
+               Canvas.line from to
              TextBox _ text -> do
                Canvas.stroke (textColor text)
                Canvas.textFont
@@ -533,7 +542,6 @@ rerender scale ev = do
       let size = V2 (round  dx) (round dy)
       let dim = SDL.Rectangle (P pos) size
       SDL.copy (evRenderer ev) texture Nothing (Just dim)
-      return ()
     _ -> return ()
   SDL.present (evRenderer ev)
   pure boxes
