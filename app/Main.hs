@@ -7,9 +7,8 @@
 {-# LANGUAGE LambdaCase #-}
 
 import           Control.Applicative
-import           Control.Arrow
 import           Control.Monad
-import           Control.Monad.Reader
+import           Control.Monad.RWS.Strict as RWS
 import qualified Data.ByteString.Lazy as B
 import qualified Data.HashMap.Strict as HM
 import           Data.List
@@ -44,6 +43,12 @@ data Content
   | ImageContent !Text !(Maybe (V2 Double)) !(Maybe SDL.Surface) -- !(Maybe Text)
   | NewlineContent
   | LineContent
+  deriving (Show)
+
+instance Show SDL.Surface where
+  show _ = "<image>"
+instance Show Events where
+  show _ = "<events>"
 
 -- | Style for an element. Inheritable values are Maybes.
 data Style = Style
@@ -62,15 +67,15 @@ data Style = Style
 
 -- | Display style.
 data Display = BlockDisplay | InlineDisplay
-  deriving Show
+  deriving (Show, Eq)
 
 -- | Font style.
 data FontStyle = NormalStyle | ItalicStyle
-  deriving (Show)
+  deriving (Show, Eq)
 
 -- | Font weight.
 data FontWeight = NormalWeight | BoldWeight
-  deriving (Show)
+  deriving (Show, Eq)
 
 -- | A box to be displayed.
 data Box
@@ -78,6 +83,10 @@ data Box
   | ImageBox !Canvas.Dim SDL.Surface    -- an image
   | LineBox !Canvas.Dim                 -- a horizontal line
 
+instance Show Box where
+  show (TextBox _ t) = "TextBox <events> " ++ show t
+  show (ImageBox dim _) = concat ["ImageBox ", show dim, " <image>"]
+  show (LineBox dim) = "LineBox " ++ show dim
 
 -- | A set of events that an element may handle.
 data Events = Events
@@ -101,9 +110,48 @@ data TextBox = Text
   } deriving (Show)
 
 -- | A text size measurer.
-newtype Measuring a =
-  Measuring {runMeasuring :: ReaderT Double Canvas.Canvas a}
-  deriving (Monad, Functor, Applicative)
+data MeasureEnv = MeasureEnv
+  { measureScale :: Double
+  , measureMaxWidth :: Double
+  , measureMaxHeight :: Double
+  }
+
+newtype Measuring m a =
+  Measuring {runMeasuring :: RWST MeasureEnv [Box] LS m a}
+  deriving (Monad, Functor, Applicative, MonadTrans)
+
+type CanvasMeasuring a = Measuring Canvas.Canvas a
+
+measureInlineBox :: Double -> Double -> CanvasMeasuring Canvas.Dim
+measureInlineBox dx dy = Measuring $ do
+  ls <- RWS.get
+  let ls' = ls { lsX = lsX ls + dx, lsLineHeight = max (lsLineHeight ls) dy }
+  RWS.put ls'
+  return $ Canvas.D (lsX ls) (lsY ls) dx dy
+
+measureBlockBox :: Double -> Double -> CanvasMeasuring Canvas.Dim
+measureBlockBox dx dy = do
+  measureLineBreak
+  dim <- measureInlineBox dx dy
+  measureLineBreak
+  return dim
+
+measureLineBreak :: CanvasMeasuring ()
+measureLineBreak = Measuring $ do
+  ls <- RWS.get
+  let dy = lsLineHeight ls
+  let ls' = ls { lsX = 0, lsY = lsY ls + dy, lsLineHeight = 0 }
+  RWS.put ls'
+
+measureOverLine :: Double -> CanvasMeasuring Bool
+measureOverLine width = Measuring $ do
+  maxwidth <- RWS.asks measureMaxWidth
+  x <- RWS.gets lsX
+  return ((x + width) > maxwidth)
+
+measureTell :: Box -> CanvasMeasuring ()
+measureTell box = Measuring $ RWS.tell [box]
+
 
 -- | Line-state. The state of rendering line-broken text.
 data LS = LS
@@ -112,10 +160,7 @@ data LS = LS
   , lsLineHeight :: Double
     -- ^ The line height gets increased every time we render a font
     -- larger than the last rendered thing.
-  , lsMaxHeight :: Double
-    -- ^ The maximum rendering height. This is just a small
-    -- optimization to not render more than needed.
-  }
+  } deriving (Show)
 
 -- | State for the event handler.
 data EV = EV
@@ -302,8 +347,7 @@ getClickEvent =
 -- | Normalize an XML tree of elements and text, possibly with
 -- attributes like style and event handlers.
 xmlToContent :: XML.Node -> Maybe Content
-xmlToContent =
-  \case
+xmlToContent = \case
     XML.NodeElement element -> do
       let tag = T.toLower (XML.nameLocalName (XML.elementName element))
       if tag == "img" then do
@@ -314,6 +358,8 @@ xmlToContent =
         Just $ ImageContent src dim Nothing
       else if tag == "hr" then do
         Just LineContent
+      else if tag == "br" then
+        Just NewlineContent
       else if tag `elem` ignoreElements
         then Nothing
         else Just (elementToContent element)
@@ -327,18 +373,13 @@ xmlToContent =
 
 -- | Convert an element to some content.
 elementToContent :: XML.Element -> Content
-elementToContent element =
-  if name == "br"
-  then NewlineContent
-  else ElementContent
-        (T.toLower (XML.nameLocalName (XML.elementName element)))
-        (eventsFor name)
-        (maybe defaultStyle id (HM.lookup name elementStyles))
-        (mapMaybe xmlToContent (XML.elementNodes element))
+elementToContent element = ElementContent name (eventsFor name) style nodes
   where
-    name = XML.nameLocalName (XML.elementName element)
+    name = T.toLower (XML.nameLocalName (XML.elementName element))
     eventsFor "a" = defaultEvents { eventsClick = Just (clickLink element) }
     eventsFor _ = defaultEvents
+    style = fromMaybe defaultStyle (HM.lookup name elementStyles)
+    nodes = mapMaybe xmlToContent (XML.elementNodes element)
 
 clickLink :: XML.Element -> (URI -> IO ()) -> IO () -> IO ()
 clickLink element loadUrl continue = maybe continue loadUrl maybeURI
@@ -350,158 +391,61 @@ clickLink element loadUrl continue = maybe continue loadUrl maybeURI
 -- Laying out content to a list of absolutely-positioned boxes
 
 -- | Convert an element to boxes.
-blockToBoxes :: LS -> Double -> Events -> Style -> [Content] -> Measuring (LS, [Box])
-blockToBoxes ls0 maxWidth events0 inheritedStyle nodes0 =
-  if lsY ls0 > lsMaxHeight ls0
-    then pure (ls0, [])
-    else fmap
-           (second concat)
-           (mapAccumM
-              (\ls content ->
-                 case content of
-                   ImageContent _ (Just (V2 dx dy)) (Just img) -> do
-                     let dim = Canvas.D (lsX ls) (lsY ls) dx dy
-                     let ls' = ls { lsX = (lsX ls) + dx
-                                  , lsLineHeight = max (lsLineHeight ls) dy
-                                  }
-                     pure (ls', [ImageBox dim img])
-                   ImageContent _ _ _ ->
-                     pure (ls, [])
-                   LineContent -> do
-                     let lineY = (lsY ls) + lsLineHeight ls
-                     let ls' = ls { lsX = 0
-                                  , lsY = lineY + defaultFontSize
-                                  , lsLineHeight = 0
-                                  , lsMaxHeight = lsMaxHeight ls - defaultFontSize - lsLineHeight ls
-                                  }
-                     let dim = Canvas.D 0 lineY maxWidth defaultFontSize
-                     pure (ls', [LineBox dim])
-                   NewlineContent -> do
-                     let ls' = ls { lsX = 0
-                                  , lsY = (lsY ls) + lsLineHeight ls
-                                  , lsLineHeight = 0
-                                  }
-                     pure (ls', [])
-                   TextContent t ->
-                     textToBoxes ls events0 inheritedStyle maxWidth t
-                   ElementContent _ events style nodes ->
-                     case styleDisplay style of
-                       InlineDisplay ->
-                         inlineToBoxes
-                           ls
-                           maxWidth
-                           events
-                           (mergeStyles inheritedStyle style)
-                           nodes
-                       BlockDisplay ->
-                         blockToBoxes
-                           ls
-                           { lsY = lsY ls + lsLineHeight ls
-                           , lsLineHeight = 0
-                           , lsX = 0
-                           }
-                           maxWidth
-                           events
-                           (mergeStyles inheritedStyle style)
-                           nodes)
-              ls0
-              nodes0)
-
--- | Convert an element to boxes.
-inlineToBoxes :: LS -> Double -> Events -> Style -> [Content] -> Measuring (LS, [Box])
-inlineToBoxes ls0 maxWidth events0 inheritedStyle nodes0 = do
-  if lsY ls0 > lsMaxHeight ls0
-    then pure (ls0, [])
-    else fmap
-           (second concat)
-           (mapAccumM
-              (\ls content ->
-                 case content of
-                   ImageContent _ (Just (V2 dx dy)) (Just img) -> do
-                     let ls' = ls { lsX = lsX ls + dx, lsLineHeight = dy }
-                     let dim = Canvas.D (lsX ls) (lsY ls) dx dy
-                     pure (ls', [ImageBox dim img])
-                   ImageContent _ _ _ ->
-                     pure (ls, [])
-                   LineContent -> do
-                     let lineY = (lsY ls) + lsLineHeight ls
-                     let ls' = ls { lsX = 0
-                                  , lsY = lineY + defaultFontSize
-                                  , lsLineHeight = 0
-                                  , lsMaxHeight = lsMaxHeight ls - defaultFontSize - lsLineHeight ls
-                                  }
-                     let dim = Canvas.D 0 lineY maxWidth defaultFontSize
-                     pure (ls', [LineBox dim])
-                   NewlineContent -> do
-                     let ls' = ls { lsX = 0
-                                  , lsY = (lsY ls) + lsLineHeight ls
-                                  , lsLineHeight = 0
-                                  }
-                     pure (ls', [])
-                   TextContent t ->
-                     textToBoxes ls events0 inheritedStyle maxWidth t
-                   ElementContent _ events style nodes ->
-                     inlineToBoxes
-                       ls
-                       maxWidth
-                       events
-                       (mergeStyles inheritedStyle style)
-                       nodes)
-              ls0
-              nodes0)
+blockToBoxes :: Bool -> Events -> Style -> [Content] -> CanvasMeasuring ()
+blockToBoxes isInline parentEvents parentStyle nodes = do
+  maxwidth <- Measuring $ RWS.asks measureMaxWidth
+  maxheight <- Measuring $ RWS.asks measureMaxHeight
+  y <- Measuring $ RWS.gets lsY
+  when (y <= maxheight) $ do
+    forM_ nodes $ \case
+        ImageContent _ (Just (V2 dx dy)) (Just img) -> do
+          dim <- measureInlineBox dx dy
+          measureTell $ ImageBox dim img
+        ImageContent _ _ _ ->
+          return ()
+        LineContent -> do
+          dim <- measureBlockBox maxwidth defaultFontSize
+          measureTell $ LineBox dim
+        NewlineContent -> do
+          measureLineBreak
+        TextContent t -> do
+          textToBoxes parentEvents parentStyle t
+        ElementContent _ events style subnodes ->
+          let isInline' = isInline || (styleDisplay style == InlineDisplay)
+              style' = mergeStyles parentStyle style
+          in blockToBoxes isInline' events style' subnodes
+    unless isInline $ measureLineBreak
 
 -- | Layout text word-by-word with line-breaking.
-textToBoxes :: LS -> Events -> Style -> Double -> Text -> Measuring (LS, [Box])
-textToBoxes ls0 events style maxWidth t = do
-  mapAccumM
-    (\ls word -> do
-       scale <- Measuring ask
-       wh@(V2 width _) <- measure word
-       let ls' =
-             if lsX ls + width > maxWidth
-               then ls
-                    {lsX = 0, lsY = lsY ls + lsLineHeight ls, lsLineHeight = (lineHeight scale)}
-               else ls {lsLineHeight = max (lsLineHeight ls) (lineHeight scale)}
-       fe <- extents
-       pure
-         ( ls' {lsX = (lsX ls' + width + space scale), lsY = lsY ls'}
-         , TextBox
-             events
-             (Text
-              { textXY = V2 (lsX ls') (lsY ls' + Canvas.fontExtentsHeight fe)
-              , textWH = wh
-              , textColor = color
-              , textWeight = weight
-              , textFont = font
-              , textSize = fontSize scale
-              , textText = word
-              , textStyle = fontStyle
-              })))
-    ls0
-    (T.words t)
-  where
-    font = fromMaybe defaultFontFace (styleFontFamily style)
-    fontStyle = fromMaybe defaultFontStyle (styleFontStyle style)
-    space scale = (fontSize scale / 2)
-    color = fromMaybe defaultColor (styleColor style)
-    fontSize scale = fromMaybe defaultFontSize (styleFontSize style) * scale
-    lineHeight scale =
-      fontSize scale * (fromMaybe defaultLineHeight (styleLineHeight style))
-    weight = fromMaybe defaultWeight (styleFontWeight style)
-    bold =
-      case weight of
-        NormalWeight -> False
-        BoldWeight -> True
-    italic =
-      case fontStyle of
-        ItalicStyle -> True
-        _ -> False
-    measure w =
-      Measuring
-        (do scale <- ask
-            lift (Canvas.textFont (Canvas.Font font (fontSize scale) bold italic))
-            lift (Canvas.textSize (T.unpack w)))
-    extents = Measuring (lift Canvas.fontExtents)
+textToBoxes :: Events -> Style -> Text -> CanvasMeasuring ()
+textToBoxes events style text = do
+  scale <- Measuring $ RWS.asks measureScale
+  let font = fromMaybe defaultFontFace (styleFontFamily style)
+  let fontstyle = fromMaybe defaultFontStyle (styleFontStyle style)
+  let fontsize = scale * fromMaybe defaultFontSize (styleFontSize style)
+  let weight = fromMaybe defaultWeight (styleFontWeight style)
+  let space = fontsize / 2
+  let lineheight = fontsize * fromMaybe defaultLineHeight (styleLineHeight style)
+
+  lift $ Canvas.textFont (Canvas.Font font fontsize (weight == BoldWeight) (fontstyle == ItalicStyle))
+  extents <- lift Canvas.fontExtents
+
+  forM_ (T.words text) $ \word -> do
+    wh@(V2 width _) <- lift $ Canvas.textSize (T.unpack word)
+    overline <- measureOverLine width
+    when overline $ measureLineBreak
+    Canvas.D x y _ _ <- measureInlineBox (width + space) lineheight
+    let t = Text { textXY = V2 x (y + Canvas.fontExtentsHeight extents)
+           , textWH = wh
+           , textText = word
+           , textColor = fromMaybe defaultColor (styleColor style)
+           , textSize = scale * fromMaybe defaultFontSize (styleFontSize style)
+           , textFont = font
+           , textWeight = weight
+           , textStyle = fontstyle
+           }
+    measureTell $ TextBox events t
+
 
 --------------------------------------------------------------------------------
 -- SDL rendering to the canvas
@@ -519,21 +463,13 @@ rerender scale ev = do
       Canvas.background $ Canvas.rgb 255 255 255
       (V2 width height) <- Canvas.getCanvasSize
       (_, boxes) <-
-        runReaderT
+        RWS.execRWST
           (runMeasuring
-             (blockToBoxes
-                (LS
-                 { lsX = 0
-                 , lsY = (evScrollY ev)
-                 , lsLineHeight = 0
-                 , lsMaxHeight = height
-                 })
-                width
-                defaultEvents
-                defaultStyle {styleWidth = Just width}
-                [(evContent ev)]))
-          scale
-      forM_ boxes $ \case
+             (blockToBoxes False defaultEvents defaultStyle [evContent ev]))
+          (MeasureEnv scale width height)
+          LS { lsX = 0, lsY = evScrollY ev, lsLineHeight = 0 }
+      forM_ boxes $ \box ->
+         case box of
              LineBox (Canvas.D x y dx dy) -> do
                let from = V2 x (y + dy/2)
                let to = V2 (x + dx) (y + dy/2)
@@ -545,12 +481,8 @@ rerender scale ev = do
                  (Canvas.Font
                     (textFont text)
                     (textSize text)
-                    (case textWeight text of
-                       BoldWeight -> True
-                       NormalWeight -> False)
-                    (case textStyle text of
-                       ItalicStyle -> True
-                       NormalStyle -> False))
+                    (textWeight text == BoldWeight)
+                    (textStyle text == ItalicStyle))
                Canvas.textBaseline (T.unpack (textText text)) (textXY text)
              _ -> return ()
       pure boxes
@@ -676,18 +608,6 @@ defaultEvents = Events Nothing
 
 --------------------------------------------------------------------------------
 -- Utilities
-
--- | Map over the list, accumulating a state.
-mapAccumM :: Monad m => (state -> a -> m (state, b)) -> state -> [a] -> m (state, [b])
-mapAccumM f state0 xs =
-  fmap
-    (second reverse)
-    (foldM
-       (\(state, ys) x -> do
-          (state', y) <- f state x
-          pure (state', y : ys))
-       (state0, [])
-       xs)
 
 lookupXMLAttribute :: Text -> XML.Element -> Maybe Text
 lookupXMLAttribute attr node = M.lookup xmlattr (XML.elementAttributes node)
