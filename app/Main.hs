@@ -115,9 +115,10 @@ data TextBox = Text
 data MeasureEnv = MeasureEnv
   { measureScale :: Double
   , measureMaxWidth :: Double
+  , measureMaxHeight :: Double
   }
 newtype Measuring m a =
-  Measuring {runMeasuring :: RWST MeasureEnv () (LS, [Box]) m a}
+  Measuring {runMeasuring :: RWST MeasureEnv [Box] LS m a}
   deriving (Monad, Functor, Applicative)
 
 instance RWS.MonadTrans (Measuring) where
@@ -127,9 +128,9 @@ type MeasuringCanvas a = Measuring Canvas.Canvas a
 
 measureInlineBox :: Double -> Double -> MeasuringCanvas Canvas.Dim
 measureInlineBox dx dy = Measuring $ do
-  (ls, boxes) <- RWS.get
+  ls <- RWS.get
   let ls' = ls { lsX = lsX ls + dx, lsLineHeight = max (lsLineHeight ls) dy }
-  RWS.put (ls', boxes)
+  RWS.put ls'
   return $ Canvas.D (lsX ls) (lsY ls) dx dy
 
 measureBlockBox :: Double -> Double -> MeasuringCanvas Canvas.Dim
@@ -141,19 +142,19 @@ measureBlockBox dx dy = do
 
 measureLineBreak :: MeasuringCanvas ()
 measureLineBreak = Measuring $ do
-  (ls, boxes) <- RWS.get
+  ls <- RWS.get
   let dy = lsLineHeight ls
-  let ls' = ls { lsX = 0, lsY = lsY ls + dy, lsLineHeight = 0, lsMaxHeight = lsMaxHeight ls - dy }
-  RWS.put (Dbg.traceShow ls' ls', boxes)
+  let ls' = ls { lsX = 0, lsY = lsY ls + dy, lsLineHeight = 0 }
+  RWS.put ls'
 
 measureOverLine :: Double -> MeasuringCanvas Bool
 measureOverLine width = Measuring $ do
   maxwidth <- RWS.asks measureMaxWidth
-  x <- RWS.gets (lsX . fst)
+  x <- RWS.gets lsX
   return ((x + width) > maxwidth)
 
 measureTell :: Box -> MeasuringCanvas ()
-measureTell box = Measuring $ RWS.modify (\(ls, boxes) -> (ls, boxes ++ [box]))
+measureTell box = Measuring $ RWS.tell [box]
 
 
 -- | Line-state. The state of rendering line-broken text.
@@ -163,9 +164,6 @@ data LS = LS
   , lsLineHeight :: Double
     -- ^ The line height gets increased every time we render a font
     -- larger than the last rendered thing.
-  , lsMaxHeight :: Double
-    -- ^ The maximum rendering height. This is just a small
-    -- optimization to not render more than needed.
   } deriving (Show)
 
 -- | State for the event handler.
@@ -401,8 +399,8 @@ clickLink element loadUrl continue = maybe continue loadUrl maybeURI
 blockToBoxes :: Events -> Style -> [Content] -> MeasuringCanvas ()
 blockToBoxes parentEvents parentStyle nodes = do
   maxwidth <- Measuring $ RWS.asks measureMaxWidth
-  maxheight <- Measuring $ RWS.gets (lsMaxHeight . fst)
-  y <- Measuring $ RWS.gets (lsY . fst)
+  maxheight <- Measuring $ RWS.asks measureMaxHeight
+  y <- Measuring $ RWS.gets lsY
   when (y <= maxheight) $ do
     forM_ nodes $ \node -> do
       -- lift $ Canvas.stroke defaultColor  -- a sacrifice to the gods of laziness
@@ -425,14 +423,14 @@ blockToBoxes parentEvents parentStyle nodes = do
             InlineDisplay -> inlineToBoxes events (mergeStyles parentStyle style) subnodes
             BlockDisplay -> blockToBoxes events (mergeStyles parentStyle style) subnodes
           -- measureLineBreak
-    measureLineBreak
+      measureLineBreak
 
 -- | Convert an inline element to boxes.
 inlineToBoxes :: Events -> Style -> [Content] -> MeasuringCanvas ()
 inlineToBoxes parentEvents parentStyle nodes = do
   maxwidth <- Measuring $ RWS.asks measureMaxWidth
-  maxheight <- Measuring $ RWS.gets (lsMaxHeight . fst)
-  y <- Measuring $ RWS.gets (lsY . fst)
+  maxheight <- Measuring $ RWS.asks measureMaxHeight
+  y <- Measuring $ RWS.gets lsY
   when (y <= maxheight) $ do
     forM_ nodes $ \node -> do
       -- lift $ Canvas.stroke defaultColor  -- a sacrifice to the gods of laziness
@@ -494,19 +492,19 @@ textToBoxes events style text = do
 -- arguments to copy of a region to copy offset by some Y.
 rerender :: Double -> EV -> IO [Box]
 rerender scale ev = do
-  (ls, boxes) <-
+  boxes <-
     Canvas.withCanvas (evTexture ev) $ do
       Canvas.background $ Canvas.rgb 255 255 255
       (V2 width height) <- Canvas.getCanvasSize
-      ((ls, boxes), _) <-
+      (_, boxes) <-
         RWS.execRWST
           (runMeasuring
              (blockToBoxes
                 defaultEvents
                 defaultStyle -- {styleWidth = Just width}
                 [evContent ev]))
-          (MeasureEnv scale width)
-          (LS { lsX = 0, lsY = evScrollY ev, lsLineHeight = 0, lsMaxHeight = height }, [])
+          (MeasureEnv scale width height)
+          LS { lsX = 0, lsY = evScrollY ev, lsLineHeight = 0 }
       forM_ boxes $ \box ->
          case box of
              LineBox (Canvas.D x y dx dy) -> do
@@ -524,8 +522,7 @@ rerender scale ev = do
                     (textStyle text == ItalicStyle))
                Canvas.textBaseline (T.unpack (textText text)) (textXY text)
              _ -> return ()
-      pure (ls, boxes)
-  print ls
+      pure boxes
   SDL.copy (evRenderer ev) (evTexture ev) Nothing Nothing
   forM_ boxes $ \case
     ImageBox (Canvas.D x y dx dy) img -> do
