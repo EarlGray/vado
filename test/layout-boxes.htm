@@ -1,0 +1,117 @@
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+#outer {
+  border: dashed 1px red;
+  padding: 0 0 0 2em;
+}
+#outer * {
+  border: dashed 1px blue;
+}
+#positioned {
+  padding: 0.5em;
+  display: inline;
+  position: relative;
+  left: 50%;
+  top: 1em;
+  background-color: yellow;
+}
+#block-format-1 { background-color: red;    width: 20em; height: 3em; margin: 1em; }
+#block-format-2 { background-color: yellow; width: 30em; height: 2em; margin: 1em; }
+#block-format-3 { background-color: green;  width: 25em; height: 4em; margin: 2em; }
+
+/* width and height are not respected: */
+/* margin-top and margin-botton are not respected */
+#inline-format-1 { background-color: cyan;    width: 10em; font-size: 12pt; margin: 0 1em; }
+#inline-format-2 { background-color: magenta; width: 8em;  font-size: 16pt; margin: 0 1em; padding: 1em 0.5em; }
+#inline-format-3 { background-color: yellow;  width: 12em; font-size: 24pt; margin: 0 2em; }
+#inline-format-4 { background-color: black; color: white;  width: 20em; font-size: 8pt;  margin: 0 1em; }
+</style>
+</head>
+<body>
+<div id="outer">
+chunk	1	tab<div id="inner">block</div>chunk 2
+</div>
+
+<h3>Positioning</h3>
+<div style="font-size: 16pt;">
+<p style="line-height: 0.8em;">
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea <small>commodo</small> consequat. <span style="font-size: 140%;">Duis</span> aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum
+  <div id="positioned">Positioned text</div>
+</p>
+<p style="text-align: justify;">
+  Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum
+  </div>
+</p>
+<hr>
+<h3>Block formatting context</h3>
+<div>
+  <div id="block-format-1"></div>
+  <div id="block-format-2"></div>
+  <div id="block-format-3"></div>
+</div>
+
+<hr>
+<h3>Inline formatting context</h3>
+<div>
+  <span id="inline-format-1">Lorem ipsum</span><span id="inline-format-2">dolor sit amet,</span>
+  <span id="inline-format-3">consectetur adipiscing elit,</span><span id="inline-format-4">sed do eiusmod tempor</span>
+  <div style="display: inline-block; background-color: green; width: 5em; height: 3em; margin: 0.5em"></div>
+</div>
+
+<hr>
+<h3>Floats</h3>
+<p style="font-size: 18pt;">
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. 
+<img style="float: left" src="res/image.png" width="64" height="64">
+<img style="float: right" src="res/image.png" width="128" height="128">
+
+Ut enim ad minim veniam, quis nostrud exercitation ullamco <img align="right" src="res/image.png" width="64" height="64">laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum
+  </div>
+</p>
+<div style="font-size: 16pt;">
+  Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna <span style="font-size: 50%;">aliqua. 
+<div style="float: right; font-size: 14pt; width:8em;"><em>Yes, this is another <br> very floating text.</em></div>
+Ut </span>enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum
+  </div>
+</div>
+<hr>
+<div style="font-size: 16pt;">
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et 
+
+dolore magna aliqua. 
+<div style="float: right; font-size: 14pt; width:8em;"><em>Yes, this is another <br> very floating text.</em></div>
+<div style="float: right; font-size: 12pt; margin: 1em"><strong>Another <br>floating block</strong></div>
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. 
+<div style="float: left; font-size: 10pt; margin: 1em; width: 30%;"><em>A floating block that is supposed to be very tall:</em>Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum</div>
+Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+  </div>
+</div>
+<hr>
+<div style="font-size: 16pt;">
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et 
+
+dolore magna aliqua. 
+<div style="float: right; font-size: 12pt; margin: 1em"><em>A floating block that is supposed to be very wide:</em>Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum</div>
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.  Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum
+  </div>
+</div>
+
+<hr>
+<div style="font-size: 12pt">
+    <span style="font-size: 9pt">these small letters should define the top line for the floating block</span><div style="float: left; width: 30%;">The floating block should be aligned at the top of the small letters</div><span style="font-size: 18pt">These must be higher than baseline of the floating block</span>
+</div>
+
+<hr>
+<div style="font-size: 16pt; clear: left;">
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. 
+<div style="float: left; font-size: 12pt; margin: 1em; width: 20%"><span style="background-color: yellow">horizonataloverflowoverflowoverflow</span> <em>A floating block that should not be overflown:</em></div>
+<div style="float: right; font-size: 12pt; margin: 1em; width: 30%;"><em>A floating block: </em>Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. </div>
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum
+  </div>
+</div>
+<hr>
+<h3>To be continued</h3>
+</body>
+</html>
