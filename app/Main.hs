@@ -6,9 +6,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
 
---import           Control.Applicative
 import           Control.Monad
---import           Control.Monad.RWS.Strict as RWS
+import           Control.Monad.RWS.Strict as RWS
 import qualified Data.ByteString.Lazy as B
 import qualified Data.Char as C
 --import           Data.HashMap.Strict ((!))
@@ -29,19 +28,16 @@ import           Network.URI
 import qualified SDL as SDL
 import qualified SDL.Cairo as Cairo
 import qualified SDL.Cairo.Canvas as Canvas
---import qualified SDL.Image as Image
 import           SDL.Event as SDL
 import           SDL.Vect
 import           System.Environment
 import qualified Text.HTML.DOM as HTML
 import qualified Text.XML as XML
 
---import Debug.Trace
+-- import Debug.Trace
 
 debug :: Bool
 debug = False
-
---tracedbg = if debug then id else traceShowId
 
 --------------------------------------------------------------------------------
 -- page, DOM and resources
@@ -123,22 +119,18 @@ withStyleFor name node =
 data DOMContent
   = TextContent Text
   -- ^ A text node
-  | ImageContent !Text !(Maybe (V2 Double)) !(Maybe SDL.Surface)
-  -- ^ Image:    ^alt   ^WxH                 ^bitmap
   | NewlineContent
   -- ^ Force newline here, usually corresponds to <br>
 
 instance Show DOMContent where
   show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
-  show (ImageContent alt xy _img) = T.unpack $ T.concat txt
-    where txt = ["ImageContent \"", alt, "\" ", T.pack $ show xy, "<image>"]
   show NewlineContent = "NewlineContent"
 
 -- | A tree of bounding boxes
 type RelPos = Point V2 Double
 
 data BoxTree = BoxTree
-  { boxContent :: Either InlineContent [(RelPos, BoxTree)]
+  { boxContent :: BoxContent
   , boxNode :: Maybe DOMNode -- backreference to its node
   , boxDim :: V2 Double      -- outer dimensions
   , boxStyling :: (StyleDiff, StyleDiff)    -- instructions for box rendering
@@ -151,30 +143,33 @@ instance Show BoxTree where
       dostyle = if M.null stpush then "" else " style=" ++ (show $ M.toList stpush)
       undostyle = if M.null stpop then "" else " unstyle=" ++ (show $ M.toList stpop)
       rshow v = show (round v :: Int)
-      contents = map ("  " ++ ) $ lines $ either show (unlines . map show) content
+      contents = map ("  " ++ ) $ lines contents'
+      contents' = case content of
+        BoxInline inline -> show inline
+        BoxOfBlocks children -> L.intercalate "\n" $ map show children
       V2 x y = dim
       name = case node of
         Just (DOM { domSource=(Just (XML.NodeElement el)) }) -> T.unpack $ tagName el
         _ -> "-"
 
+data BoxContent
+  = BoxInline InlineContent
+  | BoxOfBlocks [(RelPos, BoxTree)]
+
+instance Show BoxContent where
+  show (BoxInline inline) = "BoxInline " ++ show inline
+  show (BoxOfBlocks blocks) = "BoxOfBlocks " ++ show blocks
+  --show (BoxOfLines _) = "BoxOfLines: TODO"
 
 -- | What to draw inside a box
 data InlineContent
   = TextBox !Text !Double
   | ImageBox !(Maybe (V2 Double)) SDL.Surface   -- an image
-  | HRBox                                       -- a horizontal line
 
 instance Show InlineContent where
   show (TextBox t baseline) = "TextBox " ++ show t ++ " (baseline " ++ show baseline ++ ")"
   show (ImageBox (Just (V2 w h)) _) =   concat ["ImageBox ", show w, "x", show h, " <image>"]
   show (ImageBox Nothing _) =           "ImageBox ?x? <image>"
-  show HRBox = "HRBox"
-
-bbox :: [DOMNode] -> DOMNode
-bbox children' = DOM (Right children') noStyle Events M.empty Nothing
-
-ibox :: DOMContent -> DOMNode
-ibox content = DOM (Left content) noStyle Events M.empty Nothing
 
 {-
 findBox :: BoxTree -> Point V2 Double -> Maybe BoxTree
@@ -197,7 +192,8 @@ data Events = Events
 --
 main :: IO ()
 main = do
-  url:_ <- getArgs
+  args <- getArgs
+  let url = if null args then "https://en.wikipedia.org" else head args
   (phead, pbody, resources) <- fetchURL url
 
   window <- vadoWindow
@@ -211,7 +207,7 @@ main = do
     , pageWindow = window
     }
   when debug $ putStrLn (showdbg pbody)
-  page <- layoutBoxes page0
+  page <- layoutPage page0
   vadoRedrawEventLoop page
 
 
@@ -224,7 +220,7 @@ data VadoWindow = VadoWindow
   , vadoViewport :: V2 Double
   , vadoScale :: V2 Double
   }
- 
+
 pageViewport :: Page -> V2 Double
 pageViewport = vadoViewport . pageWindow
 
@@ -301,7 +297,7 @@ vadoEventLoop page = do
       texture' <- Cairo.createCairoTexture (vadoRenderer win) (fromIntegral <$> size)
       let win' = win{ vadoTexture=texture', vadoViewport=(fromIntegral <$> size) }
       -- TODO: optimize, don't do full layout again:
-      page' <- layoutBoxes $ page{ pageWindow=win' }
+      page' <- layoutPage page{ pageWindow=win' }
       vadoRedrawEventLoop page'
     _ -> do
       vadoEventLoop page
@@ -369,210 +365,332 @@ domFromXML xml@(XML.NodeElement el) =
 domFromXML _ = Nothing
 
 
-
 --------------------------------------------------------------------------------
 -- Layout engine
 
--- | A local layout context for each DOM subtree
-data Layout = Layout
-  { ltWidth :: Double               -- what is the maximum available width
-  , ltStyle :: Style                -- what is the style at the current layer
-  , ltX :: Double                   -- where are we
-  , ltY :: Double
-  , ltLine :: LineState             -- the last line state
+type Width = Double
+type Height = Double
+type BaselineY = Double
+
+class Monad m => CanMeasureText m where
+  measureHeightAndBaseline :: Canvas.Font -> m (Height, BaselineY)
+  measureTextWidth :: Canvas.Font -> String -> m Width
+
+instance CanMeasureText Canvas.Canvas where
+  measureHeightAndBaseline font = do
+    Canvas.textFont font
+    extents <- Canvas.fontExtents
+    let h = Canvas.fontExtentsHeight extents
+    let desc = h - Canvas.fontExtentsDescent extents
+    return (h, desc)
+
+  measureTextWidth font text = do
+    Canvas.textFont font
+    V2 width _ <- Canvas.textSize text
+    return width
+
+-- Immutable parameters for a block layuot:
+data LayoutParams = LayoutParams
+  { ltWidth :: Width
   }
 
--- | A state of the current linebox
-data LineState = LineState
-  { lsHeight :: Double
-  -- lsIBoxes :: [(Double, Double, BoxTree)]
-  -- |            ^x      ^baseline
+-- Mutable state for a block layout:
+data Layout = Layout
+  { ltStyle :: Style                      -- the full CSS set for the block
+  , ltStyling :: (StyleDiff, StyleDiff)   -- (css-push, css-pop) for rendering
+  -- current coordinates relative to the containing block:
+  , ltX :: Width
+  , ltY :: Height
+  , ltMaxX :: Width             -- record maximum block width
+  , ltLS :: LineState           -- record parts of the next line box
+  , ltCtx :: LayoutCtx
+  }
+
+data LineState = LS
+  { lsBoxes :: [(BaselineY, BoxTree, Width, Width)]
+  -- ^           baseline   box     before  after
+  -- (sdl-cairo measures text with spaces before, but ignores trailing spaces)
+  , lsGap :: Bool
+  -- ^ was there a whitespace/newline before this chunk?
+  -- current box state:
+  , lsWords :: [String]
+  , lsFont :: Canvas.Font
   }
 
 -- | A global layout context for a page
 data LayoutCtx = LayoutCtx
-  { layoutTexture :: SDL.Texture
-  --, layoutX :: Double , layoutY :: Double
-  }
 
-adaptParentLayout :: DOMNode -> Layout -> Layout
-adaptParentLayout node parent = Layout
-        { ltStyle = domStyle node `cascadingOver` ltStyle parent
-        , ltWidth = ltWidth parent        -- TODO: margins, CSS width, etc
-        , ltX = 0
-        , ltY = 0
-        , ltLine = LineState { lsHeight = 0 }
-        }
+-- | The layout monad
+newtype LayoutOver m a
+  = LayoutOver { runLayout :: RWST LayoutParams [(RelPos, BoxTree)] Layout m a }
+  deriving (
+    Functor, Applicative, Monad,
+    MonadReader LayoutParams,
+    MonadWriter [(RelPos, BoxTree)],
+    MonadState Layout, MonadTrans
+  )
 
-putInlineBox :: Layout -> (V2 Double, InlineContent) -> (V2 Double, Layout)
-putInlineBox lt (V2 dx dy, _content) =
-  let lt0 = if ltX lt + dx >= ltWidth lt then putNewline lt else lt
-      lt' = lt0 { ltX = ltX lt0 + dx, ltLine = LineState { lsHeight = max dy (lsHeight $ ltLine lt0) } }
-  in (V2 (ltX lt0) (ltY lt0), lt')
-
-putNewline :: Layout -> Layout
-putNewline lt@Layout{..} = lt { ltX = 0, ltY = ltY + lsHeight ltLine, ltLine = LineState 0 }
+stackBox :: CanMeasureText m => V2 Double -> LayoutOver m (V2 Double)
+stackBox (V2 _dx dy) = LayoutOver $ do
+  lt <- get
+  put lt{ ltX = 0, ltY = ltY lt + dy }
+  return $ V2 (ltX lt) (ltY lt)
 
 -- | Entry point for layout procedure
-layoutBoxes :: Page -> IO Page
-layoutBoxes page = do
-  let VadoWindow { vadoViewport = V2 w _, vadoTexture = texture } = pageWindow page
-  let lt = Layout
-       { ltX = 0, ltY = 0
-       , ltWidth = w
-       , ltStyle = noStyle
-       , ltLine = LineState { lsHeight = 0 }
-       }
-  (boxes, _) <- blockToBoxes (LayoutCtx texture) lt (pageBody page)
-  when debug $ print boxes
-  return $ page { pageBoxes = Just boxes }
-
--- | Recursively lay out blocks
-blockToBoxes :: LayoutCtx -> Layout -> DOMNode -> IO (BoxTree, LayoutCtx)
-blockToBoxes ctx parentLayout node@DOM{ domContent = Right children } = do
-  let layout = adaptParentLayout node parentLayout
-  let styling = ltStyle parentLayout `styleDiff` ltStyle layout
-  let (allinline, normflow, _outflow) = blocksToFlowsWithWrappers (ltStyle layout) children
-  if allinline then do
-    (boxes, layout', ctx') <- foldM pushInlineBoxes ([], layout, ctx) (normflow ++ [ibox NewlineContent])
-    let boxtree = BoxTree
-          { boxContent = Right (reverse boxes)
-          , boxNode = Just node
-          , boxDim = V2 (ltWidth layout') (ltY layout')
-          , boxStyling = styling
-          }
-    return (boxtree, ctx')
-  else do
-    (boxes, layout', ctx') <- foldM stackBlocks ([], layout, ctx) normflow
-    let boxtree = BoxTree
-          { boxContent = Right (reverse boxes)
-          , boxNode = Just node
-          , boxDim = V2 (ltWidth layout') (ltY layout')
-          , boxStyling = styling
-          }
-    return (boxtree, ctx')
-blockToBoxes _ctx _lt node = error $ "blockToBoxes DOMNode{" ++ showdbg node ++ "}"
-
--- | Sort blocks into categories: blocks, floats, static
--- Blocks also must be grouped into block boxes first (False)
---   or checked that all subblocks are inline (True)
--- If all subblocks are inline -> emit an anonymous block box wrapper.
---   Group text according to `white-space` property into unbreakable
---   anonymous inline boxes (e.g. words, lines).
--- If some subblocks are blocks boxes -> wrap chunks of iboxes into
---   anonymous bboxes.
--- Separate out-of-flow blocks into a separate list.
-blocksToFlowsWithWrappers :: Style -> [DOMNode] -> (Bool, [DOMNode], [DOMNode])
-blocksToFlowsWithWrappers parentStyle children = go children Nothing ([], [])
+layoutPage :: Page -> IO Page
+layoutPage page@Page{..} = do
+    (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes LayoutCtx params noStyle pageBody
+    when debug $ print boxes
+    return page{ pageBoxes=Just boxes }
   where
-    go :: [DOMNode] -> Maybe [DOMNode] -> ([DOMNode], [DOMNode]) -> (Bool, [DOMNode], [DOMNode])
-    -- wrap up, no more children:
-    go [] mbWrapped (normflow, outflow) =
-      let allinline = L.null normflow
-          normalflow = if allinline
-                       then fromMaybe [] mbWrapped
-                       else maybe normflow (\wbox -> (bbox wbox):normflow) mbWrapped
-      in (allinline, reverse normalflow, reverse outflow)
-    -- split text into unbreakable chunks:
-    go ((DOM { domContent = Left (TextContent txt), domStyle = st }):nodes) mbWrapped result =
-      let chunks = case styleWhiteSpace (st `cascadingOver` parentStyle) of
-                    WhiteSpaceNormal -> map (ibox . TextContent) $ T.words txt
-                    WhiteSpacePre -> L.intersperse (ibox NewlineContent) $ map (ibox . TextContent) $ T.lines txt
-      in go nodes (Just $ reverse chunks ++ fromMaybe [] mbWrapped) result
-    -- handle inline subcontainers:
-    go (node@(DOM{ domContent=Right children', domStyle=st }):nodes) mbWrapped (normflow, outflow) | styleDisplay (st `cascadingOver` parentStyle) == InlineDisplay =
-      case blocksToFlowsWithWrappers (st `cascadingOver` parentStyle) children' of
-        (True, normflow', outflow') ->
-          let node' = node { domContent = Right normflow' }
-              wrapped' = Just $ maybe [node'] (node':) mbWrapped
-          in go nodes wrapped' (normflow, outflow' ++ outflow)
-        (False, normflowC, outflowC) ->
-          -- A temporary hack: CSS 2.1 does not allow bboxes inside iboxes
-          let wrappers = maybe [] (\wrapped -> [bbox (reverse wrapped)]) mbWrapped
-              normflow' = [bbox normflowC] ++ wrappers ++ normflow
-          in go nodes Nothing (normflow', reverse outflowC ++ outflow)
-    -- handle <br>:
-    go (node@DOM{ domSource=Just (XML.NodeElement el) }:nodes) mbWrapped (normflow, outflow) | tagName el == "br" =
-      go nodes (Just ((ibox NewlineContent){domSource = domSource node} : fromMaybe [] mbWrapped)) (normflow, outflow)
-    go (node@(DOM{ domStyle=st }):nodes) (Just wrapped) (normflow, outflow) =
-      case styleDisplay st of
-        InlineDisplay ->
-          -- append this ibox to wrapped:
-          go nodes (Just (node:wrapped)) (normflow, outflow)
-        BlockDisplay ->
-          -- finish the current wrapper:
-          let wrapper = bbox (reverse wrapped)
-          in go nodes Nothing (node:wrapper:normflow, outflow)
-        _ -> go nodes (Just wrapped) (normflow, outflow)
-    go (node@(DOM{ domStyle=st }):nodes) Nothing (normflow, outflow) =
-      case styleDisplay st of
-        InlineDisplay ->
-          -- start a new wrapper:
-          go nodes (Just [node]) (normflow, outflow)
-        BlockDisplay ->
-          -- just append the current node to normflow:
-          go nodes Nothing (node:normflow, outflow)
-        _ -> go nodes Nothing (normflow, outflow)
+    params = LayoutParams { ltWidth = w }
+    VadoWindow { vadoViewport = V2 w _, vadoTexture = texture } = pageWindow
 
 
-stackBlocks :: ([(RelPos, BoxTree)], Layout, LayoutCtx) -> DOMNode -> IO ([(RelPos, BoxTree)], Layout, LayoutCtx)
-stackBlocks (boxes, layout, ctx) node = do
-  (box, ctx') <- blockToBoxes ctx layout node
-  let pos = P (V2 0 (ltY layout))
-  let V2 _ dy = boxDim box
-  let layout' = layout { ltY = ltY layout + dy }
-  case boxContent box of
-    Right [] -> return (boxes, layout', ctx')  -- TODO: don't skip non-zero size
-    _ -> return ((pos, box):boxes, layout', ctx')
+elementToBoxes :: CanMeasureText m =>
+     LayoutCtx -> LayoutParams -> Style -> DOMNode ->
+     m (BoxTree, LayoutCtx)
+elementToBoxes ctx params parentStyle node@DOM{ domContent=Right children } = do
+    (layout', posboxes) <- RWS.execRWST (runLayout (layoutBlock children >> layoutLineBreak)) params layout
+    let box = BoxTree
+         { boxContent = BoxOfBlocks posboxes
+         , boxNode = Just node
+         , boxDim = V2 (ltMaxX layout') (ltY layout')
+         , boxStyling = ltStyling layout'
+         }
+    return (box, ltCtx layout')
+  where
+    st = domStyle node `cascadingOver` parentStyle
+    layout = Layout
+      { ltX = 0, ltY = 0
+      , ltMaxX = 0
+      , ltLS = LS { lsBoxes = [], lsGap = True, lsWords = [], lsFont = defaultFont }
+      , ltCtx = ctx
+      , ltStyle = st
+      , ltStyling = parentStyle `styleDiff` st
+      }
+elementToBoxes _ctx _par _st node = error $ "elementToBoxes (" ++ showdbg node ++ ")"
 
-pushInlineBoxes :: ([(RelPos, BoxTree)], Layout, LayoutCtx) -> DOMNode -> IO ([(RelPos, BoxTree)], Layout, LayoutCtx)
-pushInlineBoxes (boxes, layout, ctx) node = do
-  case domContent node of
-    Left (TextContent txt) -> do
-      let font = styleFont $ ltStyle layout
-      (V2 dx0 _, extents) <- Canvas.withCanvas (layoutTexture ctx) $ do
-        Canvas.textFont font
-        extents <- Canvas.fontExtents
-        size <- Canvas.textSize (T.unpack txt)
-        return (size, extents)
-      let dy = Canvas.fontExtentsHeight extents
-      let dx = dx0 + defaultFontSize / 2
-      let baseline = dy - Canvas.fontExtentsDescent extents
-      let content = TextBox txt baseline
-      let size = V2 dx dy
-      -- TODO: handle overflow
-      -- TODO: handle baselines
-      let (pos, layout') = putInlineBox layout (size, content)
-      let box = BoxTree
-            { boxContent = Left content
-            , boxNode = Just node
-            , boxDim = size
-            , boxStyling = (M.empty, M.empty)
-            }
-      return ((P pos, box):boxes, layout', ctx)
-    Left NewlineContent ->
-      return (boxes, putNewline layout, ctx)
-    Right children ->
-      case styleDisplay $ domStyle node of
-        InlineDisplay -> do
-          let layout0 = layout { ltStyle = domStyle node `cascadingOver` ltStyle layout }
-          (subboxes, layout0', ctx') <- foldM pushInlineBoxes ([], layout0, ctx) children
-          let layout' = layout
-                { ltX = ltX layout0', ltY = ltY layout0'
-                , ltLine = LineState { lsHeight = max (lsHeight $ ltLine layout0') (lsHeight $ ltLine layout) }
-                }
-          let box = BoxTree
-               { boxContent = Right (reverse subboxes)
-               , boxNode = Just node
-               , boxDim = V2 (ltX layout' - ltX layout) (ltY layout' - ltY layout)
-               , boxStyling = ltStyle layout `styleDiff` ltStyle layout0'
-               }
-          return ((P (V2 0 0), box):boxes, layout', ctx')
-        NoneDisplay -> return (boxes, layout, ctx)
-        BlockDisplay -> error "BUG: block inside an inline"
-        -- _ -> error "TODO: inline-block"
-    _ -> undefined
+withStyle :: CanMeasureText m => DOMNode -> LayoutOver m a -> LayoutOver m a
+withStyle node action = do
+    parentStyle <- gets ltStyle
+    parentStyling <- gets ltStyling
+    let st = domStyle node `cascadingOver` parentStyle
+    let styling = parentStyle `styleDiff` st
+    modify $ \lt -> lt{ ltStyle=st, ltStyling=styling }
+    result <- action
+    modify $ \lt -> lt{ ltStyle=parentStyle, ltStyling=parentStyling }
+    return result
 
+layoutBlock :: CanMeasureText m => [DOMNode] -> LayoutOver m ()
+layoutBlock children = do
+  parentSt <- gets ltStyle
+  forM_ children $ \child@DOM{ domContent=content, domStyle=st } -> do
+    case (content, styleDisplay st) of
+      (_, NoneDisplay) ->
+        return ()
+      (Left (TextContent txt), _) ->
+        layoutText txt
+      (Left NewlineContent, _) ->
+        layoutLineBreak
+      (Right children', InlineDisplay) ->
+        withStyle child $ layoutBlock children'
+      (Right _, BlockDisplay) -> do
+        layoutLineBreak
+        params <- ask
+        ctx <- gets ltCtx
+        (box, ctx') <- lift $ elementToBoxes ctx params parentSt child
+        modify (\lt -> lt{ ltCtx=ctx' })
+        pos <- stackBox (boxDim box)
+        tell [(P pos, box)]
+      _ ->
+        error $ "layoutBlock " ++ showdbg child
+
+layoutText :: CanMeasureText m => Text -> LayoutOver m ()
+layoutText txt = do
+  st <- gets ltStyle
+  gap0 <- gets (lsGap . ltLS)
+  let (_gap, chunks) = chunksFromTokens (styleWhiteSpace st) (gap0, textTokens txt)
+
+  layoutInlineStart
+  forM_ chunks $ \case
+    "\n" -> layoutLineBreak
+    " " -> layoutInlineSpace
+    chunk -> layoutInlineWord chunk
+  layoutInlineClose
+
+layoutInlineStart :: CanMeasureText m => LayoutOver m ()
+layoutInlineStart = do
+  font <- gets (styleFont . ltStyle)
+  ls0 <- gets ltLS
+  let ls = ls0{ lsWords = [], lsFont = font }
+  modify $ \lt -> lt{ ltLS = ls }
+
+layoutInlineWord :: CanMeasureText m => String -> LayoutOver m ()
+layoutInlineWord chunk = do
+  maxwidth <- asks ltWidth
+  font <- gets (lsFont . ltLS)
+  x <- gets ltX
+  w <- lift $ measureTextWidth font chunk
+  when (x + w >= maxwidth) $ do
+    layoutLineBreak
+  modify (\lt ->
+    let ls = ltLS lt
+    in lt{ ltX=ltX lt + w, ltLS=ls{ lsWords=lsWords ls ++ [chunk], lsGap = False } }
+    )
+
+layoutInlineSpace :: CanMeasureText m => LayoutOver m ()
+layoutInlineSpace = do
+  fontsize <- gets (styleFontSize . ltStyle)
+  modify (\lt ->
+    let x = ltX lt + fontsize/2    -- not exactly, but no other way to measure
+        ls = ltLS lt
+        ls' = ls{ lsWords=lsWords ls ++ [" "], lsGap = True }
+    in lt{ ltX=x, ltLS=ls' })
+
+layoutInlineClose :: CanMeasureText m => LayoutOver m ()
+layoutInlineClose = do
+  lt <- get
+  let font = styleFont $ ltStyle lt
+  let ls = ltLS lt
+  let txt = concat $ lsWords ls
+
+  unless (null txt) $ do
+    wgap <- lift $ (/ 4) <$> measureTextWidth font "____"
+    let (txt', wbefore, wafter) =
+         let (before, txt0) = L.break (not . C.isSpace) txt
+             wb = wgap * fromIntegral (length before)
+             (after, txt1) = L.break (not . C.isSpace) (reverse txt0)
+             wa = wgap * fromIntegral (length after)
+         in (reverse txt1, wb, wa)
+
+    (h, baseline) <- lift $ measureHeightAndBaseline font
+    w <- lift $ measureTextWidth font txt'    -- TODO: normalize monospace
+    let box = BoxTree
+          { boxContent = BoxInline (TextBox (T.pack txt') baseline)
+          , boxNode = Nothing
+          , boxDim = V2 w h
+          , boxStyling = ltStyling lt
+          }
+    let ls' = ls { lsBoxes = lsBoxes ls ++ [(baseline, box, wbefore, wafter)], lsWords = [] }
+    put $ lt{ ltLS = ls' }
+
+layoutLineBreak :: CanMeasureText m => LayoutOver m ()
+layoutLineBreak = do
+  ws <- gets (lsWords . ltLS)
+  when (not (null ws)) $ do
+    layoutInlineClose
+
+  bs <- gets (lsBoxes . ltLS)
+  if null bs then do
+    whsp <- gets (styleWhiteSpace . ltStyle)
+    when (whsp == WhiteSpacePre) $ do
+      -- advance Y by a line height:
+      font <- gets (styleFont . ltStyle)
+      (_, h) <- lift $ measureHeightAndBaseline font
+      modify $ \lt -> lt{ ltY = ltY lt + h }
+  else do
+    -- determine the line ascent and descent:
+    let (ascents, descents) = unzip $ map (\(bl, box, _, _) -> let V2 _ h = boxDim box in (bl, h - bl)) bs
+    let baseline = maximum ascents
+    let height = baseline + maximum descents
+
+    -- arrange boxes to the known baseline:
+    modify $ \lt -> lt{ ltX = 0 }
+    posboxes <- forM bs $ \(bl, box, wbefore, wafter) -> do
+      let V2 dx _ = boxDim box
+      x <- gets ltX
+      modify $ \lt -> lt{ ltX=ltX lt + wbefore + dx + wafter }
+      return (P (V2 (x+wbefore) (baseline - bl)), box)
+    width <- gets ltX
+    modify $ \lt -> lt{ ltMaxX = max (ltMaxX lt) width }
+
+    -- emit the line box:
+    let linebox = BoxTree
+          { boxContent = BoxOfBlocks posboxes
+          , boxNode = Nothing
+          , boxDim = V2 width height
+          , boxStyling = noStyling
+          }
+    modify $ \lt -> lt{ ltX = 0 }
+    pos <- stackBox (boxDim linebox)
+    tell [(P pos, linebox)]
+
+  modify $ \lt -> lt{ ltX = 0, ltLS = (ltLS lt){ lsBoxes=[], lsGap=True, lsWords=[] } }
+
+
+-- Whitespace and tokens:
+
+textTokens :: Text -> [String]
+textTokens = go . T.unpack
+  where
+    go "" = []
+    go ('\n':t) = "\n" : go t
+    go (c:t) | C.isSpace c = " " : go t
+    go t = let (word, t') = L.break C.isSpace t in word : go t'
+
+chunksFromTokens :: WhiteSpace -> (Bool, [String]) -> (Bool, [String])
+chunksFromTokens WhiteSpaceNormal (gap, ts) = (gap', reverse chunks)
+  where
+    (gap', chunks) = L.foldl' go (gap, []) ts
+    go (True, buf) " " = (True, buf)
+    go (True, buf) "\n" = (True, buf)
+    go (False, buf) " " = (True, " " : buf)
+    go (False, buf) "\n" = (True, " " : buf)
+    go (_, buf) t = (False, t : buf)
+
+chunksFromTokens WhiteSpacePre (gap, tokens) = (gap', lns)
+  where
+    gap' = if null lns then gap else let ln = last lns in ln == "\n" || C.isSpace (last ln)
+    lns = go ([], []) tokens
+    go (buf, res) [] = res ++ (if null buf then [] else [concat buf])
+    go (buf, res) ("\n":ts) = go ([], res ++ (if null buf then [] else [concat buf]) ++ ["\n"]) ts
+    go (buf, res) (t:ts) = go (buf ++ [t], res) ts
+
+-- Tests
+
+run_tests :: (Eq b, Show b) => (a -> b) -> [(b, a)] -> IO ()
+run_tests f = mapM_ (\(want, got) -> putStrLn $ concat ["want: ", show want, "\t got: ", show got] ) . mapMaybe (test_one f)
+
+test_one :: Eq b => (a -> b) -> (b, a) -> Maybe (b, b)
+test_one f (want, arg) = let got = f arg in if got == want then Nothing else Just (want, got)
+
+test_textTokens :: IO ()
+test_textTokens = run_tests textTokens [
+    ([],                            "")
+  , (["hello"],                     "hello")
+  , ([" ", "world", " "],           " world ")
+  , (["hello", " ", "world", " "],  "hello world ")
+  , (["hello", " ", " ", "world"],  "hello  world")
+  , (["hello", " ", "\n", "world", "\n"],    "hello \nworld\n")
+  ]
+
+test_chunksFromTokens_Normal :: IO ()
+test_chunksFromTokens_Normal = run_tests (chunksFromTokens WhiteSpaceNormal) [
+    ((False, []),               (False, []))
+  , ((True, []),                (True, []))
+  , ((True, [" "]),                (False, [" "]))
+  , ((True, []),                (True, ["\n"]))
+  , ((True, [" "]),                (False, [" ", " ", " "]))
+  , ((True, ["hello", " "]),         (False, ["hello", " ", " "]))
+  , ((False, [" ", "hello"]),   (False, [" ", "hello"]))
+  , ((False, ["hello"]),        (True, [" ", "hello"]))
+  , ((True, ["hello", " "]),        (True, ["\n", "hello", "\n"]))
+  , ((True, [" ", "hello", " "]),   (False, ["\n", "hello", "\n"]))
+  ] -- want                       args
+test_chunksFromTokens_Pre :: IO ()
+test_chunksFromTokens_Pre = run_tests (chunksFromTokens WhiteSpacePre) [
+    ((False, []),               (False, []))
+  , ((True, []),                (True, []))
+  , ((True, ["\n", "\n"]),      (True, ["\n", "\n"]))
+  , ((False, ["hello"]),        (False, ["hello"]))
+  , ((False, ["hello"]),        (False, ["hello"]))
+  , ((True, ["hello "]),        (False, ["hello", " "]))
+  , ((True, ["hello ", "\n"]),  (False, ["hello", " ", "\n"]))
+  , ((False, ["  hello ", "\n", "world"]),             (False, [" ", " ", "hello", " ", "\n", "world"]))
+  , ((True, ["  hello ", "\n", "world", "\n"]),             (False, [" ", " ", "hello", " ", "\n", "world", "\n"]))
+  , ((True, ["hello  world ", "\n", "world", "\n", "\n"]),  (False, ["hello", " ", " ", "world", " ", "\n", "world", "\n", "\n"]))
+  ]
 
 --------------------------------------------------------------------------------
 -- Rendering engine
@@ -593,14 +711,15 @@ renderDOM page = do
 renderTree :: (Double, Double) -> (Double, Double, Style) -> BoxTree -> Canvas.Canvas ()
 renderTree (minY, maxY) (x, y, st0) box = do
   case boxContent box of
-    Right children ->
+    BoxOfBlocks children ->
       forM_ children $ \(P (V2 dx dy), child) -> do
         let V2 _ boxH = boxDim child
         unless ((y+dy) + boxH < minY || maxY < (y+dy)) $ do
           withStyling child st0 $ \st ->
             renderTree (minY, maxY) (x + dx, y + dy, st) child
-    Left (TextBox txt baseline) ->
+    BoxInline (TextBox txt baseline) ->
       Canvas.textBaseline (T.unpack txt) (V2 x (y + baseline - minY))
+    _ -> error $ "TODO: renderTree " ++ show (boxContent box)
 
 withStyling :: BoxTree -> Style -> (Style -> Canvas.Canvas a) -> Canvas.Canvas a
 withStyling BoxTree{boxStyling=(stpush, stpop)} st0 action = do
@@ -618,11 +737,6 @@ withStyling BoxTree{boxStyling=(stpush, stpop)} st0 action = do
         else case prop of
           "color" -> Canvas.stroke $ fromMaybe defaultColor $ cssColor (T.unpack val)
           _ -> return ()
-
-{-
-scrollBoxes :: Page -> Double -> IO ()
-scrollBoxes _page _dy = undefined
--}
 
 
 --------------------------------------------------------------------------------
@@ -722,8 +836,8 @@ styleFont st = Canvas.Font face size (weight == BoldWeight) (italic == ItalicSty
     weight = styleFontWeight st
     italic = styleFontStyle st
 
---defaultFont :: Canvas.Font
---defaultFont = Canvas.Font defaultFontFace defaultFontSize False False
+defaultFont :: Canvas.Font
+defaultFont = Canvas.Font defaultFontFace defaultFontSize False False
 
 -- | Merge the inherited style and the element style.
 css :: [(Text, Text)] -> Style
@@ -767,6 +881,9 @@ styleDiff Style{styleInherit=old} Style{styleInherit=new} = (toNew, toOld)
     toNew = M.differenceWith (\v1 v2 -> if v1 /= v2 then Just v1 else Nothing) new old
     toOld = M.differenceWith (\v1 v2 -> if v1 /= v2 then Just v1 else Nothing) old new
 
+noStyling :: (StyleDiff, StyleDiff)
+noStyling = (M.empty, M.empty)
+
 applyDiff :: Style -> StyleDiff -> Style
 applyDiff st diff = st { styleInherit = M.mergeWithKey (\_ val _ -> Just val) id id diff (styleInherit st) }
 
@@ -804,7 +921,7 @@ elementStyles =
      [ ("a",        css [color "#00e", display_inline])
      , ("abbr",     inline)
      , ("acronym",  inline)
-     , ("b",        inline)
+     , ("b",        css [fontweight_bold, display_inline])
      , ("bdo",      inline)
      , ("big",      css [fontsize (1.17 * defaultFontSize), display_inline])
      , ("blockquote", css [("margin", "40px 15px")])
