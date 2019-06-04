@@ -261,36 +261,10 @@ vadoEventLoop :: Page -> IO ()
 vadoEventLoop page = do
   event <- waitEvent
   case eventPayload event of
-    QuitEvent -> return ()
-    WindowClosedEvent {} -> return ()
-    MouseButtonEvent e ->
-      case mouseButtonEventMotion e of
-        {-
-        Released -> do
-          let xy = let P (V2 w h) = mouseButtonEventPos e
-                   in P (V2 (fromIntegral w * scalex) (fromIntegral h * scaley))
-          case findBox (fromJust $ evBoxes ev) xy of
-            Just box ->
-              case eventsClick $ boxEvents box of
-                Just handler ->
-                  let loadUrl uri = do
-                        request' <- setUriRelative (evRequest ev) uri
-                        putStrLn ("Downloading: " ++ show request')
-                        content' <- getContent request'
-                        let scrollY' = 0
-                        ev' <- layoutBoxes scale (ev {evContent = content', evScrollY = 0})
-                        renderBoxes ev'
-                        eloop scale ev'
-                  in handler loadUrl (eloop scale ev)
-            _ -> eloop scale ev
-            -}
-        _ -> vadoEventLoop page
-    MouseWheelEvent e -> do
-      let V2 _ dy = mouseWheelEventPos e
-      let V2 _ viewH = pageViewport page
-      let pageH = maybe viewH (\b -> let V2 _ boxH = boxDim b in boxH) $ pageBoxes page
-      let scrollY = min (max 0 (pageH - viewH)) $ max 0 (pageScroll page - 5 * fromIntegral dy)
-      vadoRedrawEventLoop $ page{ pageScroll=scrollY }
+    QuitEvent ->
+      return ()
+    WindowClosedEvent {} ->
+      return ()
     WindowResizedEvent e -> do
       let size = windowResizedEventSize e
       let win = pageWindow page
@@ -299,11 +273,44 @@ vadoEventLoop page = do
       -- TODO: optimize, don't do full layout again:
       page' <- layoutPage page{ pageWindow=win' }
       vadoRedrawEventLoop page'
+
+    MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released -> do
+      let P xy = mouseButtonEventPos e
+      putStrLn $ "clicked at " ++ show xy
+      vadoEventLoop page
+    MouseWheelEvent e -> do
+      let V2 _ dy = mouseWheelEventPos e
+      vadoRedrawEventLoop $ vadoScroll (negate $ fromIntegral dy) page
+    MouseMotionEvent _ ->
+      vadoEventLoop page
+
+    KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
+      case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
+        SDL.KeycodePageUp -> do
+          vadoRedrawEventLoop $ vadoScroll (negate $ vadoViewHeight page) page
+        SDL.KeycodePageDown -> do
+          vadoRedrawEventLoop $ vadoScroll (vadoViewHeight page) page
+        SDL.KeycodeHome ->
+          vadoRedrawEventLoop $ vadoScroll (negate $ pageScroll page) page
+        SDL.KeycodeEnd ->
+          let pageH = maybe 0 (\box -> let V2 _ h = boxDim box in h) $ pageBoxes page
+          in vadoRedrawEventLoop $ vadoScroll pageH page
+        _ ->
+          vadoEventLoop page
+
     _ -> do
       vadoEventLoop page
 
 vadoRedrawEventLoop :: Page -> IO ()
 vadoRedrawEventLoop page = renderDOM page >> vadoEventLoop page
+
+vadoScroll :: Height -> Page -> Page
+vadoScroll dy page = page{ pageScroll = max 0 $ min (pageScroll page + dy) (pageH - vadoViewHeight page) }
+  where V2 _ pageH = fromMaybe 0 $ boxDim <$> pageBoxes page
+
+vadoViewHeight :: Page -> Double
+vadoViewHeight page = h
+  where V2 _ h = pageViewport page
 
 --------------------------------------------------------------------------------
 -- HTTP request, caches and local storage
@@ -698,13 +705,12 @@ test_chunksFromTokens_Pre = run_tests (chunksFromTokens WhiteSpacePre) [
 renderDOM :: Page -> IO ()
 renderDOM page = do
   let minY = pageScroll page
-  let V2 _ viewY = pageViewport page
   let (texture, renderer) = let win = pageWindow page in (vadoTexture win, vadoRenderer win)
   Canvas.withCanvas texture $ do
     let body = fromJust $ pageBoxes page
     Canvas.background $ Canvas.rgb 255 255 255 -- TODO: set to body background color
     withStyling body noStyle $ \st ->
-      renderTree (minY, minY + viewY) (0, 0, st) body
+      renderTree (minY, minY + vadoViewHeight page) (0, 0, st) body
   SDL.copy (vadoRenderer $ pageWindow page) texture Nothing Nothing
   SDL.present renderer
 
