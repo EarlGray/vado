@@ -6,15 +6,18 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
 
+import           Control.Applicative
 import           Control.Monad
 import           Control.Monad.RWS.Strict as RWS
+import qualified Data.Attoparsec.Text as Atto
 import qualified Data.ByteString.Lazy as B
 import qualified Data.Char as C
---import           Data.HashMap.Strict ((!))
 import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
 import qualified Data.Map.Strict as M
 import           Data.Maybe
+import           Data.Word (Word8)
+import           Data.Either (partitionEithers)
 import           Data.String
 import           Data.Text ( Text)
 import qualified Data.Text as T
@@ -34,10 +37,13 @@ import           System.Environment
 import qualified Text.HTML.DOM as HTML
 import qualified Text.XML as XML
 
--- import Debug.Trace
+import Debug.Trace as Trace
 
 debug :: Bool
 debug = False
+
+warning :: String -> a -> a
+warning msg = Trace.trace msg
 
 --------------------------------------------------------------------------------
 -- page, DOM and resources
@@ -45,21 +51,15 @@ debug = False
 -- | State of the page
 data Page = Page
   { pageBody :: DOMNode
+  -- ^ the body DOM tree
   , pageHead :: XML.Element
-  --, pageElementById :: M.Map Text DOM
-  --, pageFocusable :: Zipper DOM
-  --, pageForms :: M.Set DOM
-  , pageResources :: M.Map URI HTTPResource
+  -- ^ XML source of <head></head>
   , pageBoxes :: Maybe BoxTree
-  , pageScroll :: Double
+  -- ^ Rendering tree
   , pageWindow :: VadoWindow
+  , pageScroll :: Height
+  , pageResources :: M.Map URI HTTPResource
   }
-
-data HTTPResource {-= HTTPResource
-  { resContentType :: Text
-  , resContentLength :: Integer
-  , resContentData :: B.ByteString
-  -}
 
 data DOMNode = DOM
   { domContent :: Either DOMContent [DOMNode]
@@ -91,9 +91,8 @@ instance HasDebugView DOMNode where
                   Right children -> concat $ map showdbg children
                   Left content -> show content
 
--- TODO: rename nodeTemplate
-defaultNode :: DOMNode
-defaultNode = DOM
+emptyNode :: DOMNode
+emptyNode = DOM
   { domContent = Right []
   , domStyle = noStyle
   , domEvents = Events
@@ -102,16 +101,10 @@ defaultNode = DOM
   }
 
 makeTextNode :: Text -> DOMNode
-makeTextNode txt = defaultNode { domContent = Left (TextContent txt) }
+makeTextNode txt = emptyNode { domContent = Left (TextContent txt) }
 
 makeNode :: [DOMNode] -> DOMNode
-makeNode children = defaultNode { domContent = Right children }
-
-withStyleFor :: Text -> DOMNode -> DOMNode
-withStyleFor name node =
-  case HM.lookup name elementStyles of
-    Just st -> node { domStyle = st }
-    Nothing -> node
+makeNode children = emptyNode { domContent = Right children }
 
 -- | Content of a leaf DOM node,
 -- i.e. what is to be drawn in this node.
@@ -126,6 +119,25 @@ instance Show DOMContent where
   show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
   show NewlineContent = "NewlineContent"
 
+--------------------------------------------------------------------------------
+-- | Normalize an XML tree of elements and text, possibly with
+-- attributes like style and event handlers.
+domFromXML :: XML.Node -> Maybe DOMNode
+domFromXML xml@(XML.NodeContent txt) =
+    Just $ DOM (Left (TextContent txt)) noStyle Events M.empty (Just xml)
+domFromXML xml@(XML.NodeElement el) =
+    Just $ DOM (Right children) style Events attrs (Just xml)
+  where
+    children = mapMaybe domFromXML $ XML.elementNodes el
+    attrs = M.mapKeys (XML.nameLocalName) $ XML.elementAttributes el
+
+    builtin_style = fromMaybe noStyle $ HM.lookup (tagName el) elementStyles
+    attr_style = fromMaybe noStyle $ decodeXMLAttribute "style" el
+    style = attr_style `overriding` builtin_style
+domFromXML _ = Nothing
+
+
+--------------------------------------------------------------------------------
 -- | A tree of bounding boxes
 type RelPos = Point V2 Double
 
@@ -159,7 +171,6 @@ data BoxContent
 instance Show BoxContent where
   show (BoxInline inline) = "BoxInline " ++ show inline
   show (BoxOfBlocks blocks) = "BoxOfBlocks " ++ show blocks
-  --show (BoxOfLines _) = "BoxOfLines: TODO"
 
 -- | What to draw inside a box
 data InlineContent
@@ -315,6 +326,12 @@ vadoViewHeight page = h
 --------------------------------------------------------------------------------
 -- HTTP request, caches and local storage
 
+data HTTPResource {-= HTTPResource
+  { resContentType :: Text
+  , resContentLength :: Integer
+  , resContentData :: B.ByteString
+  -}
+
 fetchURL :: String -> IO (XML.Element, DOMNode, M.Map URI HTTPResource)
 fetchURL pageURL = do
   pageReq <- makeRequest pageURL
@@ -334,7 +351,7 @@ fetchURL pageURL = do
   else if "text/" `T.isPrefixOf` contentType then do
     let respbody = T.decodeUtf8 $ B.toStrict $ responseBody pageResp
     let text = makeTextNode respbody
-    let pre = withStyleFor "pre" $ makeNode [text]
+    let pre = withBuiltinStyle "pre" $ makeNode [text]
     return $ fakePage [pre]
   else if "image/" `T.isPrefixOf` contentType then do
     let img = undefined
@@ -342,7 +359,7 @@ fetchURL pageURL = do
   else
     error $ "TODO: Content-Type " ++ (T.unpack contentType)
   where
-    fakePage elements = (fakeNode "head" [], withStyleFor "body" (makeNode elements), M.empty)
+    fakePage elements = (fakeNode "head" [], withBuiltinStyle "body" (makeNode elements), M.empty)
     fakeNode name nodes = XML.Element (XML.Name name Nothing Nothing) M.empty nodes
 
 makeRequest :: String -> IO Request
@@ -351,26 +368,6 @@ makeRequest url = do
   let req = request0 { requestHeaders = [ (HTTP.hUserAgent, "github.com/chrisdone/vado") ] }
   when debug $ print req
   return req
-
---------------------------------------------------------------------------------
-
-
--- | Normalize an XML tree of elements and text, possibly with
--- attributes like style and event handlers.
-domFromXML :: XML.Node -> Maybe DOMNode
-domFromXML xml@(XML.NodeContent txt) =
-    Just $ DOM (Left (TextContent txt)) noStyle Events M.empty (Just xml)
-domFromXML xml@(XML.NodeElement el) =
-    Just $ DOM (Right children) style Events attrs (Just xml)
-  where
-    children = mapMaybe domFromXML $ XML.elementNodes el
-    attrs = M.mapKeys (XML.nameLocalName) $ XML.elementAttributes el
-
-    builtin_style = fromMaybe noStyle $ HM.lookup (tagName el) elementStyles
-    attr_style = fromMaybe noStyle $ decodeXMLAttribute "style" el
-    style = attr_style `overriding` builtin_style
-domFromXML _ = Nothing
-
 
 --------------------------------------------------------------------------------
 -- Layout engine
@@ -493,31 +490,33 @@ layoutBlock :: CanMeasureText m => [DOMNode] -> LayoutOver m ()
 layoutBlock children = do
   parentSt <- gets ltStyle
   forM_ children $ \child@DOM{ domContent=content, domStyle=st } -> do
-    case (content, styleDisplay st) of
-      (_, NoneDisplay) ->
+    case (content, st `cssValue` CSSDisplay) of
+      (_, CSS_Keyword "none") ->
         return ()
       (Left (TextContent txt), _) ->
         layoutText txt
       (Left NewlineContent, _) ->
         layoutLineBreak
-      (Right children', InlineDisplay) ->
+      (Right children', CSS_Keyword "inline") ->
         withStyle child $ layoutBlock children'
-      (Right _, BlockDisplay) -> do
+      (Right _, CSS_Keyword "block") -> do
+        -- wrap up the previous line (if any):
         layoutLineBreak
+        -- start a new containing block:
         params <- ask
         ctx <- gets ltCtx
         (box, ctx') <- lift $ elementToBoxes ctx params parentSt child
         modify (\lt -> lt{ ltCtx=ctx' })
         pos <- stackBox (boxDim box)
         tell [(P pos, box)]
-      _ ->
-        error $ "layoutBlock " ++ showdbg child
+      (_, display) ->
+        error $ concat ["layoutBlock: display=", show display, ", child=", showdbg child]
 
 layoutText :: CanMeasureText m => Text -> LayoutOver m ()
 layoutText txt = do
   st <- gets ltStyle
   gap0 <- gets (lsGap . ltLS)
-  let (_gap, chunks) = chunksFromTokens (styleWhiteSpace st) (gap0, textTokens txt)
+  let (_gap, chunks) = chunksFromTokens (st `cssValue` CSSWhiteSpace) (gap0, textTokens txt)
 
   layoutInlineStart
   forM_ chunks $ \case
@@ -590,8 +589,8 @@ layoutLineBreak = do
 
   bs <- gets (lsBoxes . ltLS)
   if null bs then do
-    whsp <- gets (styleWhiteSpace . ltStyle)
-    when (whsp == WhiteSpacePre) $ do
+    preserveNewine <- gets (stylePreservesNewlines . ltStyle)
+    when preserveNewine $ do
       -- advance Y by a line height:
       font <- gets (styleFont . ltStyle)
       (_, h) <- lift $ measureHeightAndBaseline font
@@ -636,8 +635,8 @@ textTokens = go . T.unpack
     go (c:t) | C.isSpace c = " " : go t
     go t = let (word, t') = L.break C.isSpace t in word : go t'
 
-chunksFromTokens :: WhiteSpace -> (Bool, [String]) -> (Bool, [String])
-chunksFromTokens WhiteSpaceNormal (gap, ts) = (gap', reverse chunks)
+chunksFromTokens :: CSSValue -> (Bool, [String]) -> (Bool, [String])
+chunksFromTokens (CSS_Keyword "normal") (gap, ts) = (gap', reverse chunks)
   where
     (gap', chunks) = L.foldl' go (gap, []) ts
     go (True, buf) " " = (True, buf)
@@ -646,13 +645,16 @@ chunksFromTokens WhiteSpaceNormal (gap, ts) = (gap', reverse chunks)
     go (False, buf) "\n" = (True, " " : buf)
     go (_, buf) t = (False, t : buf)
 
-chunksFromTokens WhiteSpacePre (gap, tokens) = (gap', lns)
+chunksFromTokens (CSS_Keyword "pre") (gap, tokens) = (gap', lns)
   where
     gap' = if null lns then gap else let ln = last lns in ln == "\n" || C.isSpace (last ln)
     lns = go ([], []) tokens
     go (buf, res) [] = res ++ (if null buf then [] else [concat buf])
     go (buf, res) ("\n":ts) = go ([], res ++ (if null buf then [] else [concat buf]) ++ ["\n"]) ts
     go (buf, res) (t:ts) = go (buf ++ [t], res) ts
+
+chunksFromTokens whitespace ts = chunksFromTokens (warning msg $ CSS_Keyword "normal") ts
+  where msg = "TODO: chunksFromTokens fallback to 'normal' instead of: " ++ show whitespace
 
 -- Tests
 
@@ -673,7 +675,7 @@ test_textTokens = run_tests textTokens [
   ]
 
 test_chunksFromTokens_Normal :: IO ()
-test_chunksFromTokens_Normal = run_tests (chunksFromTokens WhiteSpaceNormal) [
+test_chunksFromTokens_Normal = run_tests (chunksFromTokens (CSS_Keyword "normal")) [
     ((False, []),               (False, []))
   , ((True, []),                (True, []))
   , ((True, [" "]),                (False, [" "]))
@@ -686,7 +688,7 @@ test_chunksFromTokens_Normal = run_tests (chunksFromTokens WhiteSpaceNormal) [
   , ((True, [" ", "hello", " "]),   (False, ["\n", "hello", "\n"]))
   ] -- want                       args
 test_chunksFromTokens_Pre :: IO ()
-test_chunksFromTokens_Pre = run_tests (chunksFromTokens WhiteSpacePre) [
+test_chunksFromTokens_Pre = run_tests (chunksFromTokens (CSS_Keyword "pre")) [
     ((False, []),               (False, []))
   , ((True, []),                (True, []))
   , ((True, ["\n", "\n"]),      (True, ["\n", "\n"]))
@@ -738,10 +740,18 @@ withStyling BoxTree{boxStyling=(stpush, stpop)} st0 action = do
     applyStyling :: Style -> StyleDiff -> Canvas.Canvas ()
     applyStyling st diff = do
       forM_ (M.toList diff) $ \(prop, val) -> do
-        if "font-" `T.isPrefixOf` prop then
-          Canvas.textFont $ styleFont st
-        else case prop of
-          "color" -> Canvas.stroke $ fromMaybe defaultColor $ cssColor (T.unpack val)
+        case (prop, val) of
+          (CSSFont, CSS_Font _) ->
+            Canvas.textFont $ styleFont st
+          (CSSColor, CSS_RGB r g b) ->
+            Canvas.stroke $ Canvas.rgb r g b
+          (CSSColor, CSS_Keyword name) ->
+            -- TODO: move to cascadingOver?
+            case cssReadValue <$> M.lookup name cssColorAliases of
+              Just (Right (CSS_RGB r g b)) ->
+                Canvas.stroke $ Canvas.rgb r g b
+              _ ->
+                return $ warning ("unknown color: " ++ T.unpack name) ()
           _ -> return ()
 
 
@@ -752,17 +762,19 @@ withStyling BoxTree{boxStyling=(stpush, stpop)} st0 action = do
 -- Must be complete (e.g. not just style diff)
 -- No types for now, just stringly-typed prototypes.
 data Style = Style
-  { styleOwn :: M.Map Text Text
-  , styleInherit :: M.Map Text Text
+  { styleOwn :: M.Map CSSOwnProperty CSSValue
+  , styleInherit :: M.Map CSSProperty CSSValue
   }
 
 -- A difference in styles
-type StyleDiff = M.Map Text Text
+type StyleDiff = M.Map CSSProperty CSSValue
 
 instance HasDebugView Style where
-  showdbg Style{..} =
-    T.unpack $ T.intercalate "; " $ map showprop (M.toAscList styleOwn ++ M.toAscList styleInherit)
-    where showprop (prop, val) = T.concat [prop, ": ", val]
+  showdbg Style{..} = L.intercalate "; " (ownprops ++ inheritprops)
+    where
+      ownprops = map showprop $ M.toAscList styleOwn
+      inheritprops = map showprop $ M.toAscList styleInherit
+      showprop (prop, val) = concat [showdbg prop, ": ", showdbg val]
 
 instance Show Style where
   show = showdbg
@@ -770,111 +782,213 @@ instance Show Style where
 instance Read Style where
   readsPrec _ s = [(cssFarcer s, "")]
 
--- | Helper CSS types
-data Display = NoneDisplay | BlockDisplay | InlineDisplay
+class IsCSSProperty prop where
+  cssValueMaybe :: Style -> prop -> Maybe CSSValue
+  cssDefault :: prop -> CSSValue
+
+  cssValue :: Style -> prop -> CSSValue
+  cssValue st prop = fromMaybe (cssDefault prop) (cssValueMaybe st prop)
+
+
+-- | CSS properties and values
+type UnknownOr a = Either Text a
+
+-- | Inheritable properites:
+data CSSProperty
+  = CSSBackgroundColor
+  | CSSColor
+  | CSSFont
+  | CSSWhiteSpace
+  deriving (Show, Eq, Ord, Enum)
+
+cssPropertyNames :: M.Map CSSProperty Text
+cssPropertyNames = M.fromList
+  [ (CSSBackgroundColor,    "background-color")
+  , (CSSColor,              "color")
+  , (CSSWhiteSpace,         "white-space")
+  ]
+
+cssNamesOfProperties :: M.Map Text CSSProperty
+cssNamesOfProperties =
+  M.fromList [ (v, k) | (k, v) <- M.toList cssPropertyNames ]
+
+cssPropertyDefaults :: M.Map CSSProperty CSSValue
+cssPropertyDefaults = M.fromList
+  [ (CSSBackgroundColor,    CSS_RGB 255 255 255)
+  , (CSSColor,              CSS_RGB 0 0 0)
+  , (CSSWhiteSpace,         CSS_Keyword "normal")
+  ]
+
+instance IsCSSProperty CSSProperty where
+  cssValueMaybe Style{ styleInherit=properties } prop =
+    M.lookup prop properties
+
+  cssDefault prop =
+    case M.lookup prop cssPropertyDefaults of
+      Just val -> val
+      Nothing -> CSS_Keyword "uninitialized"
+
+instance HasDebugView CSSProperty where
+  showdbg prop =
+    case M.lookup prop cssPropertyNames of
+      Just name -> T.unpack name
+      Nothing -> concat ["TODO:showdbg(", show prop, ")"]
+
+-- | Non-inheritable properties:
+data CSSOwnProperty
+  = CSSDisplay
+  | CSSMargin
+  | CSSBorder
+  | CSSPadding
+  deriving (Show, Eq, Ord, Enum)
+
+cssOwnPropertyNames :: M.Map CSSOwnProperty Text
+cssOwnPropertyNames = M.fromList
+  [ (CSSDisplay,                "display")
+  , (CSSMargin,                 "margin")
+  , (CSSBorder,                 "border")
+  , (CSSPadding,                "padding")
+  ]
+cssOwnPropertyDefaults :: M.Map CSSOwnProperty CSSValue
+cssOwnPropertyDefaults = M.fromList
+  [ (CSSDisplay,        CSS_Keyword "block")
+  , (CSSMargin,         CSS_Px 0)
+  , (CSSBorder,         CSS_Px 0)
+  , (CSSPadding,        CSS_Px 0)
+  ]
+
+cssNamesOfOwnProperties :: M.Map Text CSSOwnProperty
+cssNamesOfOwnProperties =
+  M.fromList [ (v, k) | (k, v) <- M.toList cssOwnPropertyNames ]
+
+instance IsCSSProperty CSSOwnProperty where
+  cssValueMaybe Style{ styleOwn=properties } prop =
+    M.lookup prop properties
+
+  cssDefault prop =
+    case M.lookup prop cssOwnPropertyDefaults of
+      Just val -> val
+      Nothing -> CSS_Keyword "uninitialized"
+
+instance HasDebugView CSSOwnProperty where
+  showdbg prop =
+    case M.lookup prop cssOwnPropertyNames of
+      Just name -> T.unpack name
+      Nothing -> concat ["TODO:showdbg(", show prop, ")"]
+
+-- | CSS values: weakly-typed data
+data CSSValue
+  = CSS_Keyword Text
+  | CSS_Em Double
+  | CSS_Px Double
+  | CSS_Num Double
+  | CSS_Percent Double
+  | CSS_Url Text
+  | CSS_String Text
+  | CSS_List [CSSValue]
+  | CSS_Font CSSFontValue
+  | CSS_RGB Word8 Word8 Word8
   deriving (Show, Eq)
 
-styleDisplay :: Style -> Display
-styleDisplay Style{..} =
-  case M.lookup "display" styleOwn of
-    Just "none" -> NoneDisplay
-    Just "inline" -> InlineDisplay
-    _ -> BlockDisplay
-
-data FontStyle = NormalStyle | ItalicStyle
-  deriving (Show, Eq)
-
-styleFontStyle :: Style -> FontStyle
-styleFontStyle Style{..} =
-  case M.lookup "font-style" styleInherit of
-    Just "italic" -> ItalicStyle
-    _ -> defaultFontStyle
-
-defaultFontStyle :: FontStyle
-defaultFontStyle = NormalStyle
-
-data FontWeight = NormalWeight | BoldWeight
-  deriving (Show, Eq, Enum)
-
-defaultWeight :: FontWeight
-defaultWeight = NormalWeight
-
-styleFontWeight :: Style -> FontWeight
-styleFontWeight Style{..} =
-  case M.lookup "font-weight" styleInherit of
-    Just "bold" -> BoldWeight
-    _ -> defaultWeight
+instance HasDebugView CSSValue where
+  showdbg (CSS_Keyword k) = T.unpack k
+  showdbg (CSS_Em em) = show em ++ "em"
+  showdbg (CSS_Px px) = show px ++ "px"
+  showdbg (CSS_Num n) = show n
+  showdbg (CSS_Percent p) = show p ++ "%"
+  showdbg (CSS_Url url) = "url(" ++ T.unpack url ++ ")"
+  showdbg (CSS_String s) = "\"" ++ T.unpack s ++ "\""
+  showdbg other = "TODO:showdbg(" ++ show other ++ ")"
 
 
-data WhiteSpace = WhiteSpaceNormal | WhiteSpacePre
-  deriving (Show, Eq)
+data CSSFontValue = CSSFontValue
+  { cssfontStyle :: Maybe CSSValue
+  , cssfontSize :: Maybe CSSValue
+  , cssfontWeight :: Maybe CSSValue
+  , cssfontFamily :: Maybe CSSValue
+  } deriving (Show, Eq)
 
-styleWhiteSpace :: Style -> WhiteSpace
-styleWhiteSpace Style{..} =
-  case M.lookup "white-space" styleInherit of
-    Just "pre" -> WhiteSpacePre
-    _ -> WhiteSpaceNormal
+noCSSFont :: CSSFontValue
+noCSSFont = CSSFontValue
+  { cssfontStyle = Nothing
+  , cssfontSize = Nothing
+  , cssfontWeight = Nothing
+  , cssfontFamily = Nothing
+  }
 
-styleFontFamily :: Style -> String
-styleFontFamily Style{..} =
-  case M.lookup "font-family" styleInherit of
-     Just val -> T.unpack val
-     _ -> defaultFontFace
+mergeCSSFontValues :: CSSFontValue -> CSSFontValue -> CSSFontValue
+mergeCSSFontValues font1 font2 = CSSFontValue
+    { cssfontStyle = cssfontStyle font1 <|> cssfontStyle font2
+    , cssfontSize = cssfontSize font1 <|> cssfontSize font2
+    , cssfontWeight = cssfontWeight font1 <|> cssfontWeight font2
+    , cssfontFamily = cssfontFamily font1 <|> cssfontFamily font2
+    }
 
-defaultFontFace :: String
-defaultFontFace = "Noto Serif"
+instance Monoid CSSFontValue where
+  mempty = noCSSFont
+  mappend = mergeCSSFontValues
 
-defaultFontFaceMono :: String
-defaultFontFaceMono = "Noto Mono"
 
-styleFontSize :: Style -> Double
-styleFontSize Style{..} =
-  fromMaybe defaultFontSize $ (mbRead . T.unpack) =<< M.lookup "font-size" styleInherit
-
-defaultFontSize :: Double
-defaultFontSize = 18
-
-styleFont :: Style -> Canvas.Font
-styleFont st = Canvas.Font face size (weight == BoldWeight) (italic == ItalicStyle)
-  where
-    face = styleFontFamily st
-    size = styleFontSize st
-    weight = styleFontWeight st
-    italic = styleFontStyle st
-
-defaultFont :: Canvas.Font
-defaultFont = Canvas.Font defaultFontFace defaultFontSize False False
-
--- | Merge the inherited style and the element style.
-css :: [(Text, Text)] -> Style
-css properties = Style { styleOwn = own, styleInherit = inherit }
-  where
-    (inherit, own) = M.partitionWithKey isInheritable $ M.fromList properties
-    isInheritable prop _ = prop `elem` inheritable
-    inheritable =
-      [ "background-color"
-      , "color"
-      , "font-family"
-      , "font-size"
-      , "font-style"
-      , "font-weight"
-      , "white-space"
-      ]
-
--- | Override style of parent with a new (maybe incomplete) style
--- The new style inherits parent's properties, unless overriden.
+-- | Augment/override/merge new CSS style with base style.
+-- The new style inherits/merges parent's properties, unless overriden.
+-- Some values are computed based on parent values (see `cascadingValue`).
 cascadingOver :: Style -> Style -> Style
 cascadingOver style parent =
   style { styleInherit = styleInherit style `merge` styleInherit parent }
-  where merge = M.mergeWithKey (\_ st _ -> Just st) id id
+  where
+    merge = M.mergeWithKey cascadingValue id id
+
+cascadingValue :: CSSProperty -> CSSValue -> CSSValue -> Maybe CSSValue
+cascadingValue CSSFont new@(CSS_Font font1) old@(CSS_Font font2) =
+  case cssfontSize font1 of
+    Just (CSS_Keyword kw) ->
+      case kw `L.lookup` relkeywords of
+        Just val ->
+          cascadingValue CSSFont (CSS_Font font1{ cssfontSize=Just val }) old
+        Nothing ->
+          case kw `L.lookup` abskeywords of
+            Just val -> Just $ CSS_Font $ font1{ cssfontSize=Just val }
+            Nothing -> warning ("font-size ignored: " ++ show kw) $ Just new
+    Just (CSS_Percent perc) ->
+      case cssfontSize font2 of
+        Just (CSS_Px size) ->
+          Just $ CSS_Font $ font1{ cssfontSize=Just (CSS_Px (size * (perc / 100))) }
+        other ->
+          warning ("font-size base is not computed: " ++ show other) $ Just new
+    Just (CSS_Em em) ->
+      case cssfontSize font2 of
+        Just (CSS_Px size) ->
+          Just $ CSS_Font $ font1{ cssfontSize=Just (CSS_Px (size * em)) }
+        other ->
+          warning ("font-size base is not computed: " ++ show other) $ Just new
+    _ -> Just new
+  where
+    relkeywords =
+      [ ("smaller", CSS_Percent 70)
+      , ("larger",  CSS_Percent 130)
+      ]
+    abskeywords =
+      [ ("xx-small",  CSS_Px (0.30 * defaultFontSize))
+      , ("x-small",   CSS_Px (0.50 * defaultFontSize))
+      , ("small",     CSS_Px (0.70 * defaultFontSize))
+      , ("medium",    CSS_Px (1.00 * defaultFontSize))
+      , ("large",     CSS_Px (1.30 * defaultFontSize))
+      , ("x-large",   CSS_Px (1.70 * defaultFontSize))
+      , ("xx-large",  CSS_Px (2.00 * defaultFontSize))
+      ]
+cascadingValue _ st _ = Just st
+
 
 -- | Add CSS properties to existing properties, including own properties
+-- Shadow previous values if they exist.
 overriding :: Style -> Style -> Style
-overriding style parent = Style
-    { styleInherit = styleInherit style `merge` styleInherit parent
-    , styleOwn = styleOwn style `merge` styleOwn parent
+overriding newprops base = Style
+    { styleInherit = styleInherit newprops `merge` styleInherit base
+    , styleOwn = styleOwn newprops `merge` styleOwn base
     }
-  where merge = M.mergeWithKey (\_ st _ -> Just st) id id
+  where
+    merge :: Ord k => M.Map k v -> M.Map k v -> M.Map k v
+    merge = M.mergeWithKey (\_ st _ -> Just st) id id
 
 
 -- | Get the difference between two (complete) styles both ways.
@@ -891,24 +1005,214 @@ noStyling :: (StyleDiff, StyleDiff)
 noStyling = (M.empty, M.empty)
 
 applyDiff :: Style -> StyleDiff -> Style
-applyDiff st diff = st { styleInherit = M.mergeWithKey (\_ val _ -> Just val) id id diff (styleInherit st) }
+applyDiff st diff = st { styleInherit = diff `patch` (styleInherit st) }
+  where
+    patch = M.mergeWithKey (\_ val _ -> Just val) id id
 
+--------------------------------------------------------------------------------
+-- CSS parsers and printers
+
+-- a farcical CSS parser:
+cssFarcer :: String -> Style
+cssFarcer s = css $ mapMaybe parseProp $ T.splitOn ";" (T.pack s)
+  where
+    parseProp p = case T.break (== ':') p of
+      (_, "") -> Nothing
+      (key, val) -> Just (T.strip key, T.strip $ T.tail val)
+
+-- | Read and split properties into own and inheritable
+-- Warn about unknown properties and values, ignore them.
+css :: [(Text, Text)] -> Style
+css properties = Style
+    { styleOwn = M.fromListWith mergePropVal own
+    , styleInherit = M.fromListWith mergePropVal inherit
+    }
+  where
+    (own, inherit) = partitionEithers $ mapMaybe readProperty properties
+    readProperty (name, textval) =
+      case cssReadValue textval of
+        Left _ ->
+          warning (concat ["Unknown value of a property: ", T.unpack name, "=", T.unpack textval]) Nothing
+        Right val ->
+          case M.lookup name cssNamesOfProperties of
+            Just prop -> Just $ Right (prop, val)
+            Nothing ->
+              case M.lookup name cssNamesOfOwnProperties of
+                Just prop -> Just $ Left (prop, val)
+                Nothing ->
+                  let mkFont = \font -> Just (Right (CSSFont, CSS_Font font))
+                  in case name of
+                    "font-weight" -> mkFont $ noCSSFont{ cssfontWeight = Just val }
+                    "font-style" -> mkFont $ noCSSFont{ cssfontStyle = Just val }
+                    "font-size" -> mkFont $ noCSSFont{ cssfontSize = Just val }
+                    "font-family" ->  mkFont $ noCSSFont{ cssfontFamily = Just val }
+                    _ -> warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) Nothing
+    mergePropVal (CSS_Font new) (CSS_Font old) = CSS_Font (mergeCSSFontValues new old)
+    mergePropVal new _old = new
+
+
+-- | Parses a CSSValue from text for a CSS value
+cssReadValue :: Text -> UnknownOr CSSValue
+cssReadValue txtval =
+  case Atto.parseOnly cssparseValue txtval of
+    Left _ -> Left txtval
+    Right val -> Right val
+
+cssparseValue :: Atto.Parser CSSValue
+cssparseValue = valp <* Atto.skipSpace <* Atto.endOfInput
+  where
+    valp = Atto.choice [cssparseUrl, cssparseColor, cssparseString, cssparseIdentifier, cssparseLength]
+    strp = do
+      void $ Atto.char '"'
+      cs <- Atto.many' (Atto.notChar '"' <|> (Atto.char '\\' *> Atto.anyChar))
+      void $ Atto.char '"'
+      return $ T.pack cs
+    cssparseIdentifier = do
+      start <- ((\c -> [c]) <$> Atto.satisfy (\c -> C.isAlpha c || c == '_')) <|> do
+        c1 <- Atto.char '-'
+        c2 <- Atto.satisfy (\c -> C.isAlpha c || c == '_')
+        return [c1, c2]
+      rest <- Atto.takeWhile (\c -> C.isAlphaNum c || c == '_' || c == '-')
+      return (CSS_Keyword $ T.toLower $ T.concat [ T.pack start, rest ])
+    cssparseString = CSS_String <$> strp
+    cssparseLength = do
+      num <- Atto.double
+      Atto.choice [
+          (const (CSS_Px num)) <$> Atto.string "px"
+        , (const (CSS_Em num)) <$> Atto.string "em"
+        , (const (CSS_Percent num)) <$> Atto.string "%"
+        ]
+    cssparseUrl = do
+      let urlp = (strp <|> Atto.takeWhile (/= ')'))
+      url <- Atto.string "url(" *> Atto.skipSpace *> urlp <* Atto.skipSpace <* Atto.char ')'
+      return $ CSS_Url url
+
+    colorhashp = do
+      let hex d1 d0 = fromIntegral (0x10 * C.digitToInt d1 + C.digitToInt d0) :: Word8
+      _ <- Atto.char '#'
+      digits <- Atto.takeWhile C.isHexDigit
+      return $ case T.unpack digits of
+        (r1:r2:g1:g2:b1:b2:_) -> CSS_RGB (hex r1 r2) (hex g1 g2) (hex b1 b2)
+        (r:g:b:_) -> CSS_RGB (hex r r) (hex g g) (hex b b)
+        _ -> warning ("cannot read color: " ++ T.unpack digits) $ CSS_RGB 0 0 0
+    rgbp = do
+      _ <- Atto.string "rgb("
+      let rgbdecp = Atto.decimal
+      let rgbpercp = (\percent -> round $ 2.55 * percent) <$> (Atto.double <* Atto.char '%')
+      nums <- (rgbdecp <|> rgbpercp) `Atto.sepBy` (Atto.char ',' >> Atto.skipSpace) :: Atto.Parser [Int]
+      _ <- Atto.char ')'
+      case nums of
+        [r, g, b] -> return $ CSS_RGB (fromIntegral r) (fromIntegral g) (fromIntegral b)
+        _ -> fail $ "cannot read color: rgb(" ++ show nums ++ ")"
+    cssparseColor = colorhashp <|> rgbp
+
+cssColorAliases :: M.Map Text Text
+cssColorAliases = M.fromList (cssColorsLevel1 ++ cssColorsLevel2)
+  where
+    cssColorsLevel1 =
+        -- CSS Level 1 colors:
+        [ ("aqua",      "#00ffff")
+        , ("black",     "#000000")
+        , ("blue",      "#0000ff")
+        , ("fuchsia",   "#ff00ff")
+        , ("gray",      "#808080")
+        , ("green",     "#008000")
+        , ("maroon",    "#800000")
+        , ("navy",      "#000080")
+        , ("lime",      "#00ff00")
+        , ("olive",     "#808000")
+        , ("purple",    "#800080")
+        , ("red",       "#ff0000")
+        , ("silver",    "#c0c0c0")
+        , ("teal",      "#008080")
+        , ("white",     "#ffffff")
+        , ("yellow",    "#ffff00")
+        ]
+    cssColorsLevel2 =
+        -- CSS Level 2 (Revision 1)
+        [ ("orange",        "#ffa500") , ("aliceblue",     "#f0f8ff") , ("antiquewhite",  "#faebd7") , ("aquamarine",    "#7fffd4")
+        , ("azure",         "#f0ffff") , ("beige",         "#f5f5d ") , ("bisque",        "#ffe4c4") , ("blanchedalmond","#ffebcd")
+        , ("blueviolet",    "#8a2be2") , ("brown",         "#a52a2a") , ("burlywood",     "#deb887") , ("cadetblue",     "#5f9ea0")
+        , ("chartreuse",    "#7fff00") , ("chocolate",     "#d2691e") , ("coral",         "#ff7f50") , ("cornflowerblue","#6495ed")
+        , ("cornsilk",      "#fff8dc") , ("crimson",       "#dc143c") , ("cyan",          "#00ffff") , ("darkblue",      "#00008b")
+        , ("darkcyan",      "#008b8b") , ("darkgoldenrod", "#b8860b") , ("darkgray",      "#a9a9a9") , ("darkgreen",     "#006400")
+        , ("darkgrey",      "#a9a9a9") , ("darkkhaki",     "#bdb76b") , ("darkmagenta",   "#8b008b") , ("darkolivegreen","#556b2f")
+        , ("darkorange",    "#ff8c00") , ("darkorchid",    "#9932cc") , ("darkred",       "#8b0000") , ("darksalmon",    "#e9967a")
+        , ("darkseagreen",  "#8fbc8f") , ("darkslateblue", "#483d8b") , ("darkslategray", "#2f4f4f") , ("darkslategrey", "#2f4f4f")
+        , ("darkturquoise", "#00ced1") , ("darkviolet",    "#9400d3") , ("deeppink",      "#ff1493") , ("deepskyblue",   "#00bfff")
+        , ("dimgray",       "#696969") , ("dimgrey",       "#696969") , ("dodgerblue",    "#1e90ff") , ("firebrick",     "#b22222")
+        , ("floralwhite",   "#fffaf0") , ("forestgreen",   "#228b22") , ("gainsboro",     "#dcdcdc") , ("ghostwhite",    "#f8f8ff")
+        , ("gold",          "#ffd700") , ("goldenrod",     "#daa520") , ("greenyellow",   "#adff2f") , ("grey",          "#808080")
+        , ("honeydew",      "#f0fff0") , ("hotpink",       "#ff69b4") , ("indianred",     "#cd5c5c") , ("indigo",        "#4b0082")
+        , ("ivory",         "#fffff0") , ("khaki",         "#f0e68c") , ("lavender",      "#e6e6fa") , ("lavenderblush", "#fff0f5")
+        , ("lawngreen",     "#7cfc00") , ("lemonchiffon",  "#fffacd") , ("lightblue",     "#add8e6") , ("lightcoral",    "#f08080")
+        , ("lightcyan",     "#e0fff-")
+        ]
+
+
+--------------------------------------------------------------------------------
+-- | Default CSS values and getters
+
+defaultFontFace :: String
+defaultFontFace = "Noto Serif"
+
+defaultFontFaceMono :: String
+defaultFontFaceMono = "Noto Mono"
+
+defaultFontSize :: Double
+defaultFontSize = 16
+
+styleFontSize :: Style -> Double
+styleFontSize st =
+  let CSS_Font font = st `cssValue` CSSFont
+  in case cssfontSize font of
+    Just (CSS_Num size) -> size
+    Just (CSS_Px size) -> size
+    Just other -> warning ("styleFontSize: not computed: " ++ show other) defaultFontSize
+    Nothing -> defaultFontSize
+
+defaultFont :: Canvas.Font
+defaultFont = Canvas.Font defaultFontFace defaultFontSize False False
+
+styleFont :: Style -> Canvas.Font
+styleFont st = Canvas.Font face size (weight == Just (CSS_Keyword "bold")) (italic == Just (CSS_Keyword "italic"))
+  where
+    CSS_Font font = st `cssValue` CSSFont
+    face =
+      case cssfontFamily font of
+        Just (CSS_String name) -> T.unpack name
+        Just (CSS_Keyword name) -> T.unpack name
+        Just other -> error $ "styleFont: unknown " ++ show other
+        Nothing -> defaultFontFace
+    size = styleFontSize st
+    weight = cssfontWeight font
+    italic = cssfontStyle font
+
+stylePreservesNewlines :: Style -> Bool
+stylePreservesNewlines st =
+  case st `cssValueMaybe` CSSWhiteSpace of
+    Just (CSS_Keyword "pre") -> True
+    _ -> False
+
+
+--------------------------------------------------------------------------------
 -- | Built-in styles
+
 noStyle :: Style
 noStyle = Style { styleOwn = M.empty, styleInherit = M.empty }
 
 bodyStyle :: Style
-bodyStyle = Style { styleOwn = M.fromList own, styleInherit = M.fromList inheritable }
+bodyStyle = css (own ++ inheritable)
   where
     own =
-      [ ("margin",      "8")
+      [ ("margin",          "8px")
       ]
     inheritable =
       [ ("background-color","white")
       , ("color",           "black")
       , ("font-weight",     "normal")
-      , ("font-family",     T.pack defaultFontFace)
-      , ("font-size",       tshow defaultFontSize)
+      , ("font-family",     T.pack ("\"" ++ defaultFontFace ++ "\""))
+      , ("font-size",       T.pack (show defaultFontSize ++ "px"))
       , ("font-style",      "normal")
       , ("white-space",     "normal")
       ]
@@ -967,72 +1271,17 @@ elementStyles =
     inline = css [display_inline]
     nodisplay = css [("display", "none")]
     display_inline = ("display", "inline")
-    fontsize sz = ("font-size", tshow sz)
+    fontsize sz = ("font-size", T.pack (show sz ++ "px"))
     fontstyle_italic = ("font-style", "italic")
     fontweight_bold = ("font-weight", "bold")
-    fontfamily fam = ("font-family", T.pack fam)
+    fontfamily fam = ("font-family", T.pack ("\"" ++ fam ++ "\""))
     color c = ("color", c)
 
-defaultColor :: Canvas.Color
-defaultColor = Canvas.rgb 0 0 0
-
--- CSS parsers and printers
-
--- a farcical CSS parser:
-cssFarcer :: String -> Style
-cssFarcer s = css $ mapMaybe parseProp $ T.splitOn ";" (T.pack s)
-  where
-    parseProp p = case T.splitOn ":" p of
-      (key:val:_) -> Just (T.strip key, T.strip val)
-      _ -> Nothing
-
-
-cssColor :: String -> Maybe Canvas.Color
-cssColor ['#',r1,r0,g1,g0,b1,b0] = Just $ Canvas.rgb (hex r1 r0) (hex g1 g0) (hex b1 b0)
-  where hex d1 d0 = fromIntegral (0x10 * C.digitToInt d1 + C.digitToInt d0) :: Canvas.Byte
-cssColor ['#', r, g, b] = cssColor ['#',r,r,g,g,b,b]
-cssColor ('r':'g':'b':'(':_rest) = error "TODO: color: rgb(X,Y,Z)"
-cssColor txt = cssColor =<< M.lookup txt colors
-  where
-   colors = M.fromList (
-    -- CSS Level 1 colors:
-    [ ("aqua",      "#00ffff")
-    , ("black",     "#000000")
-    , ("blue",      "#0000ff")
-    , ("fuchsia",   "#ff00ff")
-    , ("gray",      "#808080")
-    , ("green",     "#008000")
-    , ("maroon",    "#800000")
-    , ("navy",      "#000080")
-    , ("lime",      "#00ff00")
-    , ("olive",     "#808000")
-    , ("purple",    "#800080")
-    , ("red",       "#ff0000")
-    , ("silver",    "#c0c0c0")
-    , ("teal",      "#008080")
-    , ("white",     "#ffffff")
-    , ("yellow",    "#ffff00")
-    ] ++
-    -- CSS Level 2 (Revision 1)
-    [ ("orange",        "#ffa500") , ("aliceblue",     "#f0f8ff") , ("antiquewhite",  "#faebd7") , ("aquamarine",    "#7fffd4")
-    , ("azure",         "#f0ffff") , ("beige",         "#f5f5d ") , ("bisque",        "#ffe4c4") , ("blanchedalmond","#ffebcd")
-    , ("blueviolet",    "#8a2be2") , ("brown",         "#a52a2a") , ("burlywood",     "#deb887") , ("cadetblue",     "#5f9ea0")
-    , ("chartreuse",    "#7fff00") , ("chocolate",     "#d2691e") , ("coral",         "#ff7f50") , ("cornflowerblue","#6495ed")
-    , ("cornsilk",      "#fff8dc") , ("crimson",       "#dc143c") , ("cyan",          "#00ffff") , ("darkblue",      "#00008b")
-    , ("darkcyan",      "#008b8b") , ("darkgoldenrod", "#b8860b") , ("darkgray",      "#a9a9a9") , ("darkgreen",     "#006400")
-    , ("darkgrey",      "#a9a9a9") , ("darkkhaki",     "#bdb76b") , ("darkmagenta",   "#8b008b") , ("darkolivegreen","#556b2f")
-    , ("darkorange",    "#ff8c00") , ("darkorchid",    "#9932cc") , ("darkred",       "#8b0000") , ("darksalmon",    "#e9967a")
-    , ("darkseagreen",  "#8fbc8f") , ("darkslateblue", "#483d8b") , ("darkslategray", "#2f4f4f") , ("darkslategrey", "#2f4f4f")
-    , ("darkturquoise", "#00ced1") , ("darkviolet",    "#9400d3") , ("deeppink",      "#ff1493") , ("deepskyblue",   "#00bfff")
-    , ("dimgray",       "#696969") , ("dimgrey",       "#696969") , ("dodgerblue",    "#1e90ff") , ("firebrick",     "#b22222")
-    , ("floralwhite",   "#fffaf0") , ("forestgreen",   "#228b22") , ("gainsboro",     "#dcdcdc") , ("ghostwhite",    "#f8f8ff")
-    , ("gold",          "#ffd700") , ("goldenrod",     "#daa520") , ("greenyellow",   "#adff2f") , ("grey",          "#808080")
-    , ("honeydew",      "#f0fff0") , ("hotpink",       "#ff69b4") , ("indianred",     "#cd5c5c") , ("indigo",        "#4b0082")
-    , ("ivory",         "#fffff0") , ("khaki",         "#f0e68c") , ("lavender",      "#e6e6fa") , ("lavenderblush", "#fff0f5")
-    , ("lawngreen",     "#7cfc00") , ("lemonchiffon",  "#fffacd") , ("lightblue",     "#add8e6") , ("lightcoral",    "#f08080")
-    , ("lightcyan",     "#e0fff-")
-    ])
-
+withBuiltinStyle :: Text -> DOMNode -> DOMNode
+withBuiltinStyle name node =
+  case HM.lookup name elementStyles of
+    Just st -> node { domStyle = st }
+    Nothing -> node
 
 
 --------------------------------------------------------------------------------
@@ -1052,8 +1301,3 @@ decodeXMLAttribute attr node = do
 tagName :: XML.Element -> Text
 tagName = XML.nameLocalName . XML.elementName
 
-tshow :: Show a => a -> Text
-tshow = T.pack . show
-
-mbRead :: Read a => String -> Maybe a
-mbRead s = case reads s of [(v, "")] -> Just v; _ -> Nothing

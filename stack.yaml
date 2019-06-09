@@ -13,3 +13,7 @@ packages:
     git: https://github.com/chrisdone/sdl2-cairo.git
     commit: fab0d5128feefe0941336af79d8b3ad63c5db00c
   extra-dep: true
+
+extra-deps:
+- dom-selector-0.2.0.1@sha256:89f5dc75d762b01b9b09a42cc84ae8145efb3a2c5ba4f0d5605d928812606a5f
+- rosezipper-0.2@sha256:aeff4e712360c5665747905381982a0765ba2c3831e352e8caeb951fc8c107b7
