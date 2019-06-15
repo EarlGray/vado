@@ -687,9 +687,10 @@ layoutInlineWord chunk = do
 
 layoutInlineSpace :: CanMeasureText m => LayoutOver m ()
 layoutInlineSpace = do
-  fontsize <- gets (styleFontSize . ltStyle)
+  font <- gets (styleFont . ltStyle)
+  wgap <- lift $ (/ 4) <$> measureTextWidth font "____"
   modify (\lt ->
-    let x = ltX lt + fontsize/2    -- not exactly, but no other way to measure
+    let x = ltX lt + wgap
         ls = ltLS lt
         ls' = ls{ lsWords=lsWords ls ++ [" "], lsGap = True }
     in lt{ ltX=x, ltLS=ls' })
@@ -701,7 +702,7 @@ layoutInlineBox (V2 dx dy) content = do
   when (x + dx >= maxwidth) $ do
     layoutLineBreak
 
-  let baseline = dx
+  let baseline = dy
   styling <- gets ltStyling
   let box = BoxTree
         { boxContent = content
@@ -761,8 +762,20 @@ layoutLineBreak = do
     let baseline = maximum ascents
     let height = baseline + maximum descents
 
+    -- position horizontally:
+    maxwidth <- asks ltWidth
+    modify $ \lt ->
+      let (_, _, _, wafter) = last $ lsBoxes $ ltLS lt
+          w = ltX lt - wafter
+          linestart = case M.lookup CSSTextAlign (styleInherit $ ltStyle lt) of
+            Just (CSS_Keyword "right") -> maxwidth - w 
+            Just (CSS_Keyword "center") -> (maxwidth - w) / 2
+            Just (CSS_Keyword "left") -> 0
+            Just other -> warning ("text-align=" ++ show other ++ ", fallback to 'left'") 0
+            Nothing -> 0
+      in lt{ ltX = linestart }
+
     -- arrange boxes to the known baseline:
-    modify $ \lt -> lt{ ltX = 0 }
     posboxes <- forM bs $ \(bl, box, wbefore, wafter) -> do
       let V2 dx _ = boxDim box
       x <- gets ltX
@@ -990,6 +1003,7 @@ data CSSProperty
   | CSSColor
   | CSSFont
   | CSSWhiteSpace
+  | CSSTextAlign
   deriving (Show, Eq, Ord, Enum)
 
 cssPropertyNames :: M.Map CSSProperty Text
@@ -997,6 +1011,7 @@ cssPropertyNames = M.fromList
   [ (CSSBackgroundColor,    "background-color")
   , (CSSColor,              "color")
   , (CSSWhiteSpace,         "white-space")
+  , (CSSTextAlign,          "text-align")
   ]
 
 cssNamesOfProperties :: M.Map Text CSSProperty
@@ -1008,6 +1023,7 @@ cssPropertyDefaults = M.fromList
   [ (CSSBackgroundColor,    CSS_RGB 255 255 255)
   , (CSSColor,              CSS_RGB 0 0 0)
   , (CSSWhiteSpace,         CSS_Keyword "normal")
+  , (CSSTextAlign,          CSS_Keyword "left")
   ]
 
 instance IsCSSProperty CSSProperty where
@@ -1125,8 +1141,11 @@ instance Monoid CSSFontValue where
 -- Some values are computed based on parent values (see `cascadingValue`).
 cascadingOver :: Style -> Style -> Style
 cascadingOver style parent =
-  style { styleInherit = styleInherit style `merge` styleInherit parent }
+  style { styleInherit = inheritable `merge` styleInherit parent }
   where
+    inheritable = case M.lookup CSSDisplay (styleOwn style) of
+                Just (CSS_Keyword "inline") -> M.delete CSSTextAlign (styleInherit style)
+                _ -> styleInherit style
     merge = M.mergeWithKey cascadingValue id id
 
 cascadingValue :: CSSProperty -> CSSValue -> CSSValue -> Maybe CSSValue
