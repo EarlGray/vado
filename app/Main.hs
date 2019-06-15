@@ -18,7 +18,6 @@ import qualified Data.Map.Strict as M
 import           Data.Maybe
 import           Data.Word (Word8)
 import           Data.Either (partitionEithers)
-import           Data.String
 import           Data.Text ( Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -27,15 +26,18 @@ import qualified Network.HTTP.Client as HTTP
 import           Network.HTTP.Client.Internal
 import qualified Network.HTTP.Client.TLS as TLS
 import qualified Network.HTTP.Types.Header as HTTP
-import           Network.URI
+import           Network.URI as URI
 import qualified SDL as SDL
 import qualified SDL.Cairo as Cairo
 import qualified SDL.Cairo.Canvas as Canvas
 import           SDL.Event as SDL
+import qualified SDL.Image as Image
 import           SDL.Vect
 import           System.Environment
 import qualified Text.HTML.DOM as HTML
 import qualified Text.XML as XML
+import           Text.XML.Cursor (($|), (&/))
+import qualified Text.XML.Cursor as XML
 
 import Debug.Trace as Trace
 
@@ -56,9 +58,22 @@ data Page = Page
   -- ^ XML source of <head></head>
   , pageBoxes :: Maybe BoxTree
   -- ^ Rendering tree
+  , pageUrl :: URI
+  , pageResources :: M.Map Text HTTPResource  -- TODO: use URI
+
   , pageWindow :: VadoWindow
   , pageScroll :: Height
-  , pageResources :: M.Map URI HTTPResource
+  }
+
+emptyPage :: VadoWindow -> Page
+emptyPage window = Page
+  { pageHead = undefined
+  , pageBody = blankNode
+  , pageBoxes = Nothing
+  , pageWindow = window
+  , pageScroll = 0
+  , pageResources = M.empty
+  , pageUrl = nullURI
   }
 
 data DOMNode = DOM
@@ -95,45 +110,62 @@ emptyNode :: DOMNode
 emptyNode = DOM
   { domContent = Right []
   , domStyle = noStyle
-  , domEvents = Events
+  , domEvents = noEvents
   , domAttrs = M.empty
   , domSource = Nothing
   }
 
+blankNode :: DOMNode
+blankNode = makeNode "body" [makeTextNode "This page is intentionally left blank"]
+
 makeTextNode :: Text -> DOMNode
 makeTextNode txt = emptyNode { domContent = Left (TextContent txt) }
 
-makeNode :: [DOMNode] -> DOMNode
-makeNode children = emptyNode { domContent = Right children }
+makeNode :: Text -> [DOMNode] -> DOMNode
+makeNode tag children = emptyNode { domContent=Right children, domStyle=style, domEvents=events }
+  where
+    style = fromMaybe noStyle $ HM.lookup tag elementStyles
+    events = fromMaybe noEvents $ HM.lookup tag elementEvents
 
 -- | Content of a leaf DOM node,
 -- i.e. what is to be drawn in this node.
 -- either a block or inline element, e.g. some text.
 data DOMContent
-  = TextContent Text
+  = TextContent !Text
   -- ^ A text node
   | NewlineContent
   -- ^ Force newline here, usually corresponds to <br>
+  | ImageContent !Text !(Maybe (V2 Double))
+  -- ^           ^href
 
 instance Show DOMContent where
   show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
   show NewlineContent = "NewlineContent"
+  show (ImageContent href wh) = "ImageContent " ++ T.unpack href ++ " (" ++ show wh ++ ")"
 
 --------------------------------------------------------------------------------
 -- | Normalize an XML tree of elements and text, possibly with
 -- attributes like style and event handlers.
 domFromXML :: XML.Node -> Maybe DOMNode
 domFromXML xml@(XML.NodeContent txt) =
-    Just $ DOM (Left (TextContent txt)) noStyle Events M.empty (Just xml)
-domFromXML xml@(XML.NodeElement el) =
-    Just $ DOM (Right children) style Events attrs (Just xml)
+    Just (makeTextNode txt){ domSource=Just xml }
+
+domFromXML xml@(XML.NodeElement el) | tagName el == "img" =
+    Just emptyNode{ domContent=Left (ImageContent href wh), domSource=Just xml }
   where
+    Just href = lookupXMLAttribute "src" el -- TODO
+    width = decodeXMLAttribute "width" el
+    height = decodeXMLAttribute "height" el
+    wh = liftM2 V2 width height
+
+domFromXML xml@(XML.NodeElement el) =
+    Just node{ domStyle=attr_style `overriding` domStyle node, domAttrs=attrs, domSource=Just xml }
+  where
+    node = makeNode (tagName el) children
     children = mapMaybe domFromXML $ XML.elementNodes el
     attrs = M.mapKeys (XML.nameLocalName) $ XML.elementAttributes el
-
-    builtin_style = fromMaybe noStyle $ HM.lookup (tagName el) elementStyles
     attr_style = fromMaybe noStyle $ decodeXMLAttribute "style" el
-    style = attr_style `overriding` builtin_style
+
 domFromXML _ = Nothing
 
 
@@ -175,21 +207,28 @@ instance Show BoxContent where
 -- | What to draw inside a box
 data InlineContent
   = TextBox !Text !Double
-  | ImageBox !(Maybe (V2 Double)) SDL.Surface   -- an image
+  | ImageBox (V2 Double) Text   -- an image
 
 instance Show InlineContent where
   show (TextBox t baseline) = "TextBox " ++ show t ++ " (baseline " ++ show baseline ++ ")"
-  show (ImageBox (Just (V2 w h)) _) =   concat ["ImageBox ", show w, "x", show h, " <image>"]
-  show (ImageBox Nothing _) =           "ImageBox ?x? <image>"
+  show (ImageBox (V2 w h) href) =   concat ["ImageBox ", show w, "x", show h, " " ++ T.unpack href]
 
-{-
-findBox :: BoxTree -> Point V2 Double -> Maybe BoxTree
-findBox = undefined
--}
+findInBox :: Point V2 Double -> BoxTree -> [BoxTree]
+findInBox (P xy) box0 = go [] xy box0
+  where
+    go stack (V2 x y) box@BoxTree{ boxContent=content, boxDim = V2 dx dy } =
+      case content of
+        _ | (x > dx) || (y > dy) -> stack
+        BoxInline _ -> box:stack
+        BoxOfBlocks posblocks ->
+          case L.find (contains x y) posblocks of
+            Just (P (V2 x0 y0), subbox) ->
+              go (box:stack) (V2 (x - x0) (y - y0)) subbox
+            Nothing ->
+              box:stack
+    contains px py (P (V2 bx by), BoxTree{ boxDim=V2 bw bh }) =
+      (bx <= px && px <= (bx + bw)) && (by <= py && py <= (by + bh))
 
-
--- | A set of events that an element may handle.
-data Events = Events
 
 --------------------------------------------------------------------------------
 -- Main entry point and event handler
@@ -203,22 +242,15 @@ data Events = Events
 --
 main :: IO ()
 main = do
+  window <- vadoWindow
+  page0 <- layoutPage (emptyPage window)
+  renderDOM page0
+
   args <- getArgs
   let url = if null args then "https://en.wikipedia.org" else head args
-  (phead, pbody, resources) <- fetchURL url
+  page1 <- fetchURL url page0
 
-  window <- vadoWindow
-
-  let page0 = Page {
-      pageBody = pbody
-    , pageHead = phead
-    , pageResources = resources
-    , pageBoxes = Nothing
-    , pageScroll = 0
-    , pageWindow = window
-    }
-  when debug $ putStrLn (showdbg pbody)
-  page <- layoutPage page0
+  page <- layoutPage page1
   vadoRedrawEventLoop page
 
 
@@ -286,12 +318,23 @@ vadoEventLoop page = do
       vadoRedrawEventLoop page'
 
     MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released -> do
-      let P xy = mouseButtonEventPos e
+      let P xy@(V2 xi yi) = mouseButtonEventPos e
       putStrLn $ "clicked at " ++ show xy
-      vadoEventLoop page
+      page' <- case pageBoxes page of
+        Just boxes -> do
+          let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
+          let stack = P pagepos `findInBox` boxes
+          case boxNode =<< listToMaybe stack of
+            Just node ->
+              case eventMouseReleased $ domEvents node of
+                Just handler -> handler pagepos node page
+                Nothing -> return page
+            Nothing -> return page
+        _ -> return page
+      vadoRedrawEventLoop page'
     MouseWheelEvent e -> do
       let V2 _ dy = mouseWheelEventPos e
-      vadoRedrawEventLoop $ vadoScroll (negate $ fromIntegral dy) page
+      vadoRedrawEventLoop $ vadoScroll (negate $ 10 * fromIntegral dy) page
     MouseMotionEvent _ ->
       vadoEventLoop page
 
@@ -323,51 +366,131 @@ vadoViewHeight :: Page -> Double
 vadoViewHeight page = h
   where V2 _ h = pageViewport page
 
+
+-- | A set of events that an element may handle.
+type EventHandler = DOMNode -> Page -> IO Page
+
+data Events = Events
+  { eventMouseReleased :: Maybe (V2 Double -> EventHandler)
+  }
+
+noEvents :: Events
+noEvents = Events { eventMouseReleased = Nothing }
+
+elementEvents :: HM.HashMap Text Events
+elementEvents = HM.fromList
+  [ ("a", Events { eventMouseReleased = Just (\_ node page -> clickLink node page) })
+  ]
+
+clickLink :: DOMNode -> Page -> IO Page
+clickLink DOM{ domSource=Just (XML.NodeElement el) } page = do
+  case lookupXMLAttribute "href" el of
+    Nothing -> return page
+    Just href -> do
+      page' <- fetchURL (T.unpack href) page
+      layoutPage page'
+clickLink node page =
+  return $ warning ("clickLink: could not find address for: " ++ showdbg node) page
+
 --------------------------------------------------------------------------------
 -- HTTP request, caches and local storage
 
-data HTTPResource {-= HTTPResource
-  { resContentType :: Text
-  , resContentLength :: Integer
-  , resContentData :: B.ByteString
-  -}
+data HTTPResource
+  = ImageResource !(V2 Double) SDL.Texture
 
-fetchURL :: String -> IO (XML.Element, DOMNode, M.Map URI HTTPResource)
-fetchURL pageURL = do
-  pageReq <- makeRequest pageURL
+fetchURL :: String -> Page -> IO Page
+fetchURL url page = do
+  let prevuri = pageUrl page
+  let absuri =
+        if URI.isAbsoluteURI url then (fromJust $ URI.parseURI url)
+        else fromMaybe (error $ "invalid url: " ++ url) ((`URI.relativeTo` prevuri) <$> URI.parseURIReference url)
+  request0 <- HTTP.parseRequest (show absuri)
+  let pageReq = request0 { requestHeaders = [ (HTTP.hUserAgent, "github.com/chrisdone/vado") ] }
+  when debug $ print pageReq
+
   httpman <- HTTP.newManager TLS.tlsManagerSettings
   pageResp <- HTTP.httpLbs pageReq httpman
   let headers = responseHeaders pageResp
 
   let contentType = T.toLower $ maybe "text/html" (T.decodeLatin1 . snd) $ L.find (\(name, _) -> name == "Content-Type") headers
+  let body = HTTP.responseBody pageResp
 
   if "text/html" `T.isPrefixOf` contentType then do
-    let root = XML.documentRoot (HTML.parseLBS (HTTP.responseBody pageResp))
+    let document = HTML.parseLBS body
+    let root = XML.documentRoot document
     let topnodes = mapMaybe (\case XML.NodeElement el -> Just el; _ -> Nothing) $ XML.elementNodes root
     let headnode = fromMaybe (fakeNode "head" []) $ L.find (\el -> tagName el == "head") topnodes
     let bodynode = fromMaybe (fakeNode "body" $ XML.elementNodes root) $ L.find (\el -> tagName el == "body") topnodes
-    let Just body = domFromXML $ XML.NodeElement bodynode
-    return (headnode, body, M.empty)
+
+    let images_axis = (XML.fromDocument document $| XML.descendant &/ XML.element "img")
+    let imageurls = mapMaybe (\cursor -> let XML.NodeElement el = XML.node cursor in lookupXMLAttribute "src" el) images_axis
+    resources <- forM imageurls $ \imgurl -> do
+      case parseURIReference (T.unpack imgurl) of
+        Nothing -> return $ warning ("Could not parse URL: " ++ T.unpack imgurl) []
+        Just u -> do
+          req <- setUriRelative pageReq u
+          putStrLn $ concat
+            [ T.unpack $ T.decodeLatin1 $ HTTP.method req, " "
+            , if HTTP.secure req then "https://" else "http://"
+            , T.unpack $ T.decodeLatin1 $ HTTP.host req
+            , T.unpack $ T.decodeLatin1 $ HTTP.path req
+            ]
+          resp <- HTTP.httpLbs req httpman
+          let content = B.toStrict $ HTTP.responseBody resp
+          case Image.format content of
+            Just _ -> do
+              bitmap <- Image.decode content
+              V2 w h <- SDL.surfaceDimensions bitmap
+              let wh = V2 (fromIntegral w) (fromIntegral h)
+              texture <- SDL.createTextureFromSurface (vadoRenderer $ pageWindow page) bitmap
+              return [(imgurl, ImageResource wh texture)]
+            _ ->
+              return $ warning ("Image format not supported: " ++ T.unpack imgurl) []
+
+    let Just dom = domFromXML $ XML.NodeElement bodynode
+    when debug $ putStrLn (showdbg dom)
+    return page
+      { pageUrl = absuri
+      , pageHead = headnode
+      , pageBody = dom
+      , pageResources = M.fromList (concat resources)
+      , pageScroll = 0
+      }
   else if "text/" `T.isPrefixOf` contentType then do
     let respbody = T.decodeUtf8 $ B.toStrict $ responseBody pageResp
     let text = makeTextNode respbody
-    let pre = withBuiltinStyle "pre" $ makeNode [text]
-    return $ fakePage [pre]
+    let pre = makeNode "pre" [text]
+    return page
+      { pageUrl = absuri
+      , pageHead = fakeNode "head" []
+      , pageBody = makeNode "body" [pre]
+      , pageScroll = 0
+      }
   else if "image/" `T.isPrefixOf` contentType then do
-    let img = undefined
-    return $ fakePage [img]
+    let body' = B.toStrict body
+    (img, resources) <- case Image.format body' of
+      Just _ -> do
+        bitmap <- Image.decode body'
+        V2 w h <- SDL.surfaceDimensions bitmap
+        let wh = V2 (fromIntegral w) (fromIntegral h)
+        let node = emptyNode{ domContent=Left (ImageContent (T.pack url) (Just wh)) }
+        texture <- SDL.createTextureFromSurface (vadoRenderer $ pageWindow page) bitmap
+        return (node, M.fromList [(T.pack url, ImageResource wh texture)])
+      _ ->
+        let node = makeTextNode (T.pack $ "Error[" ++ url ++ "]: Image format not supported")
+        in return (node, M.fromList [])
+    return page
+      { pageUrl = absuri
+      , pageHead = fakeNode "head" []
+      , pageBody = makeNode "body" [img]
+      , pageResources = resources
+      , pageScroll = 0
+      }
   else
     error $ "TODO: Content-Type " ++ (T.unpack contentType)
   where
-    fakePage elements = (fakeNode "head" [], withBuiltinStyle "body" (makeNode elements), M.empty)
     fakeNode name nodes = XML.Element (XML.Name name Nothing Nothing) M.empty nodes
 
-makeRequest :: String -> IO Request
-makeRequest url = do
-  request0 <- HTTP.parseRequest (fromString url)
-  let req = request0 { requestHeaders = [ (HTTP.hUserAgent, "github.com/chrisdone/vado") ] }
-  when debug $ print req
-  return req
 
 --------------------------------------------------------------------------------
 -- Layout engine
@@ -402,6 +525,7 @@ data LayoutParams = LayoutParams
 data Layout = Layout
   { ltStyle :: Style                      -- the full CSS set for the block
   , ltStyling :: (StyleDiff, StyleDiff)   -- (css-push, css-pop) for rendering
+  , ltStack :: [DOMNode]                  -- reverse DOMNode stack
   -- current coordinates relative to the containing block:
   , ltX :: Width
   , ltY :: Height
@@ -423,6 +547,8 @@ data LineState = LS
 
 -- | A global layout context for a page
 data LayoutCtx = LayoutCtx
+  { ltResources :: M.Map Text HTTPResource
+  }
 
 -- | The layout monad
 newtype LayoutOver m a
@@ -435,18 +561,19 @@ newtype LayoutOver m a
   )
 
 stackBox :: CanMeasureText m => V2 Double -> LayoutOver m (V2 Double)
-stackBox (V2 _dx dy) = LayoutOver $ do
+stackBox (V2 dx dy) = LayoutOver $ do
   lt <- get
-  put lt{ ltX = 0, ltY = ltY lt + dy }
+  put lt{ ltX = 0, ltY = ltY lt + dy, ltMaxX = max (ltMaxX lt) dx }
   return $ V2 (ltX lt) (ltY lt)
 
 -- | Entry point for layout procedure
 layoutPage :: Page -> IO Page
 layoutPage page@Page{..} = do
-    (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes LayoutCtx params noStyle pageBody
+    (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle pageBody
     when debug $ print boxes
     return page{ pageBoxes=Just boxes }
   where
+    ctx = LayoutCtx { ltResources = pageResources }
     params = LayoutParams { ltWidth = w }
     VadoWindow { vadoViewport = V2 w _, vadoTexture = texture } = pageWindow
 
@@ -472,6 +599,7 @@ elementToBoxes ctx params parentStyle node@DOM{ domContent=Right children } = do
       , ltCtx = ctx
       , ltStyle = st
       , ltStyling = parentStyle `styleDiff` st
+      , ltStack = [node]
       }
 elementToBoxes _ctx _par _st node = error $ "elementToBoxes (" ++ showdbg node ++ ")"
 
@@ -479,11 +607,12 @@ withStyle :: CanMeasureText m => DOMNode -> LayoutOver m a -> LayoutOver m a
 withStyle node action = do
     parentStyle <- gets ltStyle
     parentStyling <- gets ltStyling
+    parentNode <- gets ltStack
     let st = domStyle node `cascadingOver` parentStyle
     let styling = parentStyle `styleDiff` st
-    modify $ \lt -> lt{ ltStyle=st, ltStyling=styling }
+    modify $ \lt -> lt{ ltStyle=st, ltStyling=styling, ltStack = node:parentNode }
     result <- action
-    modify $ \lt -> lt{ ltStyle=parentStyle, ltStyling=parentStyling }
+    modify $ \lt -> lt{ ltStyle=parentStyle, ltStyling=parentStyling, ltStack = parentNode }
     return result
 
 layoutBlock :: CanMeasureText m => [DOMNode] -> LayoutOver m ()
@@ -497,9 +626,21 @@ layoutBlock children = do
         layoutText txt
       (Left NewlineContent, _) ->
         layoutLineBreak
+      (Left (ImageContent href mbSize), _) ->
+        case mbSize of
+          Just wh -> do
+            layoutInlineBox wh (BoxInline $ ImageBox wh href)
+          Nothing -> do
+            resources <- gets (ltResources . ltCtx)
+            case M.lookup href resources of
+              Just (ImageResource wh _) ->
+                layoutInlineBox wh (BoxInline $ ImageBox wh href)
+              Nothing -> return ()
       (Right children', CSS_Keyword "inline") ->
         withStyle child $ layoutBlock children'
-      (Right _, CSS_Keyword "block") -> do
+      (Right _, display) -> do
+        unless (display == CSS_Keyword "block") $
+          return $ warning ("TODO: display=" ++ show display ++ ", falling back to display=block") ()
         -- wrap up the previous line (if any):
         layoutLineBreak
         -- start a new containing block:
@@ -509,8 +650,7 @@ layoutBlock children = do
         modify (\lt -> lt{ ltCtx=ctx' })
         pos <- stackBox (boxDim box)
         tell [(P pos, box)]
-      (_, display) ->
-        error $ concat ["layoutBlock: display=", show display, ", child=", showdbg child]
+      -- (_, display) -> error $ concat ["layoutBlock: display=", show display, ", child=", showdbg child]
 
 layoutText :: CanMeasureText m => Text -> LayoutOver m ()
 layoutText txt = do
@@ -536,8 +676,8 @@ layoutInlineWord :: CanMeasureText m => String -> LayoutOver m ()
 layoutInlineWord chunk = do
   maxwidth <- asks ltWidth
   font <- gets (lsFont . ltLS)
-  x <- gets ltX
   w <- lift $ measureTextWidth font chunk
+  x <- gets ltX
   when (x + w >= maxwidth) $ do
     layoutLineBreak
   modify (\lt ->
@@ -553,6 +693,26 @@ layoutInlineSpace = do
         ls = ltLS lt
         ls' = ls{ lsWords=lsWords ls ++ [" "], lsGap = True }
     in lt{ ltX=x, ltLS=ls' })
+
+layoutInlineBox :: CanMeasureText m => V2 Double -> BoxContent -> LayoutOver m ()
+layoutInlineBox (V2 dx dy) content = do
+  x <- gets ltX
+  maxwidth <- asks ltWidth
+  when (x + dx >= maxwidth) $ do
+    layoutLineBreak
+
+  let baseline = dx
+  styling <- gets ltStyling
+  let box = BoxTree
+        { boxContent = content
+        , boxNode = Nothing
+        , boxDim = V2 dx dy
+        , boxStyling = styling
+        }
+  modify (\lt ->
+    let ls = ltLS lt
+    in lt{ ltX=ltX lt + dx, ltLS=ls{ lsWords=[], lsBoxes=lsBoxes ls ++ [(baseline, box, 0, 0)] } }
+    )
 
 layoutInlineClose :: CanMeasureText m => LayoutOver m ()
 layoutInlineClose = do
@@ -574,7 +734,7 @@ layoutInlineClose = do
     w <- lift $ measureTextWidth font txt'    -- TODO: normalize monospace
     let box = BoxTree
           { boxContent = BoxInline (TextBox (T.pack txt') baseline)
-          , boxNode = Nothing
+          , boxNode = listToMaybe $ ltStack lt
           , boxDim = V2 w h
           , boxStyling = ltStyling lt
           }
@@ -653,6 +813,14 @@ chunksFromTokens (CSS_Keyword "pre") (gap, tokens) = (gap', lns)
     go (buf, res) ("\n":ts) = go ([], res ++ (if null buf then [] else [concat buf]) ++ ["\n"]) ts
     go (buf, res) (t:ts) = go (buf ++ [t], res) ts
 
+-- TODO: properly:
+chunksFromTokens (CSS_Keyword "nowrap") (gap0, tokens) =
+  case (gap0, tokens) of
+    (False, " ":ts) ->
+      let (gap', [ln]) = chunksFromTokens (CSS_Keyword "nowrap") (True, ts) in (gap', [" " ++ ln])
+    _ ->
+      let ln = L.intercalate " " $ filter (\t -> t /= " " && t /= "\n") tokens in (False, [ln])
+
 chunksFromTokens whitespace ts = chunksFromTokens (warning msg $ CSS_Keyword "normal") ts
   where msg = "TODO: chunksFromTokens fallback to 'normal' instead of: " ++ show whitespace
 
@@ -708,26 +876,49 @@ renderDOM :: Page -> IO ()
 renderDOM page = do
   let minY = pageScroll page
   let (texture, renderer) = let win = pageWindow page in (vadoTexture win, vadoRenderer win)
-  Canvas.withCanvas texture $ do
+  replaced <- Canvas.withCanvas texture $ do
     let body = fromJust $ pageBoxes page
     Canvas.background $ Canvas.rgb 255 255 255 -- TODO: set to body background color
     withStyling body noStyle $ \st ->
       renderTree (minY, minY + vadoViewHeight page) (0, 0, st) body
   SDL.copy (vadoRenderer $ pageWindow page) texture Nothing Nothing
+
+  forM_ replaced $ \(rect, content) -> do
+    case content of
+      ImageBox _ href ->
+        case M.lookup href (pageResources page) of
+          Just (ImageResource _ imgtexture) -> do
+            let cint x = fromIntegral (round x :: Int)
+            let SDL.Rectangle (P (V2 x y)) (V2 dx dy) = rect
+            let pos = P $ V2 (cint x) (cint (y - minY))
+            let dim = V2 (cint dx) (cint dy)
+            let rect' = SDL.Rectangle pos dim
+            SDL.copy (vadoRenderer $ pageWindow page) imgtexture Nothing (Just rect')
+          Nothing ->
+            return $ warning ("renderDOM: could not find resources for <img src=" ++ T.unpack href) ()
+      other -> return $ warning ("renderDOM: unexpected replaced element: " ++ show other) ()
+
   SDL.present renderer
 
-renderTree :: (Double, Double) -> (Double, Double, Style) -> BoxTree -> Canvas.Canvas ()
+renderTree :: (Double, Double) -> (Double, Double, Style) -> BoxTree -> Canvas.Canvas [(SDL.Rectangle Double, InlineContent)]
 renderTree (minY, maxY) (x, y, st0) box = do
   case boxContent box of
-    BoxOfBlocks children ->
-      forM_ children $ \(P (V2 dx dy), child) -> do
+    BoxOfBlocks children -> do
+      replaced <- forM children $ \(P (V2 dx dy), child) -> do
         let V2 _ boxH = boxDim child
-        unless ((y+dy) + boxH < minY || maxY < (y+dy)) $ do
+        if not ((y+dy) + boxH < minY || maxY < (y+dy)) then
           withStyling child st0 $ \st ->
             renderTree (minY, maxY) (x + dx, y + dy, st) child
-    BoxInline (TextBox txt baseline) ->
+        else
+          return []
+      return $ concat replaced
+    BoxInline (TextBox txt baseline) -> do
       Canvas.textBaseline (T.unpack txt) (V2 x (y + baseline - minY))
-    _ -> error $ "TODO: renderTree " ++ show (boxContent box)
+      return []
+    BoxInline content@(ImageBox (V2 w h) _) ->
+      let rect = SDL.Rectangle (P $ V2 x y) (V2 w h)
+      in return [(rect, content)]
+    -- _ -> error $ "TODO: renderTree " ++ show (boxContent box)
 
 withStyling :: BoxTree -> Style -> (Style -> Canvas.Canvas a) -> Canvas.Canvas a
 withStyling BoxTree{boxStyling=(stpush, stpop)} st0 action = do
@@ -950,17 +1141,15 @@ cascadingValue CSSFont new@(CSS_Font font1) old@(CSS_Font font2) =
             Just val -> Just $ CSS_Font $ font1{ cssfontSize=Just val }
             Nothing -> warning ("font-size ignored: " ++ show kw) $ Just new
     Just (CSS_Percent perc) ->
-      case cssfontSize font2 of
-        Just (CSS_Px size) ->
-          Just $ CSS_Font $ font1{ cssfontSize=Just (CSS_Px (size * (perc / 100))) }
-        other ->
-          warning ("font-size base is not computed: " ++ show other) $ Just new
+      let sz = case cssfontSize font2 of
+            Just (CSS_Px size) -> size
+            other -> warning ("font-size=" ++ show other ++ " is not computed, falling back to default") defaultFontSize
+      in Just $ CSS_Font $ font1{ cssfontSize=Just (CSS_Px (sz * (perc / 100))) }
     Just (CSS_Em em) ->
-      case cssfontSize font2 of
-        Just (CSS_Px size) ->
-          Just $ CSS_Font $ font1{ cssfontSize=Just (CSS_Px (size * em)) }
-        other ->
-          warning ("font-size base is not computed: " ++ show other) $ Just new
+      let sz = case cssfontSize font2 of
+            Just (CSS_Px size) -> size
+            other -> warning ("font-size=" ++ show other ++ " is not computed, falling back to default") defaultFontSize
+      in Just $ CSS_Font $ font1{ cssfontSize=Just (CSS_Px (sz * em)) }
     _ -> Just new
   where
     relkeywords =
@@ -1046,7 +1235,8 @@ css properties = Style
                     "font-style" -> mkFont $ noCSSFont{ cssfontStyle = Just val }
                     "font-size" -> mkFont $ noCSSFont{ cssfontSize = Just val }
                     "font-family" ->  mkFont $ noCSSFont{ cssfontFamily = Just val }
-                    _ -> warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) Nothing
+                    _ -> if "-" `T.isPrefixOf` name then Nothing
+                         else warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) Nothing
     mergePropVal (CSS_Font new) (CSS_Font old) = CSS_Font (mergeCSSFontValues new old)
     mergePropVal new _old = new
 
@@ -1160,7 +1350,7 @@ defaultFontFaceMono :: String
 defaultFontFaceMono = "Noto Mono"
 
 defaultFontSize :: Double
-defaultFontSize = 16
+defaultFontSize = 18
 
 styleFontSize :: Style -> Double
 styleFontSize st =
@@ -1168,6 +1358,7 @@ styleFontSize st =
   in case cssfontSize font of
     Just (CSS_Num size) -> size
     Just (CSS_Px size) -> size
+    Just (CSS_Em em) -> defaultFontSize * em
     Just other -> warning ("styleFontSize: not computed: " ++ show other) defaultFontSize
     Nothing -> defaultFontSize
 
@@ -1258,6 +1449,8 @@ elementStyles =
      , ("strong",   css [fontweight_bold, display_inline])
      , ("sub",      inline)
      , ("sup",      inline)
+     , ("td",       inline)   -- TODO: proper tables
+     , ("th",       inline)   -- TODO: proper tables
      , ("time",     inline)
      , ("textarea", inline)
      , ("tt",       inline)
@@ -1276,13 +1469,6 @@ elementStyles =
     fontweight_bold = ("font-weight", "bold")
     fontfamily fam = ("font-family", T.pack ("\"" ++ fam ++ "\""))
     color c = ("color", c)
-
-withBuiltinStyle :: Text -> DOMNode -> DOMNode
-withBuiltinStyle name node =
-  case HM.lookup name elementStyles of
-    Just st -> node { domStyle = st }
-    Nothing -> node
-
 
 --------------------------------------------------------------------------------
 -- Utilities
