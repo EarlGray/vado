@@ -22,7 +22,6 @@ executable vado
                      , bytestring
                      , cairo
                      , containers
-                     , dom-selector
                      , html-conduit
                      , http-client
                      , http-client-tls

@@ -180,6 +180,9 @@ data BoxTree = BoxTree
   , boxStyling :: (StyleDiff, StyleDiff)    -- instructions for box rendering
   }
 
+boxHeight :: BoxTree -> Height
+boxHeight BoxTree{ boxDim=V2 _ h } = h
+
 instance Show BoxTree where
   show BoxTree{boxContent=content, boxNode=node, boxDim=dim, boxStyling=(stpush, stpop)} =
     unlines (concat ["BoxTree <", name, "> : ", rshow x, "x", rshow y, dostyle, undostyle] : contents)
@@ -347,7 +350,7 @@ vadoEventLoop page = do
         SDL.KeycodeHome ->
           vadoRedrawEventLoop $ vadoScroll (negate $ pageScroll page) page
         SDL.KeycodeEnd ->
-          let pageH = maybe 0 (\box -> let V2 _ h = boxDim box in h) $ pageBoxes page
+          let pageH = maybe 0 boxHeight $ pageBoxes page
           in vadoRedrawEventLoop $ vadoScroll pageH page
         _ ->
           vadoEventLoop page
@@ -499,6 +502,9 @@ type Width = Double
 type Height = Double
 type BaselineY = Double
 
+noBaseline :: BaselineY
+noBaseline = -1
+
 class Monad m => CanMeasureText m where
   measureHeightAndBaseline :: Canvas.Font -> m (Height, BaselineY)
   measureTextWidth :: Canvas.Font -> String -> m Width
@@ -560,12 +566,6 @@ newtype LayoutOver m a
     MonadState Layout, MonadTrans
   )
 
-stackBox :: CanMeasureText m => V2 Double -> LayoutOver m (V2 Double)
-stackBox (V2 dx dy) = LayoutOver $ do
-  lt <- get
-  put lt{ ltX = 0, ltY = ltY lt + dy, ltMaxX = max (ltMaxX lt) dx }
-  return $ V2 (ltX lt) (ltY lt)
-
 -- | Entry point for layout procedure
 layoutPage :: Page -> IO Page
 layoutPage page@Page{..} = do
@@ -626,16 +626,17 @@ layoutBlock children = do
         layoutText txt
       (Left NewlineContent, _) ->
         layoutLineBreak
-      (Left (ImageContent href mbSize), _) ->
-        case mbSize of
-          Just wh -> do
-            layoutInlineBox wh (BoxInline $ ImageBox wh href)
-          Nothing -> do
-            resources <- gets (ltResources . ltCtx)
-            case M.lookup href resources of
-              Just (ImageResource wh _) ->
-                layoutInlineBox wh (BoxInline $ ImageBox wh href)
-              Nothing -> return ()
+      (Left (ImageContent href mbSize), _) -> do
+        -- TODO: block <img>
+        resources <- gets (ltResources . ltCtx)
+        let mbResSize = case M.lookup href resources of
+              Just (ImageResource wh _) -> Just wh
+              Nothing -> Nothing
+        case mbSize <|> mbResSize of
+          Just wh@(V2 _ h) -> do
+            let baseline = imgBaseline wh child
+            layoutInlineBox wh baseline child (BoxInline $ ImageBox wh href)
+          _ -> return ()
       (Right children', CSS_Keyword "inline") ->
         withStyle child $ layoutBlock children'
       (Right _, display) -> do
@@ -648,9 +649,28 @@ layoutBlock children = do
         ctx <- gets ltCtx
         (box, ctx') <- lift $ elementToBoxes ctx params parentSt child
         modify (\lt -> lt{ ltCtx=ctx' })
-        pos <- stackBox (boxDim box)
-        tell [(P pos, box)]
+        layoutBlockBox box
       -- (_, display) -> error $ concat ["layoutBlock: display=", show display, ", child=", showdbg child]
+  where
+    imgBaseline (V2 _ h) DOM{domSource=Just (XML.NodeElement el)} =
+        case lookupXMLAttribute "align" el of
+          Just "top" -> noBaseline
+          Just "middle" -> h/2
+          Just "bottom" -> h
+          Just other -> warning ("unknown <img align='" ++ T.unpack other ++ "'>") h
+          Nothing -> h
+    imgBaseline (V2 _ h) _ = h
+
+
+layoutBlockBox :: CanMeasureText m => BoxTree -> LayoutOver m ()
+layoutBlockBox box = do
+    pos <- stackBox (boxDim box)
+    tell [(P pos, box)]
+  where
+    stackBox (V2 dx dy) = LayoutOver $ do
+      lt <- get
+      put lt{ ltX = 0, ltY = ltY lt + dy, ltMaxX = max (ltMaxX lt) dx }
+      return $ V2 (ltX lt) (ltY lt)
 
 layoutText :: CanMeasureText m => Text -> LayoutOver m ()
 layoutText txt = do
@@ -695,18 +715,17 @@ layoutInlineSpace = do
         ls' = ls{ lsWords=lsWords ls ++ [" "], lsGap = True }
     in lt{ ltX=x, ltLS=ls' })
 
-layoutInlineBox :: CanMeasureText m => V2 Double -> BoxContent -> LayoutOver m ()
-layoutInlineBox (V2 dx dy) content = do
+layoutInlineBox :: CanMeasureText m => V2 Double -> BaselineY -> DOMNode -> BoxContent -> LayoutOver m ()
+layoutInlineBox (V2 dx dy) baseline node content = do
   x <- gets ltX
   maxwidth <- asks ltWidth
   when (x + dx >= maxwidth) $ do
     layoutLineBreak
 
-  let baseline = dy
   styling <- gets ltStyling
   let box = BoxTree
         { boxContent = content
-        , boxNode = Nothing
+        , boxNode = Just node
         , boxDim = V2 dx dy
         , boxStyling = styling
         }
@@ -748,8 +767,8 @@ layoutLineBreak = do
   when (not (null ws)) $ do
     layoutInlineClose
 
-  bs <- gets (lsBoxes . ltLS)
-  if null bs then do
+  boxes <- gets (lsBoxes . ltLS)
+  if null boxes then do
     preserveNewine <- gets (stylePreservesNewlines . ltStyle)
     when preserveNewine $ do
       -- advance Y by a line height:
@@ -758,9 +777,14 @@ layoutLineBreak = do
       modify $ \lt -> lt{ ltY = ltY lt + h }
   else do
     -- determine the line ascent and descent:
-    let (ascents, descents) = unzip $ map (\(bl, box, _, _) -> let V2 _ h = boxDim box in (bl, h - bl)) bs
+    let boxVerticals (bl, box, _, _) =
+          let h = boxHeight box in
+          if bl == noBaseline
+          then (0, 0, boxHeight box)
+          else (bl, h - bl, h)
+    let (ascents, descents, heights) = L.unzip3 $ map boxVerticals boxes
     let baseline = maximum ascents
-    let height = baseline + maximum descents
+    let height = max (maximum heights) (baseline + maximum descents)
 
     -- position horizontally:
     maxwidth <- asks ltWidth
@@ -768,7 +792,7 @@ layoutLineBreak = do
       let (_, _, _, wafter) = last $ lsBoxes $ ltLS lt
           w = ltX lt - wafter
           linestart = case M.lookup CSSTextAlign (styleInherit $ ltStyle lt) of
-            Just (CSS_Keyword "right") -> maxwidth - w 
+            Just (CSS_Keyword "right") -> maxwidth - w
             Just (CSS_Keyword "center") -> (maxwidth - w) / 2
             Just (CSS_Keyword "left") -> 0
             Just other -> warning ("text-align=" ++ show other ++ ", fallback to 'left'") 0
@@ -776,24 +800,22 @@ layoutLineBreak = do
       in lt{ ltX = linestart }
 
     -- arrange boxes to the known baseline:
-    posboxes <- forM bs $ \(bl, box, wbefore, wafter) -> do
-      let V2 dx _ = boxDim box
+    posboxes <- forM boxes $ \(bl, box, wbefore, wafter) -> do
       x <- gets ltX
+      let y0 = if bl == noBaseline then 0 else baseline - bl
+      let V2 dx _ = boxDim box
       modify $ \lt -> lt{ ltX=ltX lt + wbefore + dx + wafter }
-      return (P (V2 (x+wbefore) (baseline - bl)), box)
+      return (P (V2 (x+wbefore) y0), box)
     width <- gets ltX
-    modify $ \lt -> lt{ ltMaxX = max (ltMaxX lt) width }
+    modify $ \lt -> lt{ ltX = 0, ltMaxX = max (ltMaxX lt) width }
 
     -- emit the line box:
-    let linebox = BoxTree
+    layoutBlockBox $ BoxTree
           { boxContent = BoxOfBlocks posboxes
           , boxNode = Nothing
           , boxDim = V2 width height
           , boxStyling = noStyling
           }
-    modify $ \lt -> lt{ ltX = 0 }
-    pos <- stackBox (boxDim linebox)
-    tell [(P pos, linebox)]
 
   modify $ \lt -> lt{ ltX = 0, ltLS = (ltLS lt){ lsBoxes=[], lsGap=True, lsWords=[] } }
 
@@ -918,8 +940,7 @@ renderTree (minY, maxY) (x, y, st0) box = do
   case boxContent box of
     BoxOfBlocks children -> do
       replaced <- forM children $ \(P (V2 dx dy), child) -> do
-        let V2 _ boxH = boxDim child
-        if not ((y+dy) + boxH < minY || maxY < (y+dy)) then
+        if not ((y+dy) + boxHeight child < minY || maxY < (y+dy)) then
           withStyling child st0 $ \st ->
             renderTree (minY, maxY) (x + dx, y + dy, st) child
         else
@@ -1270,7 +1291,7 @@ cssReadValue txtval =
 cssparseValue :: Atto.Parser CSSValue
 cssparseValue = valp <* Atto.skipSpace <* Atto.endOfInput
   where
-    valp = Atto.choice [cssparseUrl, cssparseColor, cssparseString, cssparseIdentifier, cssparseLength]
+    valp = Atto.choice [cssparseUrl, cssparseColor, cssparseString, cssparseIdentifier, cssparseLength, cssparseNum]
     strp = do
       void $ Atto.char '"'
       cs <- Atto.many' (Atto.notChar '"' <|> (Atto.char '\\' *> Atto.anyChar))
@@ -1291,6 +1312,7 @@ cssparseValue = valp <* Atto.skipSpace <* Atto.endOfInput
         , (const (CSS_Em num)) <$> Atto.string "em"
         , (const (CSS_Percent num)) <$> Atto.string "%"
         ]
+    cssparseNum = CSS_Num <$> Atto.double
     cssparseUrl = do
       let urlp = (strp <|> Atto.takeWhile (/= ')'))
       url <- Atto.string "url(" *> Atto.skipSpace *> urlp <* Atto.skipSpace <* Atto.char ')'
@@ -1443,7 +1465,7 @@ elementStyles =
      , ("acronym",  inline)
      , ("b",        css [fontweight_bold, display_inline])
      , ("bdo",      inline)
-     , ("big",      css [fontsize (1.17 * defaultFontSize), display_inline])
+     , ("big",      css [("font-size", "117%"), display_inline])
      , ("blockquote", css [("margin", "40px 15px")])
      , ("body",     bodyStyle)
      , ("button",   inline)
@@ -1463,7 +1485,7 @@ elementStyles =
      , ("samp",     inline)
      , ("script",   inline)
      , ("select",   inline)
-     , ("small",    css [fontsize (0.83 * defaultFontSize), display_inline])
+     , ("small",    css [("font-size", "83%"), display_inline])
      , ("span",     inline)
      , ("strong",   css [fontweight_bold, display_inline])
      , ("sub",      inline)
