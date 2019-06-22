@@ -7,6 +7,7 @@
 {-# LANGUAGE LambdaCase #-}
 
 import           Control.Applicative
+import qualified Control.Exception as Exc
 import           Control.Monad
 import           Control.Monad.RWS.Strict as RWS
 import qualified Data.Attoparsec.Text as Atto
@@ -16,6 +17,7 @@ import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
 import qualified Data.Map.Strict as M
 import           Data.Maybe
+import qualified Data.Set as S
 import           Data.Word (Word8)
 import           Data.Either (partitionEithers)
 import           Data.Text ( Text)
@@ -32,9 +34,12 @@ import qualified SDL.Cairo as Cairo
 import qualified SDL.Cairo.Canvas as Canvas
 import           SDL.Event as SDL
 import qualified SDL.Image as Image
+--import qualified SDL.Input.Mouse as SDL
 import           SDL.Vect
+import           System.CPUTime (getCPUTime)
 import           System.Environment
 import qualified Text.HTML.DOM as HTML
+import           Text.Printf
 import qualified Text.XML as XML
 import           Text.XML.Cursor (($|), (&/))
 import qualified Text.XML.Cursor as XML
@@ -68,7 +73,7 @@ data Page = Page
 emptyPage :: VadoWindow -> Page
 emptyPage window = Page
   { pageHead = undefined
-  , pageBody = blankNode
+  , pageBody = emptyNode
   , pageBoxes = Nothing
   , pageWindow = window
   , pageScroll = 0
@@ -114,9 +119,6 @@ emptyNode = DOM
   , domAttrs = M.empty
   , domSource = Nothing
   }
-
-blankNode :: DOMNode
-blankNode = makeNode "body" [makeTextNode "This page is intentionally left blank"]
 
 makeTextNode :: Text -> DOMNode
 makeTextNode txt = emptyNode { domContent = Left (TextContent txt) }
@@ -167,6 +169,23 @@ domFromXML xml@(XML.NodeElement el) =
     attr_style = fromMaybe noStyle $ decodeXMLAttribute "style" el
 
 domFromXML _ = Nothing
+
+--------------------------------------------------------------------------------
+-- XML Utilities
+
+lookupXMLAttribute :: Text -> XML.Element -> Maybe Text
+lookupXMLAttribute attr node = M.lookup xmlattr (XML.elementAttributes node)
+  where xmlattr = XML.Name attr Nothing Nothing
+
+decodeXMLAttribute :: Read a => Text -> XML.Element -> Maybe a
+decodeXMLAttribute attr node = do
+  s <- lookupXMLAttribute attr node
+  case reads (T.unpack s) of
+    [(value, "")] -> Just value
+    _ -> Nothing
+
+tagName :: XML.Element -> Text
+tagName = XML.nameLocalName . XML.elementName
 
 
 --------------------------------------------------------------------------------
@@ -246,11 +265,11 @@ findInBox (P xy) box0 = go [] xy box0
 main :: IO ()
 main = do
   window <- vadoWindow
-  page0 <- layoutPage (emptyPage window)
+  page0 <- layoutPage $ vadoWaitPage window
   renderDOM page0
 
   args <- getArgs
-  let url = if null args then "https://en.wikipedia.org" else head args
+  let url = fromMaybe "vado:home" $ listToMaybe args
   page1 <- fetchURL url page0
 
   page <- layoutPage page1
@@ -386,11 +405,14 @@ elementEvents = HM.fromList
   ]
 
 clickLink :: DOMNode -> Page -> IO Page
-clickLink DOM{ domSource=Just (XML.NodeElement el) } page = do
+clickLink DOM{ domSource=Just (XML.NodeElement el) } page =
   case lookupXMLAttribute "href" el of
     Nothing -> return page
     Just href -> do
-      page' <- fetchURL (T.unpack href) page
+      let waitpage = vadoWaitPage (pageWindow page)
+      layoutPage waitpage >>= renderDOM
+      page' <- fetchURL (T.unpack href) page `Exc.catch` \(e :: HttpException) ->
+        putStr "Vado error: " >> print e >> return page
       layoutPage page'
 clickLink node page =
   return $ warning ("clickLink: could not find address for: " ++ showdbg node) page
@@ -402,7 +424,15 @@ data HTTPResource
   = ImageResource !(V2 Double) SDL.Texture
 
 fetchURL :: String -> Page -> IO Page
-fetchURL url page = do
+fetchURL "vado:home" Page{pageWindow=w} = return $ vadoHomePage w
+fetchURL "vado:error" Page{pageWindow=w} = return $ vadoErrorPage w "vado:error"
+fetchURL url page =
+    fetchHTTP url page `Exc.catch` \(e :: HttpException) ->
+      return (vadoErrorPage (pageWindow page) (T.pack $ show e))
+
+fetchHTTP :: String -> Page -> IO Page
+fetchHTTP url page = do
+  startT <- getCPUTime
   let prevuri = pageUrl page
   let absuri =
         if URI.isAbsoluteURI url then (fromJust $ URI.parseURI url)
@@ -427,28 +457,36 @@ fetchURL url page = do
 
     let images_axis = (XML.fromDocument document $| XML.descendant &/ XML.element "img")
     let imageurls = mapMaybe (\cursor -> let XML.NodeElement el = XML.node cursor in lookupXMLAttribute "src" el) images_axis
-    resources <- forM imageurls $ \imgurl -> do
-      case parseURIReference (T.unpack imgurl) of
-        Nothing -> return $ warning ("Could not parse URL: " ++ T.unpack imgurl) []
-        Just u -> do
-          req <- setUriRelative pageReq u
-          putStrLn $ concat
-            [ T.unpack $ T.decodeLatin1 $ HTTP.method req, " "
-            , if HTTP.secure req then "https://" else "http://"
-            , T.unpack $ T.decodeLatin1 $ HTTP.host req
-            , T.unpack $ T.decodeLatin1 $ HTTP.path req
-            ]
-          resp <- HTTP.httpLbs req httpman
-          let content = B.toStrict $ HTTP.responseBody resp
-          case Image.format content of
-            Just _ -> do
-              bitmap <- Image.decode content
-              V2 w h <- SDL.surfaceDimensions bitmap
-              let wh = V2 (fromIntegral w) (fromIntegral h)
-              texture <- SDL.createTextureFromSurface (vadoRenderer $ pageWindow page) bitmap
-              return [(imgurl, ImageResource wh texture)]
-            _ ->
-              return $ warning ("Image format not supported: " ++ T.unpack imgurl) []
+    resources <- forM (S.toList $ S.fromList imageurls) $ \imgurl -> do
+      case M.lookup imgurl (pageResources page) of
+        Just res -> return [(imgurl, res)]
+        Nothing ->
+          case parseURIReference (T.unpack imgurl) of
+            Nothing -> return $ warning ("Could not parse URL: " ++ T.unpack imgurl) []
+            Just u -> do
+              req <- setUriRelative pageReq u
+              putStrLn $ concat
+                [ T.unpack $ T.decodeLatin1 $ HTTP.method req, " "
+                , if HTTP.secure req then "https://" else "http://"
+                , T.unpack $ T.decodeLatin1 $ HTTP.host req
+                , case (HTTP.secure req, HTTP.port req) of (True, 443) -> ""; (False, 80) -> ""; (_,p) -> ":" ++ show p
+                , T.unpack $ T.decodeLatin1 $ HTTP.path req
+                ]
+              resp <- HTTP.httpLbs req httpman
+              let content = B.toStrict $ HTTP.responseBody resp
+              case Image.format content of
+                Just _ -> do
+                  bitmap <- Image.decode content
+                  V2 w h <- SDL.surfaceDimensions bitmap
+                  let wh = V2 (fromIntegral w) (fromIntegral h)
+                  texture <- SDL.createTextureFromSurface (vadoRenderer $ pageWindow page) bitmap
+                  return [(imgurl, ImageResource wh texture)]
+                _ ->
+                  return $ warning ("Image format not supported: " ++ T.unpack imgurl) []
+
+    endT <- getCPUTime
+    let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
+    putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show absuri) pageloadT
 
     let Just dom = domFromXML $ XML.NodeElement bodynode
     when debug $ putStrLn (showdbg dom)
@@ -456,7 +494,7 @@ fetchURL url page = do
       { pageUrl = absuri
       , pageHead = headnode
       , pageBody = dom
-      , pageResources = M.fromList (concat resources)
+      , pageResources = M.fromList (concat resources) `mappend` pageResources page
       , pageScroll = 0
       }
   else if "text/" `T.isPrefixOf` contentType then do
@@ -1280,6 +1318,8 @@ css properties = Style
     mergePropVal (CSS_Font new) (CSS_Font old) = CSS_Font (mergeCSSFontValues new old)
     mergePropVal new _old = new
 
+withCSS :: [(Text, Text)] -> DOMNode -> DOMNode
+withCSS properties node = node { domStyle = css properties `overriding` domStyle node }
 
 -- | Parses a CSSValue from text for a CSS value
 cssReadValue :: Text -> UnknownOr CSSValue
@@ -1511,20 +1551,25 @@ elementStyles =
     fontfamily fam = ("font-family", T.pack ("\"" ++ fam ++ "\""))
     color c = ("color", c)
 
---------------------------------------------------------------------------------
--- Utilities
 
-lookupXMLAttribute :: Text -> XML.Element -> Maybe Text
-lookupXMLAttribute attr node = M.lookup xmlattr (XML.elementAttributes node)
-  where xmlattr = XML.Name attr Nothing Nothing
+vadoHomePage :: VadoWindow -> Page
+vadoHomePage window = (emptyPage window){ pageBody = body }
+  where
+    body = withCSS [("text-align", "center")] $ makeNode "body"
+      [ withCSS [("white-space", "pre")] $ makeNode "h1" [makeTextNode "\n\n\nVado"]
+      ]
 
-decodeXMLAttribute :: Read a => Text -> XML.Element -> Maybe a
-decodeXMLAttribute attr node = do
-  s <- lookupXMLAttribute attr node
-  case reads (T.unpack s) of
-    [(value, "")] -> Just value
-    _ -> Nothing
+vadoWaitPage :: VadoWindow -> Page
+vadoWaitPage window = (emptyPage window){ pageBody = body }
+  where
+    body = withCSS [("text-align", "center")] $ makeNode "body"
+      [ withCSS [("white-space", "pre"), ("font-family", "FreeSerif"), ("font-size", "100px")] $ makeNode "h1" [makeTextNode "\n\n\x231B"]
+      ]
 
-tagName :: XML.Element -> Text
-tagName = XML.nameLocalName . XML.elementName
-
+vadoErrorPage :: VadoWindow -> Text -> Page
+vadoErrorPage window err = (emptyPage window){ pageBody = body }
+  where
+    body = withCSS [] $ makeNode "body"
+      [ withCSS [("text-align", "center"), ("font-weight", "bold"), ("white-space", "pre"), ("color", "red"), ("font-family", "FreeSerif"), ("font-size", "72px")] $ makeNode "h1" [makeTextNode "\noops"]
+      , makeNode "pre" [makeTextNode err]
+      ]
