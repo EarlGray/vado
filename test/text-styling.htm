@@ -14,6 +14,7 @@
   The following text must be strong: <strong>strong test</strong><br>
   The following text must be monospace: <code>monospace test</code><br>
   The following text must be red: <span style="color: red">red text</span><br>
+  The following text must be yellow on blue: <span style="color: yellow; background-color: blue;">yellow on blue</span><br>
   Links must be visible: <a href="#">this is a link</a><br>
   <nosuch>nosuch tag</nosuch><br>
   </div>
@@ -30,7 +31,7 @@
     <div>This   is a test of white-space property: <span style="white-space: pre">This   is  a "white-space: pre"
             span</span></div>
   This is code:
-  <pre><code>
+  <pre style="background-color: #eee"><code>
 #include &lt;stdio.h&gt;
 
 int main() {
@@ -45,15 +46,20 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor i
   </div>
   <hr>
 
-  <h3><code>text-align</code></h3>
+  <h3>text-align</h3>
   <div>
-     <span style="text-align: left">Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</span>
-      <div style="text-align: right">Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</div>
-   </div>
-   <div style="text-align: center">
-      <span style="text-align: right">
-        Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
-      </span>
-   </div>
+    <b>Left</b>:<br>
+    <span style="text-align: left">Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</span>
+    <div style="text-align: right">
+      <b>Right:</b><br>
+      Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. .</div>
+    </div>
+    <div style="text-align: center">
+       <b>center:</b><br>
+       <span style="text-align: right">
+         Lorem ipsum dolor sit amet, consectetur adipiscing elit,  sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
+       </span>
+    </div>
+  </div>
 </body>
 </html>

@@ -20,7 +20,7 @@ import           Data.Maybe
 import qualified Data.Set as S
 import           Data.Word (Word8)
 import           Data.Either (partitionEithers)
-import           Data.Text ( Text)
+import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import           Linear.V2 (V2(..))
@@ -37,7 +37,7 @@ import qualified SDL.Image as Image
 --import qualified SDL.Input.Mouse as SDL
 import           SDL.Vect
 import           System.CPUTime (getCPUTime)
-import           System.Environment
+import qualified System.Environment as Env
 import qualified Text.HTML.DOM as HTML
 import           Text.Printf
 import qualified Text.XML as XML
@@ -51,6 +51,10 @@ debug = False
 
 warning :: String -> a -> a
 warning msg = Trace.trace msg
+
+whenJust :: Monad m => Maybe a -> (a -> m ()) -> m ()
+whenJust (Just v) f = f v
+whenJust _ _ = return ()
 
 --------------------------------------------------------------------------------
 -- page, DOM and resources
@@ -161,12 +165,22 @@ domFromXML xml@(XML.NodeElement el) | tagName el == "img" =
     wh = liftM2 V2 width height
 
 domFromXML xml@(XML.NodeElement el) =
-    Just node{ domStyle=attr_style `overriding` domStyle node, domAttrs=attrs, domSource=Just xml }
+    let children = mapMaybe domFromXML $ XML.elementNodes el
+    in Just DOM
+      { domContent = Right children
+      , domStyle = attr_style `overriding` builtin_style
+      , domAttrs = attrs
+      , domEvents = builtin_events
+      , domSource = Just xml
+      }
   where
-    node = makeNode (tagName el) children
-    children = mapMaybe domFromXML $ XML.elementNodes el
     attrs = M.mapKeys (XML.nameLocalName) $ XML.elementAttributes el
+
     attr_style = fromMaybe noStyle $ decodeXMLAttribute "style" el
+
+    tag = tagName el
+    builtin_style = fromMaybe noStyle $ HM.lookup tag elementStyles
+    builtin_events = fromMaybe noEvents $ HM.lookup tag elementEvents
 
 domFromXML _ = Nothing
 
@@ -268,7 +282,7 @@ main = do
   page0 <- layoutPage $ vadoWaitPage window
   renderDOM page0
 
-  args <- getArgs
+  args <- Env.getArgs
   let url = fromMaybe "vado:home" $ listToMaybe args
   page1 <- fetchURL url page0
 
@@ -295,7 +309,7 @@ defaultWindowSize = V2 800 600
 -- | Create window and texture
 vadoWindow :: IO VadoWindow
 vadoWindow = do
-  setEnv "SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR" "0"
+  Env.setEnv "SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR" "0"
   SDL.initialize [SDL.InitVideo, SDL.InitTimer, SDL.InitEvents]
   window <-
     SDL.createWindow
@@ -952,7 +966,7 @@ renderDOM page = do
   replaced <- Canvas.withCanvas texture $ do
     let body = fromJust $ pageBoxes page
     Canvas.background $ Canvas.rgb 255 255 255 -- TODO: set to body background color
-    withStyling body noStyle $ \st ->
+    withStyling body (0, 0, noStyle) $ \st ->
       renderTree (minY, minY + vadoViewHeight page) (0, 0, st) body
   SDL.copy (vadoRenderer $ pageWindow page) texture Nothing Nothing
 
@@ -979,7 +993,7 @@ renderTree (minY, maxY) (x, y, st0) box = do
     BoxOfBlocks children -> do
       replaced <- forM children $ \(P (V2 dx dy), child) -> do
         if not ((y+dy) + boxHeight child < minY || maxY < (y+dy)) then
-          withStyling child st0 $ \st ->
+          withStyling child (x+dx, y+dy-minY, st0) $ \st ->
             renderTree (minY, maxY) (x + dx, y + dy, st) child
         else
           return []
@@ -992,9 +1006,10 @@ renderTree (minY, maxY) (x, y, st0) box = do
       in return [(rect, content)]
     -- _ -> error $ "TODO: renderTree " ++ show (boxContent box)
 
-withStyling :: BoxTree -> Style -> (Style -> Canvas.Canvas a) -> Canvas.Canvas a
-withStyling BoxTree{boxStyling=(stpush, stpop)} st0 action = do
+withStyling :: BoxTree -> (Double, Double, Style) -> (Style -> Canvas.Canvas a) -> Canvas.Canvas a
+withStyling BoxTree{boxDim=V2 w h, boxStyling=(stpush, stpop)} (x, y, st0) action = do
     let st = st0 `applyDiff` stpush
+    whenJust (M.lookup CSSBackgroundColor stpush) $ applyBackgroundColor st  -- only on push!
     applyStyling st stpush
     ret <- action st
     applyStyling st0 stpop
@@ -1008,14 +1023,20 @@ withStyling BoxTree{boxStyling=(stpush, stpop)} st0 action = do
             Canvas.textFont $ styleFont st
           (CSSColor, CSS_RGB r g b) ->
             Canvas.stroke $ Canvas.rgb r g b
-          (CSSColor, CSS_Keyword name) ->
-            -- TODO: move to cascadingOver?
-            case cssReadValue <$> M.lookup name cssColorAliases of
-              Just (Right (CSS_RGB r g b)) ->
-                Canvas.stroke $ Canvas.rgb r g b
-              _ ->
-                return $ warning ("unknown color: " ++ T.unpack name) ()
-          _ -> return ()
+          (CSSBackgroundColor, _) -> return ()
+          other -> return $ warning ("stpush property ignored: " ++ show other) ()
+
+    applyBackgroundColor st (CSS_RGB r g b) = do
+      Canvas.stroke $ Canvas.rgb r g b
+      Canvas.fill $ Canvas.rgb r g b
+      Canvas.rect $ Canvas.D x y w h
+      case st `cssValueMaybe` CSSColor of
+        Just (CSS_RGB r' g' b') -> Canvas.stroke $ Canvas.rgb r' g' b'
+        Just other -> return $ warning ("unknown stroke color: " ++ show other) ()
+        Nothing -> return $ warning "no stroke color set, weird" ()
+    applyBackgroundColor _ other =
+      return $ warning ("Unknown background color: " ++ show other) ()
+
 
 
 --------------------------------------------------------------------------------
@@ -1295,7 +1316,12 @@ css properties = Style
     , styleInherit = M.fromListWith mergePropVal inherit
     }
   where
-    (own, inherit) = partitionEithers $ mapMaybe readProperty properties
+    mergePropVal (CSS_Font new) (CSS_Font old) = CSS_Font (mergeCSSFontValues new old)
+    mergePropVal new _old = new
+
+    (own, inherit) = partitionEithers $ map desugar $ mapMaybe readProperty properties
+
+    readProperty :: (Text, Text) -> Maybe (Either (CSSOwnProperty, CSSValue) (CSSProperty, CSSValue))
     readProperty (name, textval) =
       case cssReadValue textval of
         Left _ ->
@@ -1315,8 +1341,12 @@ css properties = Style
                     "font-family" ->  mkFont $ noCSSFont{ cssfontFamily = Just val }
                     _ -> if "-" `T.isPrefixOf` name then Nothing
                          else warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) Nothing
-    mergePropVal (CSS_Font new) (CSS_Font old) = CSS_Font (mergeCSSFontValues new old)
-    mergePropVal new _old = new
+
+    desugar (Right (prop, CSS_Keyword color)) | prop `elem` [CSSColor, CSSBackgroundColor] = Right (prop, color')
+      where
+        -- yes, it's always Right:
+        Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases
+    desugar other = other
 
 withCSS :: [(Text, Text)] -> DOMNode -> DOMNode
 withCSS properties node = node { domStyle = css properties `overriding` domStyle node }
@@ -1563,13 +1593,22 @@ vadoWaitPage :: VadoWindow -> Page
 vadoWaitPage window = (emptyPage window){ pageBody = body }
   where
     body = withCSS [("text-align", "center")] $ makeNode "body"
-      [ withCSS [("white-space", "pre"), ("font-family", "FreeSerif"), ("font-size", "100px")] $ makeNode "h1" [makeTextNode "\n\n\x231B"]
+      [ withCSS [("white-space", "pre")
+                ,("font-family", "FreeSerif")
+                ,("font-size", "100px")
+        ] $ makeNode "h1" [makeTextNode "\n\n\x231B"]
       ]
 
 vadoErrorPage :: VadoWindow -> Text -> Page
 vadoErrorPage window err = (emptyPage window){ pageBody = body }
   where
     body = withCSS [] $ makeNode "body"
-      [ withCSS [("text-align", "center"), ("font-weight", "bold"), ("white-space", "pre"), ("color", "red"), ("font-family", "FreeSerif"), ("font-size", "72px")] $ makeNode "h1" [makeTextNode "\noops"]
+      [ withCSS [("text-align", "center")
+                ,("font-weight", "bold")
+                ,("white-space", "pre")
+                ,("color", "red")
+                ,("font-family", "FreeSerif")
+                ,("font-size", "72px")
+        ] $ makeNode "h1" [makeTextNode "\noops"]
       , makeNode "pre" [makeTextNode err]
       ]
