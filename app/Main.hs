@@ -901,12 +901,10 @@ chunksFromTokens (CSS_Keyword "pre") (gap, tokens) = (gap', lns)
     go (buf, res) (t:ts) = go (buf ++ [t], res) ts
 
 -- TODO: properly:
-chunksFromTokens (CSS_Keyword "nowrap") (gap0, tokens) =
-  case (gap0, tokens) of
-    (False, " ":ts) ->
-      let (gap', [ln]) = chunksFromTokens (CSS_Keyword "nowrap") (True, ts) in (gap', [" " ++ ln])
-    _ ->
-      let ln = L.intercalate " " $ filter (\t -> t /= " " && t /= "\n") tokens in (False, [ln])
+chunksFromTokens (CSS_Keyword "nowrap") (gap0, tokens) = (gap, lns)
+  where
+    (gap, ts) = chunksFromTokens (CSS_Keyword "normal") (gap0, tokens)
+    lns = let ln = concat ts in if L.null ln then [] else [ln]
 
 chunksFromTokens whitespace ts = chunksFromTokens (warning msg $ CSS_Keyword "normal") ts
   where msg = "TODO: chunksFromTokens fallback to 'normal' instead of: " ++ show whitespace
