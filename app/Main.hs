@@ -148,6 +148,13 @@ withAttributes attrs node = node { domAttrs = M.fromList attrs }
 withNodeID :: Int -> DOMNode -> DOMNode
 withNodeID nid node = node { domState = NodeID nid }
 
+withEvent :: Text -> EventHandler -> DOMNode -> DOMNode
+withEvent eventName eventHandler node = node{ domEvents = events }
+  where
+    prependEvent = Just . maybe [eventHandler] (eventHandler:)
+    events = events0{ eventsOther = M.alter prependEvent eventName (eventsOther events0) }
+    events0 = domEvents node
+
 -- | Content of a leaf DOM node,
 -- i.e. what is to be drawn in this node.
 -- either a block or inline element, e.g. some text.
@@ -416,10 +423,10 @@ vadoEventLoop page = do
           let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
           let stack = P pagepos `findInBox` boxes
           case boxNode =<< listToMaybe stack of
-            Just node ->
-              case eventMouseReleased $ domEvents node of
-                Just handler -> handler pagepos node page
-                Nothing -> return page
+            Just node -> do
+              let eventHandlers = eventsMouseReleased $ domEvents node
+              let foreach page' handler = handler pagepos node page'
+              foldM foreach page eventHandlers
             Nothing -> return page
         _ -> return page
       vadoRedrawEventLoop page'
@@ -440,7 +447,9 @@ vadoEventLoop page = do
             SDL.KeycodePageDown -> do
               vadoRedrawEventLoop $ vadoScroll (vadoViewHeight page) page
             SDL.KeycodeHome ->
-              vadoRedrawEventLoop $ vadoScroll (negate $ pageScroll page) page
+              if keyAltPressed (SDL.keysymModifier $ SDL.keyboardEventKeysym e)
+              then fetchURL "vado:home" page >>= layoutPage >>= vadoRedrawEventLoop
+              else vadoRedrawEventLoop $ vadoScroll (negate $ pageScroll page) page
             SDL.KeycodeEnd ->
               let pageH = maybe 0 boxHeight $ pageBoxes page
               in vadoRedrawEventLoop $ vadoScroll pageH page
@@ -449,12 +458,9 @@ vadoEventLoop page = do
 
         NodeID focus -> do
           let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
-          case eventKeyReleased (domEvents node) of
-            Just onKeyRelease -> do
-              page' <- onKeyRelease (SDL.keyboardEventKeysym e) node page
-              vadoRedrawEventLoop page'
-            Nothing ->
-              vadoEventLoop page
+          let eventHandlers = eventsKeyReleased $ domEvents node
+          let foreach page' handler = handler (SDL.keyboardEventKeysym e) node page'
+          foldM foreach page eventHandlers >>= vadoRedrawEventLoop
 
     TextInputEvent e ->
       case pageFocus page of
@@ -462,12 +468,9 @@ vadoEventLoop page = do
           vadoEventLoop page
         NodeID focus -> do
           let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
-          case eventTextInput (domEvents node) of
-            Just onTextInput -> do
-              page' <- onTextInput (SDL.textInputEventText e) node page
-              vadoRedrawEventLoop page'
-            Nothing ->
-              vadoEventLoop page
+          let eventHandlers = eventsTextInput $ domEvents node
+          let foreach page' handler = handler (SDL.textInputEventText e) node page'
+          foldM foreach page eventHandlers >>= vadoRedrawEventLoop
 
     _ -> do
       vadoEventLoop page
@@ -488,24 +491,28 @@ vadoViewHeight page = h
 type EventHandler = DOMNode -> Page -> IO Page
 
 data Events = Events
-  { eventMouseReleased :: Maybe (V2 Double -> EventHandler)
-  , eventKeyReleased :: Maybe (SDL.Keysym -> EventHandler)
-  , eventTextInput :: Maybe (Text -> EventHandler)
+  { eventsMouseReleased :: [V2 Double -> EventHandler]
+  , eventsKeyReleased :: [SDL.Keysym -> EventHandler]
+  , eventsTextInput :: [Text -> EventHandler]
+  , eventsOther :: M.Map Text [EventHandler]
   }
 
 noEvents :: Events
 noEvents = Events
-  { eventMouseReleased = Nothing
-  , eventKeyReleased = Nothing
-  , eventTextInput = Nothing
+  { eventsMouseReleased = []
+  , eventsKeyReleased = []
+  , eventsTextInput = []
+  , eventsOther = M.empty
   }
 
 elementEvents :: HM.HashMap Text Events
 elementEvents = HM.fromList
-  [ ("a", noEvents { eventMouseReleased = Just (\_ node page -> clickLink node page) })
+  [ ("a", noEvents
+      { eventsMouseReleased = [\_ node page -> clickLink node page]
+      })
   , ("input", noEvents
-      { eventKeyReleased = Just input_onKeyReleased
-      , eventTextInput = Just input_onTextInput
+      { eventsKeyReleased = [input_onKeyReleased]
+      , eventsTextInput = [input_onTextInput]
       })
   ]
 
@@ -523,22 +530,66 @@ clickLink node page =
   return $ warning ("clickLink: could not find address for: " ++ showdbg node) page
 
 
-input_onKeyReleased :: SDL.Keysym -> EventHandler
-input_onKeyReleased keysym _node page = do
-  putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
-  return page
+noKeyModifiers :: SDL.KeyModifier
+noKeyModifiers = SDL.KeyModifier
+  { SDL.keyModifierLeftShift = False
+  , SDL.keyModifierRightShift = False
+  , SDL.keyModifierLeftCtrl = False
+  , SDL.keyModifierRightCtrl = False
+  , SDL.keyModifierLeftAlt = False
+  , SDL.keyModifierRightAlt = False
+  , SDL.keyModifierLeftGUI = False
+  , SDL.keyModifierRightGUI = False
+  , SDL.keyModifierNumLock = False
+  , SDL.keyModifierCapsLock = False
+  , SDL.keyModifierAltGr = False
+  }
 
-input_onTextInput :: Text -> EventHandler
-input_onTextInput t DOM{ domState=(NodeID nid) } page@Page{ pageElementStates=states0 } = do
+keyCtrlPressed :: SDL.KeyModifier -> Bool
+keyCtrlPressed mods =
+  (SDL.keyModifierLeftCtrl mods || SDL.keyModifierRightCtrl mods) &&
+  (mods{ SDL.keyModifierLeftCtrl=False, SDL.keyModifierRightCtrl=False } == noKeyModifiers)
+
+keyAltPressed :: SDL.KeyModifier -> Bool
+keyAltPressed mods =
+  (SDL.keyModifierLeftAlt mods || SDL.keyModifierRightAlt mods) &&
+  (mods{ SDL.keyModifierLeftAlt=False, SDL.keyModifierRightAlt=False } == noKeyModifiers)
+
+input_modify :: NodeID -> Page -> (Text -> Text) -> IO Page
+input_modify (NodeID nid) page@Page{ pageElementStates=states0 } action = do
   case IM.lookup nid states0 of
     Nothing ->
       return $ warning ("NodeID=" ++ show nid ++ " not found") page
     Just (noderef, StateOfTextInput txt0) -> do
-      let txt = T.append txt0 t
+      let txt = action txt0
           states = IM.insert nid (noderef, StateOfTextInput txt) states0
-      putStrLn $ "Input: " ++ T.unpack txt
+      -- putStrLn $ "Input: " ++ T.unpack txt
       layoutPage $ page{ pageElementStates = states }
-      -- TODO: laying out page on each character is a little excessive
+
+input_onKeyReleased :: SDL.Keysym -> EventHandler
+input_onKeyReleased keysym node@DOM{ domState=nid, domEvents=events } page = do
+  case SDL.keysymKeycode keysym of
+    SDL.KeycodeBackspace ->
+      input_modify nid page (\case "" -> ""; t -> T.init t)
+    SDL.KeycodeReturn -> do
+      -- TODO: find a parent form, use its submit action
+      case M.lookup "change" (eventsOther events) of
+        Just handlers -> do
+          let foreach page' handler = handler node page'
+          foldM foreach page handlers
+        Nothing ->
+          return page
+    -- TODO: Mac (GUI) keyboard layout support:
+    SDL.KeycodeV | keyCtrlPressed (SDL.keysymModifier keysym) -> do
+      clipboard <- SDL.getClipboardText
+      input_modify nid page (const clipboard)
+    _ -> do
+      putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
+      return page
+
+input_onTextInput :: Text -> EventHandler
+input_onTextInput t DOM{ domState=nid } page =
+  input_modify nid page $ \txt -> T.append txt t
 
 --------------------------------------------------------------------------------
 -- HTTP request, caches and local storage
@@ -611,7 +662,7 @@ fetchHTTP url page = do
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show absuri) pageloadT
 
-    let (Just dom, (focused, states)) = runState (domFromXML (XML.NodeElement bodynode)) (NodeID 0, IM.empty)
+    let (Just dom, (_focused, states)) = runState (domFromXML (XML.NodeElement bodynode)) (NodeID 0, IM.empty)
     when debug $ putStrLn (showdbg dom)
     return page
       { pageUrl = absuri
@@ -619,7 +670,7 @@ fetchHTTP url page = do
       , pageBody = dom
       , pageResources = M.fromList (concat resources) `mappend` pageResources page
       , pageScroll = 0
-      , pageFocus = focused
+      , pageFocus = NodeID 0
       , pageElementStates = states
       }
   else if "text/" `T.isPrefixOf` contentType then do
@@ -1721,25 +1772,31 @@ vadoHomePage window = (emptyPage window)
   where
     inputID = 1
     input0 = (makeNode "input" []){ domContent=Left (ContentForTextInput $ NodeID inputID) }
-    input = withAttributes [("type", "text"), ("name", "url")] $ withNodeID inputID input0
+    input = withEvent "change" inputChange $ withNodeID inputID input0
     body = withCSS [("text-align", "center")] $ makeNode "body"
       [ withCSS [("white-space", "pre")] $ makeNode "h1" [makeTextNode "\n\n\nVado"]
       , makeNode "hr" []
+      , makeTextNode "type or Ctrl-V your url:"
       , withAttributes [("action", "vado:go"), ("method", "POST")] $ makeNode "form"
-          [ input
+          [ withAttributes inputAttrs input
           , makeNode "br" []
           , withAttributes [("type", "submit"), ("value", "I go!")] $ makeNode "input" []
           ]
       ]
+    inputAttrs = [("type", "text"), ("name", "url")]
+    inputChange DOM{ domState=(NodeID nid) } page@Page{ pageElementStates=states } = do
+      case IM.lookup nid states of
+        Just (_, StateOfTextInput url) ->
+          fetchURL (T.unpack url) page >>= layoutPage
+        _ -> return page
 
 vadoWaitPage :: VadoWindow -> Page
 vadoWaitPage window = (emptyPage window){ pageBody = body }
   where
     body = withCSS [("text-align", "center")] $ makeNode "body"
       [ withCSS [("white-space", "pre")
-                ,("font-family", "FreeSerif")
-                ,("font-size", "100px")
-        ] $ makeNode "h1" [makeTextNode "\n\n\x231B"]
+                ,("font-size", "48px")
+        ] $ makeNode "h1" [makeTextNode "\n\nloading..."]
       ]
 
 vadoErrorPage :: VadoWindow -> Text -> Page
