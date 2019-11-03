@@ -10,12 +10,14 @@ import           Control.Applicative
 import qualified Control.Exception as Exc
 import           Control.Monad
 import           Control.Monad.RWS.Strict as RWS
+import           Control.Monad.State (State, runState)
 import qualified Data.Attoparsec.Text as Atto
 import qualified Data.ByteString.Lazy as B
 import qualified Data.Char as C
 import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
 import qualified Data.Map.Strict as M
+import qualified Data.IntMap.Strict as IM
 import           Data.Maybe
 import qualified Data.Set as S
 import           Data.Word (Word8)
@@ -72,6 +74,9 @@ data Page = Page
 
   , pageWindow :: VadoWindow
   , pageScroll :: Height
+
+  , pageFocus :: NodeID
+  , pageElementStates :: ElementStates
   }
 
 emptyPage :: VadoWindow -> Page
@@ -83,6 +88,8 @@ emptyPage window = Page
   , pageScroll = 0
   , pageResources = M.empty
   , pageUrl = nullURI
+  , pageFocus = noState
+  , pageElementStates = IM.empty
   }
 
 data DOMNode = DOM
@@ -93,6 +100,7 @@ data DOMNode = DOM
   , domAttrs :: M.Map Text Text
   , domSource :: Maybe XML.Node
   -- ^ Backreference to the XML source of this DOM node
+  , domState :: NodeID
   }
 
 class HasDebugView a where
@@ -122,6 +130,7 @@ emptyNode = DOM
   , domEvents = noEvents
   , domAttrs = M.empty
   , domSource = Nothing
+  , domState = noState
   }
 
 makeTextNode :: Text -> DOMNode
@@ -133,6 +142,12 @@ makeNode tag children = emptyNode { domContent=Right children, domStyle=style, d
     style = fromMaybe noStyle $ HM.lookup tag elementStyles
     events = fromMaybe noEvents $ HM.lookup tag elementEvents
 
+withAttributes :: [(Text, Text)] -> DOMNode -> DOMNode
+withAttributes attrs node = node { domAttrs = M.fromList attrs }
+
+withNodeID :: Int -> DOMNode -> DOMNode
+withNodeID nid node = node { domState = NodeID nid }
+
 -- | Content of a leaf DOM node,
 -- i.e. what is to be drawn in this node.
 -- either a block or inline element, e.g. some text.
@@ -143,46 +158,78 @@ data DOMContent
   -- ^ Force newline here, usually corresponds to <br>
   | ImageContent !Text !(Maybe (V2 Double))
   -- ^           ^href
+  | ContentForTextInput NodeID
 
 instance Show DOMContent where
   show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
   show NewlineContent = "NewlineContent"
   show (ImageContent href wh) = "ImageContent " ++ T.unpack href ++ " (" ++ show wh ++ ")"
+  show (ContentForTextInput nid) = "TextInputContent (" ++ show nid ++ ")"
+
+-- | DOM Node States
+newtype NodeID = NodeID Int
+  deriving (Show, Eq)
+
+type ElementStates = IM.IntMap (DOMNode, DOMNodeState)
+
+noState :: NodeID
+noState = NodeID 0
+
+data DOMNodeState
+  = StateOfTextInput !Text
+
 
 --------------------------------------------------------------------------------
 -- | Normalize an XML tree of elements and text, possibly with
 -- attributes like style and event handlers.
-domFromXML :: XML.Node -> Maybe DOMNode
-domFromXML xml@(XML.NodeContent txt) =
-    Just (makeTextNode txt){ domSource=Just xml }
+domFromXML :: XML.Node -> State (NodeID, ElementStates) (Maybe DOMNode)
 
-domFromXML xml@(XML.NodeElement el) | tagName el == "img" =
-    Just emptyNode{ domContent=Left (ImageContent href wh), domSource=Just xml }
+domFromXML xml =
+  case xml of
+    XML.NodeContent txt ->
+      return $ Just (makeTextNode txt){ domSource=Just xml }
+
+    XML.NodeElement el | tagName el == "img" ->
+      let Just href = lookupXMLAttribute "src" el -- TODO
+          width = decodeXMLAttribute "width" el
+          height = decodeXMLAttribute "height" el
+          wh = liftM2 V2 width height
+      in return $ Just emptyNode{ domContent=Left (ImageContent href wh), domSource=Just xml }
+
+    XML.NodeElement el | tagName el == "input" -> do
+      whenJust (listToMaybe $ XML.elementNodes el) $ \_ ->
+        return $ warning "input element cannot have children, skipping" ()
+      let node = domFromElement el []
+      (NodeID nid0, states0) <- get
+      let nid = nid0 + 1
+      put (NodeID nid, IM.insert nid (node, StateOfTextInput "") states0)
+      return $ Just $ node
+        { domState = NodeID nid
+        , domContent = Left $ ContentForTextInput $ NodeID nid
+        }
+
+    XML.NodeElement el -> do
+      children <- catMaybes <$> mapM domFromXML (XML.elementNodes el)
+      return $ Just $ domFromElement el children
+
+    _ -> return Nothing
   where
-    Just href = lookupXMLAttribute "src" el -- TODO
-    width = decodeXMLAttribute "width" el
-    height = decodeXMLAttribute "height" el
-    wh = liftM2 V2 width height
+    domFromElement :: XML.Element -> [DOMNode] -> DOMNode
+    domFromElement el children =
+      let attrs = M.mapKeys XML.nameLocalName $ XML.elementAttributes el
+          attr_style = fromMaybe noStyle $ decodeXMLAttribute "style" el
+          tag = tagName el
+          builtin_style = fromMaybe noStyle $ HM.lookup tag elementStyles
+          builtin_events = fromMaybe noEvents $ HM.lookup tag elementEvents
+      in DOM
+          { domContent = Right children
+          , domStyle = attr_style `overriding` builtin_style
+          , domAttrs = attrs
+          , domEvents = builtin_events
+          , domSource = Just xml
+          , domState = noState
+          }
 
-domFromXML xml@(XML.NodeElement el) =
-    let children = mapMaybe domFromXML $ XML.elementNodes el
-    in Just DOM
-      { domContent = Right children
-      , domStyle = attr_style `overriding` builtin_style
-      , domAttrs = attrs
-      , domEvents = builtin_events
-      , domSource = Just xml
-      }
-  where
-    attrs = M.mapKeys (XML.nameLocalName) $ XML.elementAttributes el
-
-    attr_style = fromMaybe noStyle $ decodeXMLAttribute "style" el
-
-    tag = tagName el
-    builtin_style = fromMaybe noStyle $ HM.lookup tag elementStyles
-    builtin_events = fromMaybe noEvents $ HM.lookup tag elementEvents
-
-domFromXML _ = Nothing
 
 --------------------------------------------------------------------------------
 -- XML Utilities
@@ -242,12 +289,19 @@ instance Show BoxContent where
 
 -- | What to draw inside a box
 data InlineContent
-  = TextBox !Text !Double
-  | ImageBox (V2 Double) Text   -- an image
+  = TextBox !Text !BaselineY
+  | ImageBox (V2 Double) Text
+  -- ^  an image of size (V2 Double) and source.
+  | InputTextBox (V2 Double) OffsetX BaselineY Text OffsetX
+  -- ^ a text input with some text at OffsetX and cursor at OffsetX
 
 instance Show InlineContent where
-  show (TextBox t baseline) = "TextBox " ++ show t ++ " (baseline " ++ show baseline ++ ")"
-  show (ImageBox (V2 w h) href) =   concat ["ImageBox ", show w, "x", show h, " " ++ T.unpack href]
+  show (TextBox t baseline) =
+    "TextBox " ++ show t ++ " (baseline " ++ show baseline ++ ")"
+  show (ImageBox (V2 w h) href) =
+    concat ["ImageBox ", show w, "x", show h, " " ++ T.unpack href]
+  show (InputTextBox (V2 w h) _textX _baseline txt cursorX) =
+    concat ["TextInputContent ", show w, "x", show h, ";cursorX=", show cursorX, ": ", T.unpack txt]
 
 findInBox :: Point V2 Double -> BoxTree -> [BoxTree]
 findInBox (P xy) box0 = go [] xy box0
@@ -344,6 +398,7 @@ vadoEventLoop page = do
       return ()
     WindowClosedEvent {} ->
       return ()
+
     WindowResizedEvent e -> do
       let size = windowResizedEventSize e
       let win = pageWindow page
@@ -368,25 +423,51 @@ vadoEventLoop page = do
             Nothing -> return page
         _ -> return page
       vadoRedrawEventLoop page'
+
     MouseWheelEvent e -> do
       let V2 _ dy = mouseWheelEventPos e
       vadoRedrawEventLoop $ vadoScroll (negate $ 10 * fromIntegral dy) page
-    MouseMotionEvent _ ->
-      vadoEventLoop page
+
+    --MouseMotionEvent _ ->
+    --  vadoEventLoop page
 
     KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
-      case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
-        SDL.KeycodePageUp -> do
-          vadoRedrawEventLoop $ vadoScroll (negate $ vadoViewHeight page) page
-        SDL.KeycodePageDown -> do
-          vadoRedrawEventLoop $ vadoScroll (vadoViewHeight page) page
-        SDL.KeycodeHome ->
-          vadoRedrawEventLoop $ vadoScroll (negate $ pageScroll page) page
-        SDL.KeycodeEnd ->
-          let pageH = maybe 0 boxHeight $ pageBoxes page
-          in vadoRedrawEventLoop $ vadoScroll pageH page
-        _ ->
+      case pageFocus page of
+        NodeID 0 ->
+          case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
+            SDL.KeycodePageUp -> do
+              vadoRedrawEventLoop $ vadoScroll (negate $ vadoViewHeight page) page
+            SDL.KeycodePageDown -> do
+              vadoRedrawEventLoop $ vadoScroll (vadoViewHeight page) page
+            SDL.KeycodeHome ->
+              vadoRedrawEventLoop $ vadoScroll (negate $ pageScroll page) page
+            SDL.KeycodeEnd ->
+              let pageH = maybe 0 boxHeight $ pageBoxes page
+              in vadoRedrawEventLoop $ vadoScroll pageH page
+            _ ->
+              vadoEventLoop page
+
+        NodeID focus -> do
+          let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
+          case eventKeyReleased (domEvents node) of
+            Just onKeyRelease -> do
+              page' <- onKeyRelease (SDL.keyboardEventKeysym e) node page
+              vadoRedrawEventLoop page'
+            Nothing ->
+              vadoEventLoop page
+
+    TextInputEvent e ->
+      case pageFocus page of
+        NodeID 0 ->
           vadoEventLoop page
+        NodeID focus -> do
+          let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
+          case eventTextInput (domEvents node) of
+            Just onTextInput -> do
+              page' <- onTextInput (SDL.textInputEventText e) node page
+              vadoRedrawEventLoop page'
+            Nothing ->
+              vadoEventLoop page
 
     _ -> do
       vadoEventLoop page
@@ -408,14 +489,24 @@ type EventHandler = DOMNode -> Page -> IO Page
 
 data Events = Events
   { eventMouseReleased :: Maybe (V2 Double -> EventHandler)
+  , eventKeyReleased :: Maybe (SDL.Keysym -> EventHandler)
+  , eventTextInput :: Maybe (Text -> EventHandler)
   }
 
 noEvents :: Events
-noEvents = Events { eventMouseReleased = Nothing }
+noEvents = Events
+  { eventMouseReleased = Nothing
+  , eventKeyReleased = Nothing
+  , eventTextInput = Nothing
+  }
 
 elementEvents :: HM.HashMap Text Events
 elementEvents = HM.fromList
-  [ ("a", Events { eventMouseReleased = Just (\_ node page -> clickLink node page) })
+  [ ("a", noEvents { eventMouseReleased = Just (\_ node page -> clickLink node page) })
+  , ("input", noEvents
+      { eventKeyReleased = Just input_onKeyReleased
+      , eventTextInput = Just input_onTextInput
+      })
   ]
 
 clickLink :: DOMNode -> Page -> IO Page
@@ -430,6 +521,24 @@ clickLink DOM{ domSource=Just (XML.NodeElement el) } page =
       layoutPage page'
 clickLink node page =
   return $ warning ("clickLink: could not find address for: " ++ showdbg node) page
+
+
+input_onKeyReleased :: SDL.Keysym -> EventHandler
+input_onKeyReleased keysym _node page = do
+  putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
+  return page
+
+input_onTextInput :: Text -> EventHandler
+input_onTextInput t DOM{ domState=(NodeID nid) } page@Page{ pageElementStates=states0 } = do
+  case IM.lookup nid states0 of
+    Nothing ->
+      return $ warning ("NodeID=" ++ show nid ++ " not found") page
+    Just (noderef, StateOfTextInput txt0) -> do
+      let txt = T.append txt0 t
+          states = IM.insert nid (noderef, StateOfTextInput txt) states0
+      putStrLn $ "Input: " ++ T.unpack txt
+      layoutPage $ page{ pageElementStates = states }
+      -- TODO: laying out page on each character is a little excessive
 
 --------------------------------------------------------------------------------
 -- HTTP request, caches and local storage
@@ -502,7 +611,7 @@ fetchHTTP url page = do
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show absuri) pageloadT
 
-    let Just dom = domFromXML $ XML.NodeElement bodynode
+    let (Just dom, (focused, states)) = runState (domFromXML (XML.NodeElement bodynode)) (NodeID 0, IM.empty)
     when debug $ putStrLn (showdbg dom)
     return page
       { pageUrl = absuri
@@ -510,6 +619,8 @@ fetchHTTP url page = do
       , pageBody = dom
       , pageResources = M.fromList (concat resources) `mappend` pageResources page
       , pageScroll = 0
+      , pageFocus = focused
+      , pageElementStates = states
       }
   else if "text/" `T.isPrefixOf` contentType then do
     let respbody = T.decodeUtf8 $ B.toStrict $ responseBody pageResp
@@ -553,6 +664,7 @@ fetchHTTP url page = do
 type Width = Double
 type Height = Double
 type BaselineY = Double
+type OffsetX = Double
 
 noBaseline :: BaselineY
 noBaseline = -1
@@ -577,6 +689,7 @@ instance CanMeasureText Canvas.Canvas where
 -- Immutable parameters for a block layuot:
 data LayoutParams = LayoutParams
   { ltWidth :: Width
+  , ltElementStates :: ElementStates
   }
 
 -- Mutable state for a block layout:
@@ -626,7 +739,7 @@ layoutPage page@Page{..} = do
     return page{ pageBoxes=Just boxes }
   where
     ctx = LayoutCtx { ltResources = pageResources }
-    params = LayoutParams { ltWidth = w }
+    params = LayoutParams { ltWidth = w, ltElementStates = pageElementStates }
     VadoWindow { vadoViewport = V2 w _, vadoTexture = texture } = pageWindow
 
 
@@ -678,6 +791,18 @@ layoutBlock children = do
         layoutText txt
       (Left NewlineContent, _) ->
         layoutLineBreak
+
+      (Left (ContentForTextInput (NodeID nid)), _) -> do
+        states <- asks ltElementStates
+        -- TODO: extract the font of own CSS (not the cascaded one), calculate wh and baseline
+        -- TODO: cursor position
+        let wh = V2 300 20
+        let baseline = 16
+        let cursorX = 0
+        let textX = 0
+        let Just (_, StateOfTextInput t) = IM.lookup nid states
+        layoutInlineBox wh baseline child (BoxInline $ InputTextBox wh textX baseline t cursorX)
+
       (Left (ImageContent href mbSize), _) -> do
         -- TODO: block <img>
         resources <- gets (ltResources . ltCtx)
@@ -689,8 +814,10 @@ layoutBlock children = do
             let baseline = imgBaseline wh child
             layoutInlineBox wh baseline child (BoxInline $ ImageBox wh href)
           _ -> return ()
+
       (Right children', CSS_Keyword "inline") ->
         withStyle child $ layoutBlock children'
+
       (Right _, display) -> do
         unless (display == CSS_Keyword "block") $
           return $ warning ("TODO: display=" ++ show display ++ ", falling back to display=block") ()
@@ -702,6 +829,7 @@ layoutBlock children = do
         (box, ctx') <- lift $ elementToBoxes ctx params parentSt child
         modify (\lt -> lt{ ltCtx=ctx' })
         layoutBlockBox box
+
       -- (_, display) -> error $ concat ["layoutBlock: display=", show display, ", child=", showdbg child]
   where
     imgBaseline (V2 _ h) DOM{domSource=Just (XML.NodeElement el)} =
@@ -981,7 +1109,8 @@ renderDOM page = do
             SDL.copy (vadoRenderer $ pageWindow page) imgtexture Nothing (Just rect')
           Nothing ->
             return $ warning ("renderDOM: could not find resources for <img src=" ++ T.unpack href) ()
-      other -> return $ warning ("renderDOM: unexpected replaced element: " ++ show other) ()
+      other ->
+        return $ warning ("renderDOM: unexpected replaced element: " ++ show other) ()
 
   SDL.present renderer
 
@@ -1002,6 +1131,9 @@ renderTree (minY, maxY) (x, y, st0) box = do
     BoxInline content@(ImageBox (V2 w h) _) ->
       let rect = SDL.Rectangle (P $ V2 x y) (V2 w h)
       in return [(rect, content)]
+    BoxInline (InputTextBox _wh textX baseline txt _cursorX) -> do
+      Canvas.textBaseline (T.unpack txt) (V2 (x + textX) (y + baseline - minY))
+      return []
     -- _ -> error $ "TODO: renderTree " ++ show (boxContent box)
 
 withStyling :: BoxTree -> (Double, Double, Style) -> (Style -> Canvas.Canvas a) -> Canvas.Canvas a
@@ -1543,7 +1675,7 @@ elementStyles =
      , ("em",       css [fontstyle_italic, display_inline])
      , ("i",        css [fontstyle_italic, display_inline])
      , ("img",      inline)
-     , ("input",    inline)
+     , ("input",    css [("border", "grey inset 2px"), display_inline])
      , ("kbd",      inline)
      , ("label",    inline)
      , ("map",      inline)
@@ -1581,10 +1713,23 @@ elementStyles =
 
 
 vadoHomePage :: VadoWindow -> Page
-vadoHomePage window = (emptyPage window){ pageBody = body }
+vadoHomePage window = (emptyPage window)
+    { pageBody = body
+    , pageFocus = NodeID inputID
+    , pageElementStates = IM.fromList [(inputID, (input, StateOfTextInput ""))]
+    }
   where
+    inputID = 1
+    input0 = (makeNode "input" []){ domContent=Left (ContentForTextInput $ NodeID inputID) }
+    input = withAttributes [("type", "text"), ("name", "url")] $ withNodeID inputID input0
     body = withCSS [("text-align", "center")] $ makeNode "body"
       [ withCSS [("white-space", "pre")] $ makeNode "h1" [makeTextNode "\n\n\nVado"]
+      , makeNode "hr" []
+      , withAttributes [("action", "vado:go"), ("method", "POST")] $ makeNode "form"
+          [ input
+          , makeNode "br" []
+          , withAttributes [("type", "submit"), ("value", "I go!")] $ makeNode "input" []
+          ]
       ]
 
 vadoWaitPage :: VadoWindow -> Page
