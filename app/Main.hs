@@ -847,10 +847,10 @@ layoutBlock children = do
         states <- asks ltElementStates
         -- TODO: extract the font of own CSS (not the cascaded one), calculate wh and baseline
         -- TODO: cursor position
-        let wh = V2 300 20
-        let baseline = 16
+        let wh = V2 320 32
+        let baseline = 22
         let cursorX = 0
-        let textX = 0
+        let textX = 10
         let Just (_, StateOfTextInput t) = IM.lookup nid states
         layoutInlineBox wh baseline child (BoxInline $ InputTextBox wh textX baseline t cursorX)
 
@@ -1773,16 +1773,17 @@ vadoHomePage window = (emptyPage window)
     inputID = 1
     input0 = (makeNode "input" []){ domContent=Left (ContentForTextInput $ NodeID inputID) }
     input = withEvent "change" inputChange $ withNodeID inputID input0
-    body = withCSS [("text-align", "center")] $ makeNode "body"
-      [ withCSS [("white-space", "pre")] $ makeNode "h1" [makeTextNode "\n\n\nVado"]
+    body = withCSS [("text-align", "center"), ("white-space", "pre")] $ makeNode "body"
+      [ makeNode "h1" [makeTextNode "\n\n\nVado"]
       , makeNode "hr" []
       , makeTextNode "type or Ctrl-V your url:"
       , withAttributes [("action", "vado:go"), ("method", "POST")] $ makeNode "form"
-          [ withAttributes inputAttrs input
+          [ withCSS inputCSS $ makeNode "span" [withAttributes inputAttrs input]
           , makeNode "br" []
           , withAttributes [("type", "submit"), ("value", "I go!")] $ makeNode "input" []
           ]
       ]
+    inputCSS = [("background-color", "#f0f0f0"), ("font-size", "18px"), ("font-family", "sans")]
     inputAttrs = [("type", "text"), ("name", "url")]
     inputChange DOM{ domState=(NodeID nid) } page@Page{ pageElementStates=states } = do
       case IM.lookup nid states of

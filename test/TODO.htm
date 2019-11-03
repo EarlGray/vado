@@ -23,10 +23,16 @@
 <li>[DONE: 2019/06/15] CSS: <code>text-align</code></li>
 <li>[DONE: 2019/06/22] UI: show a nice <a href="vado:error">error page</a> on network error</li>
 <li>[DONE: 2019/06/30] CSS: <code>background-color</code></li>
+<li>[DONE: 2019/11/03] UI: <a href="vado:home">vado:home</a> with address field</li>
 <li>[WIP] Refactor: a proper CSS parser from <code>css-text</code></li>
 <li>[WIP] UI: basic event dispatch for elements</li>
+<li>[WIP] UI: text input</li>
+<li>[WIP] UI: dispatching keyboard events to focusable elements, moving between focusable elements</li>
 <li>Refactor: DOMNode to be defined as Data.Tree (to be able to use Data.Tree.Zipper)<li>
 <li>Refactor: TileIndex from BoxTree, findBox using TileIndex; rendering using TileIndex too?<li>
+<li>Refactor: split fetching data, decoding data and presenting content; future: progressive encoding and presenting</li>
+<li>Network: detect redirects, e.g. from <pre>/dir</pre> to <pre>/dir/</pre><li>
+<li>Network: parse <pre>data:</pre> urls</li>
 <li>Layout: margins, borders and padding</li>
 <li>Layout, CSS: <code>position: static|relative|absolute|fixed</code></li>
 <li>Layout: tests</li>
@@ -38,9 +44,6 @@
     <li>HTML: <code>&lt;input type="text"&gt;</code></li>
   </ul>
 </li>
-<li>UI: text input</li>
-<li>[WIP] UI: <a href="vado:home">vado:home</a> with address field</li>
-<li>UI: dispatching keyboard events to focusable elements, moving between focusable elements</li>
 <li>UI: buttons</li>
 <li>UI: history, going back and forth</li>
 <li>UI: optimized scroll (skiplist of subboxes in large boxes?) - blit copy + TileIndex</li>
