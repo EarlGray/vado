@@ -616,11 +616,14 @@ fetchHTTP url page = do
   when debug $ print pageReq
 
   httpman <- HTTP.newManager TLS.tlsManagerSettings
-  pageResp <- HTTP.httpLbs pageReq httpman
-  let headers = responseHeaders pageResp
+  (body, headers, pageURI) <- HTTP.withResponseHistory pageReq httpman $ \respHistory -> do
+    let uri = HTTP.getUri $ HTTP.hrFinalRequest respHistory
+    let pageResp = HTTP.hrFinalResponse respHistory
+    let headers = HTTP.responseHeaders pageResp
+    body <- B.fromChunks <$> (HTTP.brConsume $ HTTP.responseBody pageResp)
+    return (body, headers, uri)
 
   let contentType = T.toLower $ maybe "text/html" (T.decodeLatin1 . snd) $ L.find (\(name, _) -> name == "Content-Type") headers
-  let body = HTTP.responseBody pageResp
 
   if "text/html" `T.isPrefixOf` contentType then do
     let document = HTML.parseLBS body
@@ -660,12 +663,12 @@ fetchHTTP url page = do
 
     endT <- getCPUTime
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
-    putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show absuri) pageloadT
+    putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
 
     let (Just dom, (_focused, states)) = runState (domFromXML (XML.NodeElement bodynode)) (NodeID 0, IM.empty)
     when debug $ putStrLn (showdbg dom)
     return page
-      { pageUrl = absuri
+      { pageUrl = pageURI
       , pageHead = headnode
       , pageBody = dom
       , pageResources = M.fromList (concat resources) `mappend` pageResources page
@@ -674,11 +677,11 @@ fetchHTTP url page = do
       , pageElementStates = states
       }
   else if "text/" `T.isPrefixOf` contentType then do
-    let respbody = T.decodeUtf8 $ B.toStrict $ responseBody pageResp
+    let respbody = T.decodeUtf8 $ B.toStrict body
     let text = makeTextNode respbody
     let pre = makeNode "pre" [text]
     return page
-      { pageUrl = absuri
+      { pageUrl = pageURI
       , pageHead = fakeNode "head" []
       , pageBody = makeNode "body" [pre]
       , pageScroll = 0
@@ -697,7 +700,7 @@ fetchHTTP url page = do
         let node = makeTextNode (T.pack $ "Error[" ++ url ++ "]: Image format not supported")
         in return (node, M.fromList [])
     return page
-      { pageUrl = absuri
+      { pageUrl = pageURI
       , pageHead = fakeNode "head" []
       , pageBody = makeNode "body" [img]
       , pageResources = resources
