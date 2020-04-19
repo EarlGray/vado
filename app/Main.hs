@@ -1395,10 +1395,6 @@ mergeCSSFontValues font1 font2 = CSSFontValue
     , cssfontFamily = cssfontFamily font1 <|> cssfontFamily font2
     }
 
-instance Monoid CSSFontValue where
-  mempty = noCSSFont
-  mappend = mergeCSSFontValues
-
 
 -- | Augment/override/merge new CSS style with base style.
 -- The new style inherits/merges parent's properties, unless overriden.
