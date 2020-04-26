@@ -1,6 +1,5 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -31,7 +30,7 @@ import           Network.HTTP.Client.Internal
 import qualified Network.HTTP.Client.TLS as TLS
 import qualified Network.HTTP.Types.Header as HTTP
 import           Network.URI as URI
-import qualified SDL as SDL
+import qualified SDL
 import qualified SDL.Cairo as Cairo
 import qualified SDL.Cairo.Canvas as Canvas
 import           SDL.Event as SDL
@@ -120,7 +119,7 @@ instance HasDebugView DOMNode where
       attrs = ":attrs " ++ maybe "{}" xmlAttrs (domSource dom)
       style = ":style " ++ showdbg (domStyle dom)
       contents = case domContent dom of
-                  Right children -> concat $ map showdbg children
+                  Right children -> concatMap showdbg children
                   Left content -> show content
 
 emptyNode :: DOMNode
@@ -274,8 +273,8 @@ instance Show BoxTree where
   show BoxTree{boxContent=content, boxNode=node, boxDim=dim, boxStyling=(stpush, stpop)} =
     unlines (concat ["BoxTree <", name, "> : ", rshow x, "x", rshow y, dostyle, undostyle] : contents)
     where
-      dostyle = if M.null stpush then "" else " style=" ++ (show $ M.toList stpush)
-      undostyle = if M.null stpop then "" else " unstyle=" ++ (show $ M.toList stpop)
+      dostyle = if M.null stpush then "" else " style=" ++ show (M.toList stpush)
+      undostyle = if M.null stpop then "" else " unstyle=" ++ show (M.toList stpop)
       rshow v = show (round v :: Int)
       contents = map ("  " ++ ) $ lines contents'
       contents' = case content of
@@ -283,7 +282,7 @@ instance Show BoxTree where
         BoxOfBlocks children -> L.intercalate "\n" $ map show children
       V2 x y = dim
       name = case node of
-        Just (DOM { domSource=(Just (XML.NodeElement el)) }) -> T.unpack $ tagName el
+        Just DOM { domSource=(Just (XML.NodeElement el)) } -> T.unpack $ tagName el
         _ -> "-"
 
 data BoxContent
@@ -480,7 +479,7 @@ vadoRedrawEventLoop page = renderDOM page >> vadoEventLoop page
 
 vadoScroll :: Height -> Page -> Page
 vadoScroll dy page = page{ pageScroll = max 0 $ min (pageScroll page + dy) (pageH - vadoViewHeight page) }
-  where V2 _ pageH = fromMaybe 0 $ boxDim <$> pageBoxes page
+  where V2 _ pageH = maybe 0 boxDim $ pageBoxes page
 
 vadoViewHeight :: Page -> Double
 vadoViewHeight page = h
@@ -556,7 +555,7 @@ keyAltPressed mods =
   (mods{ SDL.keyModifierLeftAlt=False, SDL.keyModifierRightAlt=False } == noKeyModifiers)
 
 input_modify :: NodeID -> Page -> (Text -> Text) -> IO Page
-input_modify (NodeID nid) page@Page{ pageElementStates=states0 } action = do
+input_modify (NodeID nid) page@Page{ pageElementStates=states0 } action =
   case IM.lookup nid states0 of
     Nothing ->
       return $ warning ("NodeID=" ++ show nid ++ " not found") page
@@ -567,11 +566,11 @@ input_modify (NodeID nid) page@Page{ pageElementStates=states0 } action = do
       layoutPage $ page{ pageElementStates = states }
 
 input_onKeyReleased :: SDL.Keysym -> EventHandler
-input_onKeyReleased keysym node@DOM{ domState=nid, domEvents=events } page = do
+input_onKeyReleased keysym node@DOM{ domState=nid, domEvents=events } page =
   case SDL.keysymKeycode keysym of
     SDL.KeycodeBackspace ->
       input_modify nid page (\case "" -> ""; t -> T.init t)
-    SDL.KeycodeReturn -> do
+    SDL.KeycodeReturn ->
       -- TODO: find a parent form, use its submit action
       case M.lookup "change" (eventsOther events) of
         Just handlers -> do
@@ -609,8 +608,8 @@ fetchHTTP url page = do
   startT <- getCPUTime
   let prevuri = pageUrl page
   let absuri =
-        if URI.isAbsoluteURI url then (fromJust $ URI.parseURI url)
-        else fromMaybe (error $ "invalid url: " ++ url) ((`URI.relativeTo` prevuri) <$> URI.parseURIReference url)
+        if URI.isAbsoluteURI url then fromJust $ URI.parseURI url
+        else maybe (error $ "invalid url: " ++ url) (`URI.relativeTo` prevuri) (URI.parseURIReference url)
   request0 <- HTTP.parseRequest (show absuri)
   let pageReq = request0 { requestHeaders = [ (HTTP.hUserAgent, "github.com/chrisdone/vado") ] }
   when debug $ print pageReq
@@ -620,7 +619,7 @@ fetchHTTP url page = do
     let uri = HTTP.getUri $ HTTP.hrFinalRequest respHistory
     let pageResp = HTTP.hrFinalResponse respHistory
     let headers = HTTP.responseHeaders pageResp
-    body <- B.fromChunks <$> (HTTP.brConsume $ HTTP.responseBody pageResp)
+    body <- B.fromChunks <$> HTTP.brConsume (HTTP.responseBody pageResp)
     return (body, headers, uri)
 
   let contentType = T.toLower $ maybe "text/html" (T.decodeLatin1 . snd) $ L.find (\(name, _) -> name == "Content-Type") headers
@@ -837,7 +836,7 @@ withStyle node action = do
 layoutBlock :: CanMeasureText m => [DOMNode] -> LayoutOver m ()
 layoutBlock children = do
   parentSt <- gets ltStyle
-  forM_ children $ \child@DOM{ domContent=content, domStyle=st } -> do
+  forM_ children $ \child@DOM{ domContent=content, domStyle=st } ->
     case (content, st `cssValue` CSSDisplay) of
       (_, CSS_Keyword "none") ->
         return ()
@@ -978,9 +977,9 @@ layoutInlineClose = do
   unless (null txt) $ do
     wgap <- lift $ (/ 4) <$> measureTextWidth font "____"
     let (txt', wbefore, wafter) =
-         let (before, txt0) = L.break (not . C.isSpace) txt
+         let (before, txt0) = L.span C.isSpace txt
              wb = wgap * fromIntegral (length before)
-             (after, txt1) = L.break (not . C.isSpace) (reverse txt0)
+             (after, txt1) = L.span C.isSpace (reverse txt0)
              wa = wgap * fromIntegral (length after)
          in (reverse txt1, wb, wa)
 
@@ -1201,7 +1200,7 @@ withStyling BoxTree{boxDim=V2 w h, boxStyling=(stpush, stpop)} (x, y, st0) actio
   where
     applyStyling :: Style -> StyleDiff -> Canvas.Canvas ()
     applyStyling st diff = do
-      forM_ (M.toList diff) $ \(prop, val) -> do
+      forM_ (M.toList diff) $ \(prop, val) ->
         case (prop, val) of
           (CSSFont, CSS_Font _) ->
             Canvas.textFont $ styleFont st
@@ -1513,7 +1512,7 @@ css properties = Style
               case M.lookup name cssNamesOfOwnProperties of
                 Just prop -> Just $ Left (prop, val)
                 Nothing ->
-                  let mkFont = \font -> Just (Right (CSSFont, CSS_Font font))
+                  let mkFont font = Just (Right (CSSFont, CSS_Font font))
                   in case name of
                     "font-weight" -> mkFont $ noCSSFont{ cssfontWeight = Just val }
                     "font-style" -> mkFont $ noCSSFont{ cssfontStyle = Just val }
@@ -1558,9 +1557,9 @@ cssparseValue = valp <* Atto.skipSpace <* Atto.endOfInput
     cssparseLength = do
       num <- Atto.double
       Atto.choice [
-          (const (CSS_Px num)) <$> Atto.string "px"
-        , (const (CSS_Em num)) <$> Atto.string "em"
-        , (const (CSS_Percent num)) <$> Atto.string "%"
+          CSS_Px num <$ Atto.string "px"
+        , CSS_Em num <$ Atto.string "em"
+        , CSS_Percent num <$ Atto.string "%"
         ]
     cssparseNum = CSS_Num <$> Atto.double
     cssparseUrl = do
@@ -1784,7 +1783,7 @@ vadoHomePage window = (emptyPage window)
       ]
     inputCSS = [("background-color", "#f0f0f0"), ("font-size", "18px"), ("font-family", "sans")]
     inputAttrs = [("type", "text"), ("name", "url")]
-    inputChange DOM{ domState=(NodeID nid) } page@Page{ pageElementStates=states } = do
+    inputChange DOM{ domState=(NodeID nid) } page@Page{ pageElementStates=states } =
       case IM.lookup nid states of
         Just (_, StateOfTextInput url) ->
           fetchURL (T.unpack url) page >>= layoutPage
