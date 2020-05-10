@@ -640,7 +640,7 @@ fetchHTTP url page = do
           case parseURIReference (T.unpack imgurl) of
             Nothing -> return $ warning ("Could not parse URL: " ++ T.unpack imgurl) []
             Just u -> do
-              req <- setUriRelative pageReq u
+              req <- HTTP.parseUrlThrow (show (u `relativeTo` pageURI))
               putStrLn $ concat
                 [ T.unpack $ T.decodeLatin1 $ HTTP.method req, " "
                 , if HTTP.secure req then "https://" else "http://"
