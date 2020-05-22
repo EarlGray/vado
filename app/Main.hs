@@ -13,6 +13,8 @@ import           Control.Monad.State (State, runState)
 import qualified Data.Attoparsec.Text as Atto
 import qualified Data.ByteString.Lazy as B
 import qualified Data.ByteString as Bs
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Char8 as Bc
 import qualified Data.Char as C
 import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
@@ -29,6 +31,7 @@ import           Linear.V2 (V2(..))
 import qualified Network.HTTP.Client as HTTP
 import           Network.HTTP.Client.Internal (HttpException)
 import qualified Network.HTTP.Client.TLS as TLS
+import           Network.HTTP.Types.URI (urlDecode)
 import qualified Network.HTTP.Types.Header as HTTP
 import           Network.URI as URI
 import qualified SDL
@@ -689,13 +692,17 @@ fetchResource :: Page -> HTTP.Manager -> Text -> IO [(Text, HTTPResource)]
 fetchResource Page{pageUrl=pageURI, pageResources=pageRes, pageWindow=pageWin} httpman imgurl = do
   case M.lookup imgurl pageRes of
     Just res -> return [(imgurl, res)]
-    Nothing -> fetch >>= maybe (return []) decode
+    Nothing -> fetch imgurl >>= maybe (return []) decode
   where
-    fetch :: IO (Maybe Bs.ByteString)
-    fetch =
-      case parseURIReference (T.unpack imgurl) of
+    fetch :: Text -> IO (Maybe Bs.ByteString)
+    fetch url | "data:" `T.isPrefixOf` url =
+      case Atto.parseOnly attoDataUrl url of
+        Right (_, bytes) -> return $ Just bytes
+        Left e -> return $ warning (show e) Nothing
+    fetch url =
+      case parseURIReference (T.unpack url) of
         Nothing ->
-          return $ warning ("Could not parse URL: " ++ T.unpack imgurl) Nothing
+          return $ warning ("Could not parse URL: " ++ T.unpack url) Nothing
         Just u -> do
           req <- HTTP.parseUrlThrow (show (u `relativeTo` pageURI))
           putStrLn $ concat
@@ -720,6 +727,33 @@ fetchResource Page{pageUrl=pageURI, pageResources=pageRes, pageWindow=pageWin} h
         _ ->
           return $ warning ("Image format not supported: " ++ T.unpack imgurl) []
 
+attoDataUrl :: Atto.Parser (Text, Bs.ByteString)
+attoDataUrl = do
+  _ <- Atto.string "data:"
+  (mty, msub, _mparams) <- Atto.option ("text", "plain", []) attoMimeType
+  -- TODO: use charset from _mparams?
+  isBase64 <- Atto.option False (Atto.string ";base64" *> pure True)
+  _ <- Atto.char ','
+  bytes <- (Bc.pack . T.unpack) <$> Atto.takeText
+  let dayta = (if isBase64 then B64.decodeLenient else urlDecode False) bytes
+  return (T.concat [mty, "/", msub], dayta)
+
+attoMimeType :: Atto.Parser (Text, Text, [(Text, Text)])
+attoMimeType = do
+    mtype <- token
+    _ <- Atto.char '/'
+    msubtype <- token
+    params <- Atto.many' (Atto.char ';' *> parameter)
+    return (mtype, msubtype, params)
+  where
+    tsspecials = "()<>@,;:\\\"/[]?="  -- see RFC 2045
+    token = T.pack <$> (Atto.many1 $ Atto.satisfy $ \c -> Atto.notInClass tsspecials c && not (C.isSpace c))
+    qstr = fail "TODO: quoted strings as mime/type;parameter='value'"
+    parameter = do
+      attr <- token
+      _ <- Atto.char '='
+      value <- token <|> qstr
+      return (T.toLower attr, value)
 
 --------------------------------------------------------------------------------
 -- Layout engine

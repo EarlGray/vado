@@ -19,6 +19,7 @@ executable vado
   default-language:    Haskell2010
   build-depends:       attoparsec
                      , base
+                     , base64-bytestring
                      , bytestring
                      , cairo
                      , containers

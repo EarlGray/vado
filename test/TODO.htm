@@ -26,15 +26,21 @@
 <li>[DONE: 2019/11/03] UI: <a href="vado:home">vado:home</a> with address field</li>
 <li>[DONE: 2020/02/07] Network: detect redirects, e.g. from <pre>/dir</pre> to <pre>/dir/</pre><li>
 <li>[DONE: 2020/05/22] Network bug: do not fail on resource failure</li>
+<li>[DONE: 2020/05/22] Network: parse <pre>data:</pre> urls</li>
 <li>[WIP] Refactor: a proper CSS parser from <code>css-text</code></li>
-<li>[WIP] UI: basic event dispatch for elements</li>
-<li>[WIP] UI: text input</li>
-<li>[WIP] UI: dispatching keyboard events to focusable elements, moving between focusable elements</li>
-<li>Refactor: DOMNode to be defined as Data.Tree (to be able to use Data.Tree.Zipper)<li>
+<li>Rendering: additional lines for an element (for underlines, strike-through, borders, etc)</li>
+<li>UI: basic event dispatch for elements</li>
+<li>UI: text input</li>
+<li>UI: dispatching keyboard events to focusable elements, moving between focusable elements</li>
+<li>CSS: parse <code>&lt;style&gt;</code> tags</li>
+<li>CSS: CSS priority resolution and rule storage</li>
+<li>CSS, Layout: margins, borders and padding</li>
+<li>CSS: <code>text-decoration: line-through</code>, HTML: <code>&lt;s&gt;</code>/<code>&lt;strike&gt;</code></li>
+<li>CSS: <code>line-height</code></li>
+<li>Refactor: DOM as an IntMap with integer "pointers"; page monad<li>
 <li>Refactor: TileIndex from BoxTree, findBox using TileIndex; rendering using TileIndex too?<li>
 <li>Refactor: split fetching data, decoding data and presenting content; future: progressive encoding and presenting</li>
-<li>Network: parse <pre>data:</pre> urls</li>
-<li>Layout: margins, borders and padding</li>
+<li>Network: parse a HTTP response as it comes, build DOM and BoxTree concurrently (conduits?)</li>
 <li>Layout, CSS: <code>position: static|relative|absolute|fixed</code></li>
 <li>Layout: tests</li>
 <li>HTML: &lt;hr&gt;</li>
@@ -51,13 +57,10 @@
 <li>UI, HTML: handling <code>tabindex</code><li>
 <li>UI: scaling, zooming</li>
 <li>UI: optimized resize</li>
-<li>CSS: CSS priority resolution and rule storage</li>
-<li>CSS: <code>text-decoration: line-through</code>, HTML: <code>&lt;s&gt;</code>/<code>&lt;strike&gt;</code></li>
-<li>CSS: <code>line-height</code></li>
+<li>Network: a separate green thread</li>
 <li>Network: fetching resources concurrently</li>
 <li>Network: cookies</li>
 <li>Network: basic HTTP auth</li>
-<li>Network: parse a HTTP response as it comes, build DOM and BoxTree concurrently (conduits?)</li>
 </ul>
 </body>
 </html>
