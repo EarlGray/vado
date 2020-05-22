@@ -1361,6 +1361,7 @@ data CSSValue
   = CSS_Keyword Text
   | CSS_Em Double
   | CSS_Px Double
+  | CSS_Pt Double
   | CSS_Num Double
   | CSS_Percent Double
   | CSS_Url Text
@@ -1569,6 +1570,7 @@ cssparseValue = valp <* Atto.skipSpace <* Atto.endOfInput
       Atto.choice [
           CSS_Px num <$ Atto.string "px"
         , CSS_Em num <$ Atto.string "em"
+        , CSS_Pt num <$ Atto.string "pt"
         , CSS_Percent num <$ Atto.string "%"
         ]
     cssparseNum = CSS_Num <$> Atto.double
@@ -1659,6 +1661,7 @@ styleFontSize st =
     Just (CSS_Num size) -> size
     Just (CSS_Px size) -> size
     Just (CSS_Em em) -> defaultFontSize * em
+    Just (CSS_Pt pt) -> 1.3333 * pt
     Just other -> warning ("styleFontSize: not computed: " ++ show other) defaultFontSize
     Nothing -> defaultFontSize
 
