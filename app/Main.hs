@@ -12,6 +12,7 @@ import           Control.Monad.RWS.Strict as RWS
 import           Control.Monad.State (State, runState)
 import qualified Data.Attoparsec.Text as Atto
 import qualified Data.ByteString.Lazy as B
+import qualified Data.ByteString as Bs
 import qualified Data.Char as C
 import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
@@ -26,7 +27,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import           Linear.V2 (V2(..))
 import qualified Network.HTTP.Client as HTTP
-import           Network.HTTP.Client.Internal
+import           Network.HTTP.Client.Internal (HttpException)
 import qualified Network.HTTP.Client.TLS as TLS
 import qualified Network.HTTP.Types.Header as HTTP
 import           Network.URI as URI
@@ -54,8 +55,7 @@ warning :: String -> a -> a
 warning msg = Trace.trace msg
 
 whenJust :: Monad m => Maybe a -> (a -> m ()) -> m ()
-whenJust (Just v) f = f v
-whenJust _ _ = return ()
+whenJust = forM_
 
 --------------------------------------------------------------------------------
 -- page, DOM and resources
@@ -611,7 +611,7 @@ fetchHTTP url page = do
         if URI.isAbsoluteURI url then fromJust $ URI.parseURI url
         else maybe (error $ "invalid url: " ++ url) (`URI.relativeTo` prevuri) (URI.parseURIReference url)
   request0 <- HTTP.parseRequest (show absuri)
-  let pageReq = request0 { requestHeaders = [ (HTTP.hUserAgent, "github.com/chrisdone/vado") ] }
+  let pageReq = request0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "github.com/chrisdone/vado") ] }
   when debug $ print pageReq
 
   httpman <- HTTP.newManager TLS.tlsManagerSettings
@@ -633,33 +633,8 @@ fetchHTTP url page = do
 
     let images_axis = (XML.fromDocument document $| XML.descendant &/ XML.element "img")
     let imageurls = mapMaybe (\cursor -> let XML.NodeElement el = XML.node cursor in lookupXMLAttribute "src" el) images_axis
-    resources <- forM (S.toList $ S.fromList imageurls) $ \imgurl -> do
-      case M.lookup imgurl (pageResources page) of
-        Just res -> return [(imgurl, res)]
-        Nothing ->
-          case parseURIReference (T.unpack imgurl) of
-            Nothing -> return $ warning ("Could not parse URL: " ++ T.unpack imgurl) []
-            Just u -> do
-              req <- HTTP.parseUrlThrow (show (u `relativeTo` pageURI))
-              putStrLn $ concat
-                [ T.unpack $ T.decodeLatin1 $ HTTP.method req, " "
-                , if HTTP.secure req then "https://" else "http://"
-                , T.unpack $ T.decodeLatin1 $ HTTP.host req
-                , case (HTTP.secure req, HTTP.port req) of (True, 443) -> ""; (False, 80) -> ""; (_,p) -> ":" ++ show p
-                , T.unpack $ T.decodeLatin1 $ HTTP.path req
-                ]
-              resp <- HTTP.httpLbs req httpman
-              let content = B.toStrict $ HTTP.responseBody resp
-              case Image.format content of
-                Just _ -> do
-                  bitmap <- Image.decode content
-                  V2 w h <- SDL.surfaceDimensions bitmap
-                  let wh = V2 (fromIntegral w) (fromIntegral h)
-                  texture <- SDL.createTextureFromSurface (vadoRenderer $ pageWindow page) bitmap
-                  return [(imgurl, ImageResource wh texture)]
-                _ ->
-                  return $ warning ("Image format not supported: " ++ T.unpack imgurl) []
-
+    resources <- forM (S.toList $ S.fromList imageurls) $ \imgurl ->
+        fetchResource page{pageUrl=pageURI} httpman imgurl `Exc.catch` \(e :: HttpException) -> return $ warning (show e) []
     endT <- getCPUTime
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
@@ -706,9 +681,44 @@ fetchHTTP url page = do
       , pageScroll = 0
       }
   else
-    error $ "TODO: Content-Type " ++ (T.unpack contentType)
+    error $ "TODO: Content-Type " ++ T.unpack contentType
   where
     fakeNode name nodes = XML.Element (XML.Name name Nothing Nothing) M.empty nodes
+
+fetchResource :: Page -> HTTP.Manager -> Text -> IO [(Text, HTTPResource)]
+fetchResource Page{pageUrl=pageURI, pageResources=pageRes, pageWindow=pageWin} httpman imgurl = do
+  case M.lookup imgurl pageRes of
+    Just res -> return [(imgurl, res)]
+    Nothing -> fetch >>= maybe (return []) decode
+  where
+    fetch :: IO (Maybe Bs.ByteString)
+    fetch =
+      case parseURIReference (T.unpack imgurl) of
+        Nothing ->
+          return $ warning ("Could not parse URL: " ++ T.unpack imgurl) Nothing
+        Just u -> do
+          req <- HTTP.parseUrlThrow (show (u `relativeTo` pageURI))
+          putStrLn $ concat
+            [ T.unpack $ T.decodeLatin1 $ HTTP.method req, " "
+            , if HTTP.secure req then "https://" else "http://"
+            , T.unpack $ T.decodeLatin1 $ HTTP.host req
+            , case (HTTP.secure req, HTTP.port req) of (True, 443) -> ""; (False, 80) -> ""; (_,p) -> ":" ++ show p
+            , T.unpack $ T.decodeLatin1 $ HTTP.path req
+            ]
+          resp <- HTTP.httpLbs req httpman
+          return (Just $ B.toStrict $ HTTP.responseBody resp)
+
+    decode :: Bs.ByteString -> IO [(Text, HTTPResource)]
+    decode content =
+      case Image.format content of
+        Just _ -> do
+          bitmap <- Image.decode content
+          V2 w h <- SDL.surfaceDimensions bitmap
+          let wh = V2 (fromIntegral w) (fromIntegral h)
+          texture <- SDL.createTextureFromSurface (vadoRenderer pageWin) bitmap
+          return [(imgurl, ImageResource wh texture)]
+        _ ->
+          return $ warning ("Image format not supported: " ++ T.unpack imgurl) []
 
 
 --------------------------------------------------------------------------------
