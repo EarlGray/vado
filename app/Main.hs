@@ -172,14 +172,15 @@ data DOMContent
   -- ^           ^href
   | HorizLineContent
   -- ^ <hr>
-  | ContentForTextInput NodeID
+  | InputTextContent NodeID
+  -- ^ <input type="text">
 
 instance Show DOMContent where
   show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
   show NewlineContent = "NewlineContent"
   show HorizLineContent = "HorizLineContent"
   show (ImageContent href wh) = "ImageContent " ++ T.unpack href ++ " (" ++ show wh ++ ")"
-  show (ContentForTextInput nid) = "TextInputContent (" ++ show nid ++ ")"
+  show (InputTextContent nid) = "TextInputContent (" ++ show nid ++ ")"
 
 -- | DOM Node States
 newtype NodeID = NodeID Int
@@ -191,7 +192,7 @@ noState :: NodeID
 noState = NodeID 0
 
 data DOMNodeState
-  = StateOfTextInput !Text
+  = InputTextState !Text
 
 
 --------------------------------------------------------------------------------
@@ -220,10 +221,18 @@ domFromXML xml =
       let node = domFromElement el []
       (NodeID nid0, states0) <- get
       let nid = nid0 + 1
-      put (NodeID nid, IM.insert nid (node, StateOfTextInput "") states0)
+      put (NodeID nid, IM.insert nid (node, InputTextState "") states0)
+      let content = case lookupXMLAttribute "type" el of
+            Just "text" -> InputTextContent $ NodeID nid
+            Just "password" -> InputTextContent $ NodeID nid    -- TODO: a password input
+            Just "button" -> TextContent $ fromMaybe "" $ lookupXMLAttribute "value" el
+            Just "checkbox" -> TextContent $ case lookupXMLAttribute "checked" el of Just _ -> "\x2611"; _ -> "\x2610"
+            Just "submit" -> TextContent $ fromMaybe "submit" $ lookupXMLAttribute "value" el
+            Just "hidden" -> TextContent ""
+            _ -> warning ("Unknown input type: " ++ show el) $ TextContent ""
       return $ Just $ node
         { domState = NodeID nid
-        , domContent = Left $ ContentForTextInput $ NodeID nid
+        , domContent = Left content
         }
 
     XML.NodeElement el -> do
@@ -311,16 +320,16 @@ data InlineContent
   = TextBox !Text !BaselineY
   | ImageBox (V2 Double) Text
   -- ^  an image of size (V2 Double) and source.
-  | InputTextBox (V2 Double) OffsetX BaselineY Text OffsetX
-  -- ^ a text input with some text at OffsetX and cursor at OffsetX
+  | InputTextBox (V2 Double) OffsetX BaselineY Text
+  -- ^ a text input with some text at OffsetX
 
 instance Show InlineContent where
   show (TextBox t baseline) =
     "TextBox " ++ show t ++ " (baseline " ++ show baseline ++ ")"
   show (ImageBox (V2 w h) href) =
     concat ["ImageBox ", show w, "x", show h, " " ++ T.unpack href]
-  show (InputTextBox (V2 w h) _textX _baseline txt cursorX) =
-    concat ["TextInputContent ", show w, "x", show h, ";cursorX=", show cursorX, ": ", T.unpack txt]
+  show (InputTextBox (V2 w h) _textX _baseline txt) =
+    concat ["TextInputContent ", show w, "x", show h, ": ", T.unpack txt]
 
 findInBox :: Point V2 Double -> BoxTree -> [BoxTree]
 findInBox (P xy) box0 = go [] xy box0
@@ -345,7 +354,7 @@ boxFirstBaselineY = \case
       Just $ case content of
         TextBox _ baselineY -> baselineY
         ImageBox (V2 _ dy) _ -> dy
-        InputTextBox _ _ baselineY _ _ -> baselineY
+        InputTextBox _ _ baselineY _ -> baselineY
     BoxTree{ boxContent = BoxOfBlocks posboxes } ->
       listToMaybe $ mapMaybe maybeBaseline posboxes
   where
@@ -593,9 +602,9 @@ input_modify (NodeID nid) page@Page{ pageElementStates=states0 } action =
   case IM.lookup nid states0 of
     Nothing ->
       return $ warning ("NodeID=" ++ show nid ++ " not found") page
-    Just (noderef, StateOfTextInput txt0) -> do
+    Just (noderef, InputTextState txt0) -> do
       let txt = action txt0
-          states = IM.insert nid (noderef, StateOfTextInput txt) states0
+          states = IM.insert nid (noderef, InputTextState txt) states0
       -- putStrLn $ "Input: " ++ T.unpack txt
       layoutPage $ page{ pageElementStates = states }
 
@@ -933,16 +942,22 @@ layoutBlock children = do
           , boxLines = [BoxLine{boxlineStart=V2 0 lineY, boxlineEnd=V2 w lineY}]
           }
 
-      (Left (ContentForTextInput (NodeID nid)), _) -> do
+      (Left (InputTextContent (NodeID nid)), _) -> do
         states <- asks ltElementStates
         -- TODO: extract the font of own CSS (not the cascaded one), calculate wh and baseline
-        -- TODO: cursor position
-        let wh = V2 320 32
+        let w = 320
+        let h = 32
         let baseline = 22
-        let cursorX = 0
         let textX = 10
-        let Just (_, StateOfTextInput t) = IM.lookup nid states
-        layoutInlineBox wh baseline child (BoxInline $ InputTextBox wh textX baseline t cursorX)
+        let Just (_, InputTextState t) = IM.lookup nid states
+        let box = BoxInline $ InputTextBox (V2 w h) textX baseline t
+        let boxlines =
+              [ BoxLine{boxlineStart=V2 0 0, boxlineEnd=V2 0 h}
+              , BoxLine{boxlineStart=V2 0 0, boxlineEnd=V2 w 0}
+              , BoxLine{boxlineStart=V2 0 h, boxlineEnd=V2 w h}
+              , BoxLine{boxlineStart=V2 w 0, boxlineEnd=V2 w h}
+              ]
+        layoutInlineBox (V2 w h) baseline child box boxlines
 
       (Left (ImageContent href mbSize), _) -> do
         -- TODO: block <img>
@@ -951,7 +966,7 @@ layoutBlock children = do
         case mbSize <|> mbResSize of
           Just wh -> do
             let baseline = imgBaseline wh child
-            layoutInlineBox wh baseline child (BoxInline $ ImageBox wh href)
+            layoutInlineBox wh baseline child (BoxInline $ ImageBox wh href) []
           _ -> return ()
 
       (Right children', CSS_Keyword "inline") ->
@@ -1080,8 +1095,8 @@ layoutInlineSpace = do
         ls' = ls{ lsWords=lsWords ls ++ [" "], lsGap = True }
     in lt{ ltX=x, ltLS=ls' })
 
-layoutInlineBox :: CanMeasureText m => V2 Double -> BaselineY -> DOMNode -> BoxContent -> LayoutOver m ()
-layoutInlineBox (V2 dx dy) baseline node content = do
+layoutInlineBox :: CanMeasureText m => V2 Double -> BaselineY -> DOMNode -> BoxContent -> [BoxLine] -> LayoutOver m ()
+layoutInlineBox (V2 dx dy) baseline node content boxlines = do
   x <- gets ltX
   maxwidth <- asks ltWidth
   when (x + dx >= maxwidth) $ do
@@ -1093,7 +1108,7 @@ layoutInlineBox (V2 dx dy) baseline node content = do
         , boxNode = Just node
         , boxDim = V2 dx dy
         , boxStyling = styling
-        , boxLines = []
+        , boxLines = boxlines
         }
   modify $ \lt ->
     let ls = ltLS lt
@@ -1128,8 +1143,9 @@ layoutInlineClose = do
          Just (CSS_Keyword "line-through") ->
            let strikeY = baseline * 0.7
            in [BoxLine{ boxlineStart=V2 0 strikeY, boxlineEnd=V2 w strikeY}]
+         Just (CSS_Keyword "none") -> []
          Just other ->
-           warning ("ignoring text-decoration=" ++ show other) []
+           warning ("Ignoring text-decoration=" ++ show other) []
          Nothing -> []
 
     -- emit the inline box
@@ -1343,7 +1359,7 @@ renderTree (minY, maxY) (x, y, st0) box = do
     BoxInline content@(ImageBox (V2 w h) _) ->
       let rect = SDL.Rectangle (P $ V2 x y) (V2 w h)
       in return [(rect, content)]
-    BoxInline (InputTextBox (V2 _bw bh) textX baseline txt _cursorX) -> do
+    BoxInline (InputTextBox (V2 _bw bh) textX baseline txt) -> do
       V2 w _ <- Canvas.textSize (T.unpack txt)
       let cursorInset = bh/6
       let cursorX = textX + w + defaultFontSize/5
@@ -1952,11 +1968,11 @@ vadoHomePage :: VadoWindow -> Page
 vadoHomePage window = (emptyPage window)
     { pageBody = body
     , pageFocus = NodeID inputID
-    , pageElementStates = IM.fromList [(inputID, (input, StateOfTextInput ""))]
+    , pageElementStates = IM.fromList [(inputID, (input, InputTextState ""))]
     }
   where
     inputID = 1
-    input0 = (makeNode "input" []){ domContent=Left (ContentForTextInput $ NodeID inputID) }
+    input0 = (makeNode "input" []){ domContent=Left (InputTextContent $ NodeID inputID) }
     input = withEvent "change" inputChange $ withNodeID inputID input0
     body = withCSS [("text-align", "center"), ("white-space", "pre")] $ makeNode "body"
       [ makeNode "h1" [makeTextNode "\n\n\nVado"]
@@ -1972,7 +1988,7 @@ vadoHomePage window = (emptyPage window)
     inputAttrs = [("type", "text"), ("name", "url")]
     inputChange DOM{ domState=(NodeID nid) } page@Page{ pageElementStates=states } =
       case IM.lookup nid states of
-        Just (_, StateOfTextInput url) ->
+        Just (_, InputTextState url) ->
           fetchURL (T.unpack url) page >>= layoutPage
         _ -> return page
 
