@@ -332,6 +332,18 @@ findInBox (P xy) box0 = go [] xy box0
       (bx <= px && px <= (bx + bw)) && (by <= py && py <= (by + bh))
 
 
+boxFirstBaselineY :: BoxTree -> Maybe BaselineY
+boxFirstBaselineY = \case
+    BoxTree{ boxContent = BoxInline content } ->
+      Just $ case content of
+        TextBox _ baselineY -> baselineY
+        ImageBox (V2 _ dy) _ -> dy
+        InputTextBox _ _ baselineY _ _ -> baselineY
+    BoxTree{ boxContent = BoxOfBlocks posboxes } ->
+      listToMaybe $ mapMaybe maybeBaseline posboxes
+  where
+    maybeBaseline (P (V2 _ dy), box) = (dy + ) <$> boxFirstBaselineY box
+
 --------------------------------------------------------------------------------
 -- Main entry point and event handler
 
@@ -882,7 +894,6 @@ withStyle node action = do
 
 layoutBlock :: CanMeasureText m => [DOMNode] -> LayoutOver m ()
 layoutBlock children = do
-  parentSt <- gets ltStyle
   forM_ children $ \child@DOM{ domContent=content, domStyle=st } ->
     case (content, st `cssValue` CSSDisplay) of
       (_, CSS_Keyword "none") ->
@@ -906,9 +917,7 @@ layoutBlock children = do
       (Left (ImageContent href mbSize), _) -> do
         -- TODO: block <img>
         resources <- gets (ltResources . ltCtx)
-        let mbResSize = case M.lookup href resources of
-              Just (ImageResource wh _) -> Just wh
-              Nothing -> Nothing
+        let mbResSize = forJust (M.lookup href resources) $ \(ImageResource wh _) -> wh
         case mbSize <|> mbResSize of
           Just wh -> do
             let baseline = imgBaseline wh child
@@ -918,20 +927,64 @@ layoutBlock children = do
       (Right children', CSS_Keyword "inline") ->
         withStyle child $ layoutBlock children'
 
+      (Right _, CSS_Keyword "list-item") ->
+        layoutListItem child
+
       (Right _, display) -> do
-        unless (display == CSS_Keyword "block") $
+        when (display /= CSS_Keyword "block") $
           return $ warning ("TODO: display=" ++ show display ++ ", falling back to display=block") ()
         -- wrap up the previous line (if any):
         layoutLineBreak
         -- start a new containing block:
         params <- ask
-        ctx <- gets ltCtx
-        (box, ctx') <- lift $ elementToBoxes ctx params parentSt child
-        modify (\lt -> lt{ ltCtx=ctx' })
+        box <- sublayout child params
         layoutBlockBox box
 
       -- (_, display) -> error $ concat ["layoutBlock: display=", show display, ", child=", showdbg child]
   where
+    sublayout child params = do
+      parentSt <- gets ltStyle
+      ctx <- gets ltCtx
+      (box, ctx') <- lift $ elementToBoxes ctx params parentSt child
+      modify (\lt -> lt{ ltCtx=ctx' })
+      return box
+
+    layoutListItem child = do
+      let markerText = "\x2022"   -- TODO: numbered lists
+      let markerWidth = 20        -- TODO: why 20?
+
+      params0 <- ask
+      let outerWidth = ltWidth params0
+      let params = params0{ ltWidth = outerWidth - markerWidth }
+      box <- sublayout child params   -- layout the inner block
+
+      font <- gets (styleFont . ltStyle)
+      (mh, mb) <- lift $ measureHeightAndBaseline font
+      mw <- lift $ measureTextWidth font markerText
+
+      let baselineY = fromMaybe mb $ boxFirstBaselineY box
+      let outerHeight = max (boxHeight box) mh
+      let mx = (markerWidth - mw) / 2
+      let my = baselineY - mb
+
+      let markerBox = BoxTree
+            { boxContent = BoxInline $ TextBox (T.pack markerText) baselineY
+            , boxNode = boxNode box
+            , boxDim = V2 mw mh
+            , boxStyling = noStyling
+            }
+
+      let outerBox = BoxTree
+            { boxContent = BoxOfBlocks
+                [ (P (V2 mx my),            markerBox)
+                , (P (V2 markerWidth 0.0),  box{ boxStyling = noStyling })  -- move styling into the outer box
+                ]
+            , boxNode = boxNode box
+            , boxDim = V2 outerWidth outerHeight
+            , boxStyling = boxStyling box
+            }
+      layoutBlockBox outerBox
+
     imgBaseline (V2 _ h) DOM{domSource=Just (XML.NodeElement el)} =
         case lookupXMLAttribute "align" el of
           Just "top" -> noBaseline
@@ -1416,6 +1469,7 @@ instance HasDebugView CSSValue where
   showdbg (CSS_Percent p) = show p ++ "%"
   showdbg (CSS_Url url) = "url(" ++ T.unpack url ++ ")"
   showdbg (CSS_String s) = "\"" ++ T.unpack s ++ "\""
+  showdbg (CSS_RGB r g b) = concat ["rgb(", show r, ", ", show g, ", ", show b, ")"]
   showdbg other = "TODO:showdbg(" ++ show other ++ ")"
 
 
@@ -1777,6 +1831,7 @@ elementStyles =
      , ("input",    css [("border", "grey inset 2px"), display_inline])
      , ("kbd",      inline)
      , ("label",    inline)
+     , ("li",       css [("display", "list-item")])
      , ("map",      inline)
      , ("mark",     css [("background-color", "yellow"), display_inline])
      , ("object",   inline)
