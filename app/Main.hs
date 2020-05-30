@@ -170,11 +170,14 @@ data DOMContent
   -- ^ Force newline here, usually corresponds to <br>
   | ImageContent !Text !(Maybe (V2 Double))
   -- ^           ^href
+  | HorizLineContent
+  -- ^ <hr>
   | ContentForTextInput NodeID
 
 instance Show DOMContent where
   show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
   show NewlineContent = "NewlineContent"
+  show HorizLineContent = "HorizLineContent"
   show (ImageContent href wh) = "ImageContent " ++ T.unpack href ++ " (" ++ show wh ++ ")"
   show (ContentForTextInput nid) = "TextInputContent (" ++ show nid ++ ")"
 
@@ -207,6 +210,9 @@ domFromXML xml =
               height = decodeXMLAttribute "height" el
               wh = liftM2 V2 width height
           in emptyNode{ domContent=Left (ImageContent href wh), domSource=Just xml }
+
+    XML.NodeElement el | tagName el == "hr" ->
+      return $ Just $ emptyNode{ domContent=Left HorizLineContent, domSource=Just xml }
 
     XML.NodeElement el | tagName el == "input" -> do
       whenJust (listToMaybe $ XML.elementNodes el) $ \_ ->
@@ -913,6 +919,19 @@ layoutBlock children = do
         layoutText txt
       (Left NewlineContent, _) ->
         layoutLineBreak
+      (Left HorizLineContent, _) -> do
+        layoutLineBreak
+        w <- asks ltWidth
+        font <- gets (styleFont . ltStyle)
+        (h, _) <- lift $ measureHeightAndBaseline font
+        let lineY = h/2
+        layoutBlockBox $ BoxTree
+          { boxContent = BoxInline $ TextBox "" 0
+          , boxNode = Just child
+          , boxDim = V2 w h
+          , boxStyling = noStyling
+          , boxLines = [BoxLine{boxlineStart=V2 0 lineY, boxlineEnd=V2 w lineY}]
+          }
 
       (Left (ContentForTextInput (NodeID nid)), _) -> do
         states <- asks ltElementStates
