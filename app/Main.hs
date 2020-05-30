@@ -60,6 +60,9 @@ warning msg = Trace.trace msg
 whenJust :: Monad m => Maybe a -> (a -> m ()) -> m ()
 whenJust = forM_
 
+forJust :: Maybe a -> (a -> b) -> Maybe b
+forJust mb f = f `fmap` mb
+
 --------------------------------------------------------------------------------
 -- page, DOM and resources
 
@@ -199,11 +202,11 @@ domFromXML xml =
       return $ Just (makeTextNode txt){ domSource=Just xml }
 
     XML.NodeElement el | tagName el == "img" ->
-      let Just href = lookupXMLAttribute "src" el -- TODO
-          width = decodeXMLAttribute "width" el
-          height = decodeXMLAttribute "height" el
-          wh = liftM2 V2 width height
-      in return $ Just emptyNode{ domContent=Left (ImageContent href wh), domSource=Just xml }
+      return $ forJust (lookupXMLAttribute "src" el) $ \href ->
+          let width = decodeXMLAttribute "width" el
+              height = decodeXMLAttribute "height" el
+              wh = liftM2 V2 width height
+          in emptyNode{ domContent=Left (ImageContent href wh), domSource=Just xml }
 
     XML.NodeElement el | tagName el == "input" -> do
       whenJust (listToMaybe $ XML.elementNodes el) $ \_ ->
