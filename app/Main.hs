@@ -267,9 +267,10 @@ type RelPos = Point V2 Double
 
 data BoxTree = BoxTree
   { boxContent :: BoxContent
-  , boxNode :: Maybe DOMNode -- backreference to its node
-  , boxDim :: V2 Double      -- outer dimensions
+  , boxNode :: Maybe DOMNode    -- backreference to its node
+  , boxDim :: V2 Double         -- outer dimensions
   , boxStyling :: (StyleDiff, StyleDiff)    -- instructions for box rendering
+  , boxLines :: [BoxLine]       -- lines to be drawn after the content
   }
 
 boxHeight :: BoxTree -> Height
@@ -343,6 +344,15 @@ boxFirstBaselineY = \case
       listToMaybe $ mapMaybe maybeBaseline posboxes
   where
     maybeBaseline (P (V2 _ dy), box) = (dy + ) <$> boxFirstBaselineY box
+
+-- | BoxLine can be used for underlines, strikethroughs, borders, etc.
+-- | They are drawn after the content.
+data BoxLine = BoxLine
+  { boxlineStart :: V2 Double
+  , boxlineEnd :: V2 Double
+  -- , boxlineColor :: Maybe Canvas.Color
+  -- , boxlineThickness :: Maybe Double
+  }
 
 --------------------------------------------------------------------------------
 -- Main entry point and event handler
@@ -865,6 +875,7 @@ elementToBoxes ctx params parentStyle node@DOM{ domContent=Right children } = do
          , boxNode = Just node
          , boxDim = V2 (ltMaxX layout') (ltY layout')
          , boxStyling = ltStyling layout'
+         , boxLines = []
          }
     return (box, ltCtx layout')
   where
@@ -972,6 +983,7 @@ layoutBlock children = do
             , boxNode = boxNode box
             , boxDim = V2 mw mh
             , boxStyling = noStyling
+            , boxLines = []
             }
 
       let outerBox = BoxTree
@@ -982,6 +994,7 @@ layoutBlock children = do
             , boxNode = boxNode box
             , boxDim = V2 outerWidth outerHeight
             , boxStyling = boxStyling box
+            , boxLines = []
             }
       layoutBlockBox outerBox
 
@@ -1061,11 +1074,11 @@ layoutInlineBox (V2 dx dy) baseline node content = do
         , boxNode = Just node
         , boxDim = V2 dx dy
         , boxStyling = styling
+        , boxLines = []
         }
-  modify (\lt ->
+  modify $ \lt ->
     let ls = ltLS lt
     in lt{ ltX=ltX lt + dx, ltLS=ls{ lsWords=[], lsBoxes=lsBoxes ls ++ [(baseline, box, 0, 0)] } }
-    )
 
 layoutInlineClose :: CanMeasureText m => LayoutOver m ()
 layoutInlineClose = do
@@ -1075,6 +1088,7 @@ layoutInlineClose = do
   let txt = concat $ lsWords ls
 
   unless (null txt) $ do
+    -- assemble the line and measure it again
     wgap <- lift $ (/ 4) <$> measureTextWidth font "____"
     let (txt', wbefore, wafter) =
          let (before, txt0) = L.span C.isSpace txt
@@ -1085,11 +1099,27 @@ layoutInlineClose = do
 
     (h, baseline) <- lift $ measureHeightAndBaseline font
     w <- lift $ measureTextWidth font txt'    -- TODO: normalize monospace
+
+    -- underlines?
+    let underlineOffset = 3         -- TODO: unhardcode
+    let boxlines = case M.lookup CSSTextDecorationLine (styleInherit $ ltStyle lt) of
+         Just (CSS_Keyword "underline") ->
+           let underY = baseline + underlineOffset
+           in [BoxLine{ boxlineStart=V2 0 underY, boxlineEnd=V2 w underY}]
+         Just (CSS_Keyword "line-through") ->
+           let strikeY = baseline * 0.7
+           in [BoxLine{ boxlineStart=V2 0 strikeY, boxlineEnd=V2 w strikeY}]
+         Just other ->
+           warning ("ignoring text-decoration=" ++ show other) []
+         Nothing -> []
+
+    -- emit the inline box
     let box = BoxTree
           { boxContent = BoxInline (TextBox (T.pack txt') baseline)
           , boxNode = listToMaybe $ ltStack lt
           , boxDim = V2 w h
           , boxStyling = ltStyling lt
+          , boxLines = boxlines
           }
     let ls' = ls { lsBoxes = lsBoxes ls ++ [(baseline, box, wbefore, wafter)], lsWords = [] }
     put $ lt{ ltLS = ls' }
@@ -1106,7 +1136,7 @@ layoutLineBreak = do
     when preserveNewine $ do
       -- advance Y by a line height:
       font <- gets (styleFont . ltStyle)
-      (_, h) <- lift $ measureHeightAndBaseline font
+      (h, _) <- lift $ measureHeightAndBaseline font
       modify $ \lt -> lt{ ltY = ltY lt + h }
   else do
     -- determine the line ascent and descent:
@@ -1148,6 +1178,7 @@ layoutLineBreak = do
           , boxNode = Nothing
           , boxDim = V2 width height
           , boxStyling = noStyling
+          , boxLines = []
           }
 
   modify $ \lt -> lt{ ltX = 0, ltLS = (ltLS lt){ lsBoxes=[], lsGap=True, lsWords=[] } }
@@ -1269,6 +1300,15 @@ renderDOM page = do
 
 renderTree :: (Double, Double) -> (Double, Double, Style) -> BoxTree -> Canvas.Canvas [(SDL.Rectangle Double, InlineContent)]
 renderTree (minY, maxY) (x, y, st0) box = do
+  -- draw the lines
+  forM_ (boxLines box) $ \boxline -> do
+    let V2 dx1 dy1 = boxlineStart boxline
+    let V2 dx2 dy2 = boxlineEnd boxline
+    let start = V2 (x + dx1) (y + dy1 - minY)
+    let end = V2 (x + dx2) (y + dy2 - minY)
+    Canvas.line start end
+
+  -- draw the content
   case boxContent box of
     BoxOfBlocks children -> do
       replaced <- forM children $ \(P (V2 dx dy), child) -> do
@@ -1284,8 +1324,12 @@ renderTree (minY, maxY) (x, y, st0) box = do
     BoxInline content@(ImageBox (V2 w h) _) ->
       let rect = SDL.Rectangle (P $ V2 x y) (V2 w h)
       in return [(rect, content)]
-    BoxInline (InputTextBox _wh textX baseline txt _cursorX) -> do
+    BoxInline (InputTextBox (V2 _bw bh) textX baseline txt _cursorX) -> do
+      V2 w _ <- Canvas.textSize (T.unpack txt)
+      let cursorInset = bh/6
+      let cursorX = textX + w + defaultFontSize/5
       Canvas.textBaseline (T.unpack txt) (V2 (x + textX) (y + baseline - minY))
+      Canvas.line (V2 (x + cursorX) (y + cursorInset - minY)) (V2 (x + cursorX) (y + bh - cursorInset - minY))
       return []
     -- _ -> error $ "TODO: renderTree " ++ show (boxContent box)
 
@@ -1367,6 +1411,7 @@ data CSSProperty
   | CSSFont
   | CSSWhiteSpace
   | CSSTextAlign
+  | CSSTextDecorationLine
   deriving (Show, Eq, Ord, Enum)
 
 cssPropertyNames :: M.Map CSSProperty Text
@@ -1375,6 +1420,7 @@ cssPropertyNames = M.fromList
   , (CSSColor,              "color")
   , (CSSWhiteSpace,         "white-space")
   , (CSSTextAlign,          "text-align")
+  , (CSSTextDecorationLine, "text-decoraton-line")
   ]
 
 cssNamesOfProperties :: M.Map Text CSSProperty
@@ -1387,6 +1433,7 @@ cssPropertyDefaults = M.fromList
   , (CSSColor,              CSS_RGB 0 0 0)
   , (CSSWhiteSpace,         CSS_Keyword "normal")
   , (CSSTextAlign,          CSS_Keyword "left")
+  , (CSSTextDecorationLine, CSS_Keyword "none")
   ]
 
 instance IsCSSProperty CSSProperty where
@@ -1600,34 +1647,47 @@ css properties = Style
     mergePropVal (CSS_Font new) (CSS_Font old) = CSS_Font (mergeCSSFontValues new old)
     mergePropVal new _old = new
 
-    (own, inherit) = partitionEithers $ map desugar $ mapMaybe readProperty properties
+    (own, inherit) = partitionEithers $ map desugarValues $ concatMap readProperty properties
 
-    readProperty :: (Text, Text) -> Maybe (Either (CSSOwnProperty, CSSValue) (CSSProperty, CSSValue))
+    readProperty :: (Text, Text) -> [Either (CSSOwnProperty, CSSValue) (CSSProperty, CSSValue)]
     readProperty (name, textval) =
       case cssReadValue textval of
         Left _ ->
-          warning (concat ["Unknown value of a property: ", T.unpack name, "=", T.unpack textval]) Nothing
+          warning (concat ["Unknown value of a property: ", T.unpack name, "=", T.unpack textval]) []
         Right val ->
           case M.lookup name cssNamesOfProperties of
-            Just prop -> Just $ Right (prop, val)
+            Just prop -> [Right (prop, val)]
             Nothing ->
               case M.lookup name cssNamesOfOwnProperties of
-                Just prop -> Just $ Left (prop, val)
+                Just prop -> [Left (prop, val)]
                 Nothing ->
-                  let mkFont font = Just (Right (CSSFont, CSS_Font font))
-                  in case name of
-                    "font-weight" -> mkFont $ noCSSFont{ cssfontWeight = Just val }
-                    "font-style" -> mkFont $ noCSSFont{ cssfontStyle = Just val }
-                    "font-size" -> mkFont $ noCSSFont{ cssfontSize = Just val }
-                    "font-family" ->  mkFont $ noCSSFont{ cssfontFamily = Just val }
-                    _ -> if "-" `T.isPrefixOf` name then Nothing
-                         else warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) Nothing
+                  case M.lookup name cssShorthands of
+                    Just unshorthand -> unshorthand val
+                    Nothing ->
+                      let mkFont font = [Right (CSSFont, CSS_Font font)]
+                      in case name of
+                        "font-weight" -> mkFont $ noCSSFont{ cssfontWeight = Just val }
+                        "font-style" -> mkFont $ noCSSFont{ cssfontStyle = Just val }
+                        "font-size" -> mkFont $ noCSSFont{ cssfontSize = Just val }
+                        "font-family" ->  mkFont $ noCSSFont{ cssfontFamily = Just val }
+                        _ -> if "-" `T.isPrefixOf` name then []
+                             else warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) []
 
-    desugar (Right (prop, CSS_Keyword color)) | prop `elem` [CSSColor, CSSBackgroundColor] = Right (prop, color')
+    desugarValues (Right (prop, CSS_Keyword color)) | prop `elem` [CSSColor, CSSBackgroundColor] = Right (prop, color')
       where
-        -- yes, it's always Right:
-        Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases
-    desugar other = other
+        Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases  -- yes, it's always Right:
+    desugarValues other = other
+
+    cssShorthands = M.fromList
+      [ ("text-decoration", expandTextDecoration)
+      ]
+
+    expandTextDecoration = \case
+      CSS_Keyword kw | kw `elem` ["none", "underline", "overline", "line-through"] ->
+        [Right (CSSTextDecorationLine, CSS_Keyword kw)]
+      CSS_List vals ->
+        concatMap expandTextDecoration vals
+      other -> warning ("Unknown value for text-decoration=" ++ show other) []
 
 withCSS :: [(Text, Text)] -> DOMNode -> DOMNode
 withCSS properties node = node { domStyle = css properties `overriding` domStyle node }
@@ -1813,7 +1873,7 @@ elementStyles =
      , ("h5",       css [fontsize (0.83 * defaultFontSize), fontweight_bold])
      , ("h6",       css [fontsize (0.75 * defaultFontSize), fontweight_bold])
      ] ++
-     [ ("a",        css [color "#00e", display_inline])
+     [ ("a",        css [color "#00e", display_inline, ("text-decoration", "underline")])
      , ("abbr",     inline)
      , ("acronym",  inline)
      , ("b",        css [fontweight_bold, display_inline])
@@ -1842,7 +1902,7 @@ elementStyles =
      , ("select",   inline)
      , ("small",    css [("font-size", "83%"), display_inline])
      , ("span",     inline)
-     , ("strike",   inline)
+     , ("strike",   css [("text-decoration", "line-through"), display_inline])
      , ("strong",   css [fontweight_bold, display_inline])
      , ("sub",      inline)
      , ("sup",      inline)
@@ -1851,7 +1911,7 @@ elementStyles =
      , ("time",     inline)
      , ("textarea", inline)
      , ("tt",       inline)
-     , ("u",        inline)
+     , ("u",        css [("text-decoration", "underline"), display_inline])
      , ("var",      inline)
      ] ++
      [ ("script",   nodisplay)
