@@ -1,0 +1,16 @@
+<html>
+<head>
+</head>
+<body>
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">import</span> <span class="nn">http.server</span> <span class="k">as</span> <span class="n">http</span>
+
+<span class="n">address</span> <span class="o">=</span> <span class="p">(</span><span class="s">''</span><span class="p">,</span> <span class="mi">8000</span><span class="p">)</span>
+<span class="k">with</span> <span class="n">http</span><span class="o">.</span><span class="n">HTTPServer</span><span class="p">(</span><span class="n">address</span><span class="p">,</span> <span class="n">SimpleHTTPRequestHandler</span><span class="p">)</span> <span class="k">as</span> <span class="n">httpd</span><span class="p">:</span>
+    <span class="k">print</span><span class="p">(</span><span class="s">'Listening on </span><span class="si">%</span><span class="s">s:</span><span class="si">%</span><span class="s">d'</span> <span class="o">%</span> <span class="n">address</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">httpd</span><span class="o">.</span><span class="n">serve_forever</span><span class="p">()</span>
+    <span class="k">except</span> <span class="nb">KeyboardInterrupt</span><span class="p">:</span>
+        <span class="k">pass</span>
+</code></pre></div></div>
+</body>
+</html>
