@@ -194,6 +194,71 @@ noState = NodeID 0
 data DOMNodeState
   = InputTextState !Text
 
+--------------------------------------------------------------------------------
+-- | This is a new take on the page loading and state,
+-- | to replace DOMNode and Page in the future.
+
+
+-- | The navigator is a "browser" abstraction.
+-- |   - stores settings and the collection of windows.
+-- |   - does network requests and caching.
+data Navigator = Navigator
+
+-- | This is a window to render on the screen.
+-- |   - contains a document
+-- |   - contains history
+data Window = Window
+
+-- | This is a web-page
+-- |   - contains the DOM tree
+-- |   - contains the CSS rule storage
+-- |   - contains the rendering cache(s)
+data Document = Document
+  { documentAllNodes :: IM.IntMap Element
+
+  -- , documentTitle :: Text
+  -- , documentElementsByClass :: M.Map Text [ElementID]
+  -- , documentElementById :: M.Map Text ElementID
+
+  -- , documentFocusChain :: ElementZipList
+  }
+
+type ElementID = Int
+noElement =   0 :: ElementID
+htmlElement = 1 :: ElementID
+headElement = 2 :: ElementID
+bodyElement = 3 :: ElementID
+
+-- external collections:
+data ZipperList a = ZipperList
+  { zipperPrev :: [a]
+  , zipperHead :: a
+  , zipperNext :: [a]
+  }
+
+type ElementZList = ZipperList ElementID
+
+-- intrusive collections:
+data ElementSiblings = ElementSiblings
+  { prevSibling :: ElementID
+  , nextSibling :: ElementID
+  }   -- the prev and the next
+
+data ElementChildren = ElementChildren
+  { firstChild :: ElementID
+  , lastChild :: ElementID
+  }
+
+data Element = Element {
+    -- | all elements are parts of the DOM tree:
+    elementParent :: ElementID
+  , elementSiblings :: ElementSiblings
+
+  , elementContent :: Either DOMContent ElementChildren
+  -- , elementSource :: XML.Element
+  -- , elementEvents :: Events
+  -- , elementStyle :: Style
+  }
 
 --------------------------------------------------------------------------------
 -- | Normalize an XML tree of elements and text, possibly with
@@ -223,6 +288,7 @@ domFromXML xml =
       let nid = nid0 + 1
       put (NodeID nid, IM.insert nid (node, InputTextState "") states0)
       let content = case lookupXMLAttribute "type" el of
+            Nothing -> InputTextContent $ NodeID nid
             Just "text" -> InputTextContent $ NodeID nid
             Just "password" -> InputTextContent $ NodeID nid    -- TODO: a password input
             Just "button" -> TextContent $ fromMaybe "" $ lookupXMLAttribute "value" el
