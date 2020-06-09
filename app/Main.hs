@@ -9,7 +9,7 @@ import           Control.Applicative
 import qualified Control.Exception as Exc
 import           Control.Monad
 import           Control.Monad.RWS.Strict as RWS
-import           Control.Monad.State (State, runState)
+import           Control.Monad.State (State, StateT(..), runState)
 import qualified Data.Attoparsec.Text as Atto
 import qualified Data.ByteString.Lazy as B
 import qualified Data.ByteString as Bs
@@ -215,26 +215,133 @@ data Window = Window
 -- |   - contains the rendering cache(s)
 data Document = Document
   { documentAllNodes :: IM.IntMap Element
+  , documentNewID :: ElementID
+  , documentBuildState :: [ElementID]     -- current open elements during adding
 
+  -- , documentContentType :: ContentType
   -- , documentTitle :: Text
   -- , documentElementsByClass :: M.Map Text [ElementID]
   -- , documentElementById :: M.Map Text ElementID
 
-  -- , documentFocusChain :: ElementZipList
-  }
+  -- , documentFocus :: ElementID
+  } deriving (Show)
 
+emptyDocument :: Document
+emptyDocument = Document { documentAllNodes = IM.empty, documentNewID = succ noElement, documentBuildState = [] }
+
+
+type DocumentT m a = StateT Document m a
+
+takeNewID :: Monad m => DocumentT m ElementID
+takeNewID = do
+  i <- gets documentNewID
+  modify $ \doc -> doc{ documentNewID = succ (documentNewID doc) }
+  return i
+
+getNode :: Monad m => ElementID -> DocumentT m Element
+getNode nid = do
+  nodes <- gets documentAllNodes
+  case IM.lookup nid nodes of
+    Just node -> return node
+    Nothing -> error $ "nodeID not found: " ++ show nid
+
+alterNode :: Monad m => ElementID -> (Maybe Element -> Maybe Element) -> DocumentT m ()
+alterNode nid f = do
+  nodes <- gets documentAllNodes
+  let nodes' = IM.alter f nid nodes
+  modify $ \doc -> doc{ documentAllNodes = nodes' }
+
+modifyNode :: Monad m => ElementID -> (Element -> Element) -> DocumentT m ()
+modifyNode nid f = alterNode nid (fmap f)
+
+-- | Building document DOM tree
+domtreeAppendChild :: Monad m => DOMContent -> DocumentT m ElementID
+domtreeAppendChild content = do
+  opened <- gets documentBuildState
+  let pid = head opened
+  parent <- getNode pid
+  case elementContent parent of
+    Right fid -> do
+      nid <- takeNewID
+      (fid', lid') <- if fid == noElement then do
+        modifyNode pid $ \_ -> parent{ elementContent = Right nid }
+        return (nid, nid)
+      else do
+        first <- getNode fid
+        let lid = prevSibling $ elementSiblings first
+        modifyNode fid $ \_ -> first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
+        modifyNode lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
+        return (fid, lid)
+      alterNode nid $ \_ -> Just $ Element
+            { elementParent = pid
+            , elementSiblings = ElementSiblings{ prevSibling = lid', nextSibling = fid' }
+            , elementContent = Left content
+            }
+      -- TODO: run DOM mutation callbacks
+      return nid
+    _ ->
+      return $ warning ("not an insertable element: " ++ show parent) noElement
+
+domtreeStartElement :: Monad m => DocumentT m ElementID
+domtreeStartElement = do
+  opened <- gets documentBuildState
+  let pid = if null opened then noElement else head opened
+
+  nid <- takeNewID
+
+  when (pid /= noElement) $ do
+    parent <- getNode pid
+    let Right fid = elementContent parent   -- Left should not be in opened, ever.
+    when (fid /= noElement) $ do
+      first <- getNode fid
+      let lid = prevSibling $ elementSiblings first
+      modifyNode fid $ \_ -> first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
+      modifyNode lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
+    modifyNode pid $ \_ -> parent{ elementContent = Right nid }
+    alterNode nid $ \_ -> Just $ Element
+      { elementParent = pid
+      , elementSiblings = ElementSiblings{ prevSibling = nid, nextSibling = nid }
+      , elementContent = Right noElement
+      }
+
+  alterNode nid $ \_ -> Just $ Element
+    { elementParent = pid
+    , elementSiblings = ElementSiblings{ prevSibling = nid, nextSibling = nid }
+    , elementContent = Right noElement
+    }
+  modify $ \doc -> doc{ documentBuildState = (nid:opened) }
+  return nid
+
+domtreeEndElement :: Monad m => DocumentT m ElementID
+domtreeEndElement = do
+  (_:opened) <- gets documentBuildState
+  modify $ \doc -> doc{ documentBuildState = opened }
+  return $ if null opened then noElement else head opened
+
+
+-- | Traversing document DOM tree
+domtreeTraverse :: (Traversable t, Applicative f) => (Element -> f b) -> Document -> f (t b)
+domtreeTraverse = undefined
+
+
+-- | This is a DOM node
 type ElementID = Int
-noElement =   0 :: ElementID
-htmlElement = 1 :: ElementID
-headElement = 2 :: ElementID
-bodyElement = 3 :: ElementID
+
+noElement :: ElementID
+noElement =   0
+
+htmlElement :: ElementID
+htmlElement = 1
+
+--headElement = 2 :: ElementID
+--bodyElement = 3 :: ElementID
 
 -- external collections:
 data ZipperList a = ZipperList
   { zipperPrev :: [a]
   , zipperHead :: a
   , zipperNext :: [a]
-  }
+  } deriving (Show, Eq)
 
 type ElementZList = ZipperList ElementID
 
@@ -242,22 +349,29 @@ type ElementZList = ZipperList ElementID
 data ElementSiblings = ElementSiblings
   { prevSibling :: ElementID
   , nextSibling :: ElementID
-  }   -- the prev and the next
+  } deriving (Show)
 
 data ElementChildren = ElementChildren
   { firstChild :: ElementID
   , lastChild :: ElementID
-  }
+  } deriving (Show)
 
-data Element = Element {
-    -- | all elements are parts of the DOM tree:
-    elementParent :: ElementID
+data Element = Element
+  { elementParent :: ElementID
   , elementSiblings :: ElementSiblings
 
-  , elementContent :: Either DOMContent ElementChildren
+  , elementContent :: Either DOMContent ElementID -- content or the first child
+
   -- , elementSource :: XML.Element
   -- , elementEvents :: Events
   -- , elementStyle :: Style
+  } deriving (Show)
+
+emptyElement :: Element
+emptyElement = Element
+  { elementParent = noElement
+  , elementSiblings = ElementSiblings{ prevSibling = noElement, nextSibling = noElement }
+  , elementContent = Right noElement
   }
 
 --------------------------------------------------------------------------------
