@@ -30,19 +30,27 @@
 <li>[DONE: 2020/05/30] UI, Layout: <code>&lt;li&gt;</code> and <code>display: list-item</code></li>
 <li>[DONE: 2020/05/30] Rendering: additional lines for an element (for underlines, strike-through, borders, etc)</li>
 <li>[DONE: 2020/05/30] HTML: &lt;hr&gt;</li>
+<li>[DONE: 2020/05/30] CSS: <code>text-decoration: line-through</code>, HTML: <code>&lt;s&gt;</code>/<code>&lt;strike&gt;</code></li>
+<li>[DONE: 2020/06/13] Refactor: DOM as an IntMap with integer "pointers"; page monad</li>
 <li>[WIP] Refactor: a proper CSS parser from <code>css-text</code></li>
 <li>UI: basic event dispatch for elements</li>
-<li>UI: text input</li>
+<li>UI: text input widget</li>
 <li>UI: dispatching keyboard events to focusable elements, moving between focusable elements</li>
+<li>Fonts: font/glyph cache, fallbacks for different writing systems.</li>
+<li>Fonts: choose sensible default fonts depending on the platform</li>
+<li>HTML: support for non-UTF encodings (e.g. piping through iconv?)</li>
+<li>HTML: <code>&lt;details&gt;</code> tag</li>
+<li>HTML: <code>&lt;audio&gt;</code> with offload to mplayer/mpv</li>
 <li>CSS: parse <code>&lt;style&gt;</code> tags</li>
 <li>CSS: CSS priority resolution and rule storage</li>
 <li>CSS: some <code>&lt;body&gt;</code> padding</li>
 <li>CSS, Layout: margins, borders and padding</li>
-<li>CSS: <code>text-decoration: line-through</code>, HTML: <code>&lt;s&gt;</code>/<code>&lt;strike&gt;</code></li>
 <li>CSS: <code>line-height</code></li>
-<li>Refactor: DOM as an IntMap with integer "pointers"; page monad</li>
 <li>Refactor: TileIndex from BoxTree, findBox using TileIndex; rendering using TileIndex too?</li>
 <li>Refactor: split fetching data, decoding data and presenting content; future: progressive encoding and presenting</li>
+<li>Misc: profiling, CPU and memory optimization</li>
+<li>Misc: persistent settings and cache (SQLite?)</li>
+<li>Network: <code>file://</code> resource scheme</li>
 <li>Network: parse a HTTP response as it comes, build DOM and BoxTree concurrently (conduits?)</li>
 <li>Layout, CSS: <code>position: static|relative|absolute|fixed</code></li>
 <li>Layout: tests</li>
@@ -56,6 +64,7 @@
 <li>UI: buttons</li>
 <li>UI: history, going back and forth</li>
 <li>UI: optimized scroll (skiplist of subboxes in large boxes?) - blit copy + TileIndex</li>
+<li>UI: custom cursors; CSS: <code>cursor</code></li>
 <li>UI, HTML: handling <code>tabindex</code></li>
 <li>UI: scaling, zooming</li>
 <li>UI: optimized resize</li>
