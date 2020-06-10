@@ -423,6 +423,7 @@ domtreeFromXML (XML.NodeElement el) =
         _ ->
           let alt = fromMaybe "<img>" $ lookupXMLAttribute "alt" el
           in appendContent (TextContent alt)
+      -- TODO: add this element to documentImages
 
     "input" -> do
       let value = fromMaybe "" $ lookupXMLAttribute "value" el
@@ -1926,6 +1927,7 @@ applyDiff st diff = st { styleInherit = diff `patch` (styleInherit st) }
 --------------------------------------------------------------------------------
 -- CSS parsers and printers
 
+-- TODO: use css-text here
 -- a farcical CSS parser:
 cssFarcer :: String -> Style
 cssFarcer s = css $ mapMaybe parseProp $ T.splitOn ";" (T.pack s)
@@ -2091,6 +2093,9 @@ cssColorAliases = M.fromList (cssColorsLevel1 ++ cssColorsLevel2)
         ]
 
 
+-- | TODO: cursors bitmap collection
+-- https://developer.mozilla.org/en-US/docs/Web/CSS/cursor
+
 --------------------------------------------------------------------------------
 -- | Default CSS values and getters
 
@@ -2160,6 +2165,18 @@ bodyStyle = css (own ++ inheritable)
       , ("white-space",     "normal")
       ]
 
+inputStyle :: Style
+inputStyle = css
+  [ ("background-color", "#f8f8f8")
+  , ("border", "grey inset 2px")
+  , ("color", "black")
+  , ("cursor", "text")
+  , ("display", "inline")
+  , ("font-family", "sans")
+  , ("font-size", T.pack $ show defaultFontSize ++ "px")
+  , ("width", "32em")
+  ]
+
 -- | Default stylings for standard HTML elements.
 builtinHTMLStyles :: HM.HashMap Text Style
 builtinHTMLStyles =
@@ -2186,7 +2203,7 @@ builtinHTMLStyles =
      , ("em",       css [fontstyle_italic, display_inline])
      , ("i",        css [fontstyle_italic, display_inline])
      , ("img",      inline)
-     , ("input",    css [("border", "grey inset 2px"), display_inline])
+     , ("input",    inputStyle)
      , ("kbd",      inline)
      , ("label",    inline)
      , ("li",       css [("display", "list-item")])
@@ -2247,7 +2264,7 @@ vadoHomePage window = (emptyPage window)
           , withAttributes [("type", "submit"), ("value", "I go!")] $ makeNode "input" []
           ]
       ]
-    inputCSS = [("background-color", "#f0f0f0"), ("font-size", "18px"), ("font-family", "sans")]
+    inputCSS = [("font-size", "18px")]
     inputAttrs = [("type", "text"), ("name", "url")]
     inputChange DOM{ domState=(NodeID nid) } page@Page{ pageElementStates=states } =
       case IM.lookup nid states of
