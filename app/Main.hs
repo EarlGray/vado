@@ -9,7 +9,7 @@ import           Control.Applicative
 import qualified Control.Exception as Exc
 import           Control.Monad
 import           Control.Monad.RWS.Strict as RWS
-import           Control.Monad.State (State, StateT(..), runState)
+import           Control.Monad.State (State, StateT(..), runState, evalStateT)
 import qualified Data.Attoparsec.Text as Atto
 import qualified Data.ByteString.Lazy as B
 import qualified Data.ByteString as Bs
@@ -232,18 +232,33 @@ emptyDocument = Document { documentAllNodes = IM.empty, documentNewID = succ noE
 
 type DocumentT m a = StateT Document m a
 
+inDocument :: Monad m => Document -> DocumentT m a -> m a
+inDocument doc f = evalStateT f doc
+
 takeNewID :: Monad m => DocumentT m ElementID
 takeNewID = do
   i <- gets documentNewID
   modify $ \doc -> doc{ documentNewID = succ (documentNewID doc) }
   return i
 
-getNode :: Monad m => ElementID -> DocumentT m Element
-getNode nid = do
+getElement :: Monad m => ElementID -> DocumentT m Element
+getElement nid = do
   nodes <- gets documentAllNodes
   case IM.lookup nid nodes of
     Just node -> return node
     Nothing -> error $ "nodeID not found: " ++ show nid
+
+getChildren :: Monad m => ElementID -> DocumentT m [Element]
+getChildren pid = do
+    node <- getElement pid
+    case elementContent node of
+      Right fid | fid /= noElement -> go fid fid
+      _ -> return []
+  where
+    go fid nid = do
+      node <- getElement nid
+      let nextid = nextSibling $ elementSiblings node
+      (node:) <$> if fid == nid then return [] else go fid nextid
 
 alterNode :: Monad m => ElementID -> (Maybe Element -> Maybe Element) -> DocumentT m ()
 alterNode nid f = do
@@ -259,7 +274,7 @@ domtreeAppendChild :: Monad m => DOMContent -> DocumentT m ElementID
 domtreeAppendChild content = do
   opened <- gets documentBuildState
   let pid = head opened
-  parent <- getNode pid
+  parent <- getElement pid
   case elementContent parent of
     Right fid -> do
       nid <- takeNewID
@@ -267,7 +282,7 @@ domtreeAppendChild content = do
         modifyNode pid $ \_ -> parent{ elementContent = Right nid }
         return (nid, nid)
       else do
-        first <- getNode fid
+        first <- getElement fid
         let lid = prevSibling $ elementSiblings first
         modifyNode fid $ \_ -> first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
         modifyNode lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
@@ -290,10 +305,10 @@ domtreeStartElement = do
   nid <- takeNewID
 
   when (pid /= noElement) $ do
-    parent <- getNode pid
+    parent <- getElement pid
     let Right fid = elementContent parent   -- Left should not be in opened, ever.
     when (fid /= noElement) $ do
-      first <- getNode fid
+      first <- getElement fid
       let lid = prevSibling $ elementSiblings first
       modifyNode fid $ \_ -> first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
       modifyNode lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
@@ -1078,7 +1093,7 @@ elementToBoxes ctx params parentStyle node@DOM{ domContent=Right children } = do
     layout = Layout
       { ltX = 0, ltY = 0
       , ltMaxX = 0
-      , ltLS = LS { lsBoxes = [], lsGap = True, lsWords = [], lsFont = defaultFont }
+      , ltLS = LS { lsBoxes = [], lsGap = True, lsWords = [], lsFont = styleFont st }
       , ltCtx = ctx
       , ltStyle = st
       , ltStyling = parentStyle `styleDiff` st
@@ -1649,6 +1664,7 @@ cssPropertyDefaults = M.fromList
   , (CSSWhiteSpace,         CSS_Keyword "normal")
   , (CSSTextAlign,          CSS_Keyword "left")
   , (CSSTextDecorationLine, CSS_Keyword "none")
+  --, (CSSFont,               CSSFontValue )
   ]
 
 instance IsCSSProperty CSSProperty where
