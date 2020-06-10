@@ -144,8 +144,8 @@ makeTextNode txt = emptyNode { domContent = Left (TextContent txt) }
 makeNode :: Text -> [DOMNode] -> DOMNode
 makeNode tag children = emptyNode { domContent=Right children, domStyle=style, domEvents=events }
   where
-    style = fromMaybe noStyle $ HM.lookup tag elementStyles
-    events = fromMaybe noEvents $ HM.lookup tag elementEvents
+    style = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
+    events = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
 
 withAttributes :: [(Text, Text)] -> DOMNode -> DOMNode
 withAttributes attrs node = node { domAttrs = M.fromList attrs }
@@ -172,7 +172,7 @@ data DOMContent
   -- ^           ^href
   | HorizLineContent
   -- ^ <hr>
-  | InputTextContent NodeID
+  | InputTextContent !Text
   -- ^ <input type="text">
 
 instance Show DOMContent where
@@ -180,7 +180,7 @@ instance Show DOMContent where
   show NewlineContent = "NewlineContent"
   show HorizLineContent = "HorizLineContent"
   show (ImageContent href wh) = "ImageContent " ++ T.unpack href ++ " (" ++ show wh ++ ")"
-  show (InputTextContent nid) = "TextInputContent (" ++ show nid ++ ")"
+  show (InputTextContent t) = "TextInputContent \"" ++ T.unpack t ++ "\""
 
 -- | DOM Node States
 newtype NodeID = NodeID Int
@@ -266,12 +266,15 @@ alterNode nid f = do
   let nodes' = IM.alter f nid nodes
   modify $ \doc -> doc{ documentAllNodes = nodes' }
 
-modifyNode :: Monad m => ElementID -> (Element -> Element) -> DocumentT m ()
-modifyNode nid f = alterNode nid (fmap f)
+setElement :: Monad m => ElementID -> Element -> DocumentT m ()
+setElement nid element = alterNode nid $ \_ -> Just element
+
+modifyElement :: Monad m => ElementID -> (Element -> Element) -> DocumentT m ()
+modifyElement nid f = alterNode nid (fmap f)
 
 -- | Building document DOM tree
-domtreeAppendChild :: Monad m => DOMContent -> DocumentT m ElementID
-domtreeAppendChild content = do
+domtreeAppendChild :: Monad m => Maybe (Text, M.Map Text Text) -> DOMContent -> DocumentT m ElementID
+domtreeAppendChild mbXML content = do
   opened <- gets documentBuildState
   let pid = head opened
   parent <- getElement pid
@@ -279,26 +282,29 @@ domtreeAppendChild content = do
     Right fid -> do
       nid <- takeNewID
       (fid', lid') <- if fid == noElement then do
-        modifyNode pid $ \_ -> parent{ elementContent = Right nid }
+        modifyElement pid $ \_ -> parent{ elementContent = Right nid }
         return (nid, nid)
       else do
         first <- getElement fid
         let lid = prevSibling $ elementSiblings first
-        modifyNode fid $ \_ -> first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
-        modifyNode lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
+        modifyElement fid $ \_ -> first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
+        modifyElement lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
         return (fid, lid)
-      alterNode nid $ \_ -> Just $ Element
+
+      let (tag, attrs) = fromMaybe ("", M.empty) mbXML
+      setElement nid emptyElement
             { elementParent = pid
             , elementSiblings = ElementSiblings{ prevSibling = lid', nextSibling = fid' }
             , elementContent = Left content
+            , elementTag = tag
+            , elementAttrs = attrs
             }
-      -- TODO: run DOM mutation callbacks
       return nid
     _ ->
       return $ warning ("not an insertable element: " ++ show parent) noElement
 
-domtreeStartElement :: Monad m => DocumentT m ElementID
-domtreeStartElement = do
+domtreeStartElement :: Monad m => (Text, M.Map Text Text) -> DocumentT m ElementID
+domtreeStartElement (tag, attrs) = do
   opened <- gets documentBuildState
   let pid = if null opened then noElement else head opened
 
@@ -310,19 +316,16 @@ domtreeStartElement = do
     when (fid /= noElement) $ do
       first <- getElement fid
       let lid = prevSibling $ elementSiblings first
-      modifyNode fid $ \_ -> first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
-      modifyNode lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
-    modifyNode pid $ \_ -> parent{ elementContent = Right nid }
-    alterNode nid $ \_ -> Just $ Element
-      { elementParent = pid
-      , elementSiblings = ElementSiblings{ prevSibling = nid, nextSibling = nid }
-      , elementContent = Right noElement
-      }
+      setElement fid $ first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
+      modifyElement lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
+    setElement pid parent{ elementContent = Right nid }
 
-  alterNode nid $ \_ -> Just $ Element
+  setElement nid emptyElement
     { elementParent = pid
     , elementSiblings = ElementSiblings{ prevSibling = nid, nextSibling = nid }
     , elementContent = Right noElement
+    , elementTag = tag
+    , elementAttrs = attrs
     }
   modify $ \doc -> doc{ documentBuildState = (nid:opened) }
   return nid
@@ -364,30 +367,107 @@ type ElementZList = ZipperList ElementID
 data ElementSiblings = ElementSiblings
   { prevSibling :: ElementID
   , nextSibling :: ElementID
-  } deriving (Show)
+  }
+  deriving (Show)
 
 data ElementChildren = ElementChildren
   { firstChild :: ElementID
   , lastChild :: ElementID
-  } deriving (Show)
+  }
+  deriving (Show)
 
 data Element = Element
   { elementParent :: ElementID
   , elementSiblings :: ElementSiblings
 
   , elementContent :: Either DOMContent ElementID -- content or the first child
+  , elementTag :: Text
+  , elementAttrs :: M.Map Text Text
 
-  -- , elementSource :: XML.Element
-  -- , elementEvents :: Events
-  -- , elementStyle :: Style
-  } deriving (Show)
+  , elementEvents :: Events
+  , elementStyleHTML :: Style       -- builtin HTML styling
+  , elementStyleAttr :: Style       -- style="..."
+  }
+  deriving (Show)
 
 emptyElement :: Element
 emptyElement = Element
   { elementParent = noElement
   , elementSiblings = ElementSiblings{ prevSibling = noElement, nextSibling = noElement }
   , elementContent = Right noElement
+  , elementTag = ""
+  , elementAttrs = M.empty
+  , elementEvents = noEvents
+  , elementStyleHTML = noStyle
+  , elementStyleAttr = noStyle
   }
+
+
+domtreeFromXML :: Monad m => XML.Node -> DocumentT m ()
+domtreeFromXML (XML.NodeContent txt) =
+  void $ domtreeAppendChild Nothing (TextContent txt)
+
+domtreeFromXML (XML.NodeElement el) =
+  case tagName el of
+    "hr" -> do
+      appendContent HorizLineContent
+
+    "img" -> do
+      -- TODO: start fetching
+      case lookupXMLAttribute "src" el of
+        Just href -> do
+          let width = decodeXMLAttribute "width" el
+          let height = decodeXMLAttribute "height" el
+          let wh = liftM2 V2 width height
+          appendContent (ImageContent href wh)
+        _ ->
+          let alt = fromMaybe "<img>" $ lookupXMLAttribute "alt" el
+          in appendContent (TextContent alt)
+
+    "input" -> do
+      let value = fromMaybe "" $ lookupXMLAttribute "value" el
+      let content = case lookupXMLAttribute "type" el of
+            Nothing -> InputTextContent value
+            Just "text" -> InputTextContent value
+            Just "password" -> InputTextContent value    -- TODO: a password input
+            Just "button" -> TextContent value
+            Just "checkbox" -> TextContent $ maybe "\x2610" (\_ -> "\x2611") $ lookupXMLAttribute "checked" el
+            Just "submit" -> TextContent $ fromMaybe "submit" $ lookupXMLAttribute "value" el
+            Just "hidden" -> TextContent ""
+            _ -> warning ("Unknown input type: " ++ show el) $ TextContent ""
+      appendContent content
+
+    _ -> do
+      startElement
+      forM_ (XML.elementNodes el) $ \child ->
+        domtreeFromXML child
+      void $ domtreeEndElement
+
+  where
+    tag = tagName el
+    attrs = M.mapKeys xmlTextName (XML.elementAttributes el)
+
+    appendContent content = do
+      nid <- domtreeAppendChild (Just (tag, attrs)) content
+      parseGeneralAttributes nid
+
+    startElement = do
+      nid <- domtreeStartElement (tag, attrs)
+      parseGeneralAttributes nid
+
+    parseGeneralAttributes nid = do
+      -- TODO: parse class set
+      -- TODO: parse id and add globally
+      -- TODO: parse style=""
+      -- TODO: add builtin style and events
+      modifyElement nid $ \node -> node
+        { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
+        , elementStyleHTML = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
+        , elementStyleAttr = fromMaybe noStyle $ decodeXMLAttribute "style" el
+        }
+
+domtreeFromXML _ = return ()
+
 
 --------------------------------------------------------------------------------
 -- | Normalize an XML tree of elements and text, possibly with
@@ -409,27 +489,6 @@ domFromXML xml =
     XML.NodeElement el | tagName el == "hr" ->
       return $ Just $ emptyNode{ domContent=Left HorizLineContent, domSource=Just xml }
 
-    XML.NodeElement el | tagName el == "input" -> do
-      whenJust (listToMaybe $ XML.elementNodes el) $ \_ ->
-        return $ warning "input element cannot have children, skipping" ()
-      let node = domFromElement el []
-      (NodeID nid0, states0) <- get
-      let nid = nid0 + 1
-      put (NodeID nid, IM.insert nid (node, InputTextState "") states0)
-      let content = case lookupXMLAttribute "type" el of
-            Nothing -> InputTextContent $ NodeID nid
-            Just "text" -> InputTextContent $ NodeID nid
-            Just "password" -> InputTextContent $ NodeID nid    -- TODO: a password input
-            Just "button" -> TextContent $ fromMaybe "" $ lookupXMLAttribute "value" el
-            Just "checkbox" -> TextContent $ case lookupXMLAttribute "checked" el of Just _ -> "\x2611"; _ -> "\x2610"
-            Just "submit" -> TextContent $ fromMaybe "submit" $ lookupXMLAttribute "value" el
-            Just "hidden" -> TextContent ""
-            _ -> warning ("Unknown input type: " ++ show el) $ TextContent ""
-      return $ Just $ node
-        { domState = NodeID nid
-        , domContent = Left content
-        }
-
     XML.NodeElement el -> do
       children <- catMaybes <$> mapM domFromXML (XML.elementNodes el)
       return $ Just $ domFromElement el children
@@ -441,8 +500,8 @@ domFromXML xml =
       let attrs = M.mapKeys XML.nameLocalName $ XML.elementAttributes el
           attr_style = fromMaybe noStyle $ decodeXMLAttribute "style" el
           tag = tagName el
-          builtin_style = fromMaybe noStyle $ HM.lookup tag elementStyles
-          builtin_events = fromMaybe noEvents $ HM.lookup tag elementEvents
+          builtin_style = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
+          builtin_events = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
       in DOM
           { domContent = Right children
           , domStyle = attr_style `overriding` builtin_style
@@ -470,6 +529,12 @@ decodeXMLAttribute attr node = do
 tagName :: XML.Element -> Text
 tagName = XML.nameLocalName . XML.elementName
 
+xmlTextName :: XML.Name -> Text
+xmlTextName name =
+  let n = XML.nameLocalName name
+  in case XML.nameNamespace name of
+    Just ns -> T.concat [ns, ":", n]
+    _ -> n
 
 --------------------------------------------------------------------------------
 -- | A tree of bounding boxes
@@ -727,12 +792,16 @@ vadoViewHeight page = h
 -- | A set of events that an element may handle.
 type EventHandler = DOMNode -> Page -> IO Page
 
+-- TODO: refactor to a map + an enum of known enum names
 data Events = Events
   { eventsMouseReleased :: [V2 Double -> EventHandler]
   , eventsKeyReleased :: [SDL.Keysym -> EventHandler]
   , eventsTextInput :: [Text -> EventHandler]
   , eventsOther :: M.Map Text [EventHandler]
   }
+
+instance Show Events where
+  show _ = "<events>"
 
 noEvents :: Events
 noEvents = Events
@@ -742,8 +811,8 @@ noEvents = Events
   , eventsOther = M.empty
   }
 
-elementEvents :: HM.HashMap Text Events
-elementEvents = HM.fromList
+builtinHTMLEvents :: HM.HashMap Text Events
+builtinHTMLEvents = HM.fromList
   [ ("a", noEvents
       { eventsMouseReleased = [\_ node page -> clickLink node page]
       })
@@ -1137,14 +1206,12 @@ layoutBlock children = do
           , boxLines = [BoxLine{boxlineStart=V2 0 lineY, boxlineEnd=V2 w lineY}]
           }
 
-      (Left (InputTextContent (NodeID nid)), _) -> do
-        states <- asks ltElementStates
+      (Left (InputTextContent t), _) -> do
         -- TODO: extract the font of own CSS (not the cascaded one), calculate wh and baseline
         let w = 320
         let h = 32
         let baseline = 22
         let textX = 10
-        let Just (_, InputTextState t) = IM.lookup nid states
         let box = BoxInline $ InputTextBox (V2 w h) textX baseline t
         let boxlines =
               [ BoxLine{boxlineStart=V2 0 0, boxlineEnd=V2 0 h}
@@ -2094,8 +2161,8 @@ bodyStyle = css (own ++ inheritable)
       ]
 
 -- | Default stylings for standard HTML elements.
-elementStyles :: HM.HashMap Text Style
-elementStyles =
+builtinHTMLStyles :: HM.HashMap Text Style
+builtinHTMLStyles =
   HM.fromList
     ([ ("h1",       css [fontsize (2.00 * defaultFontSize), fontweight_bold])
      , ("h2",       css [fontsize (1.50 * defaultFontSize), fontweight_bold])
@@ -2168,7 +2235,7 @@ vadoHomePage window = (emptyPage window)
     }
   where
     inputID = 1
-    input0 = (makeNode "input" []){ domContent=Left (InputTextContent $ NodeID inputID) }
+    input0 = (makeNode "input" []){ domContent=Left (InputTextContent "") }
     input = withEvent "change" inputChange $ withNodeID inputID input0
     body = withCSS [("text-align", "center"), ("white-space", "pre")] $ makeNode "body"
       [ makeNode "h1" [makeTextNode "\n\n\nVado"]
