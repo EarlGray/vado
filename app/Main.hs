@@ -282,12 +282,12 @@ domtreeAppendChild mbXML content = do
     Right fid -> do
       nid <- takeNewID
       (fid', lid') <- if fid == noElement then do
-        modifyElement pid $ \_ -> parent{ elementContent = Right nid }
+        setElement pid $ parent{ elementContent = Right nid }
         return (nid, nid)
       else do
         first <- getElement fid
         let lid = prevSibling $ elementSiblings first
-        modifyElement fid $ \_ -> first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
+        setElement fid $ first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
         modifyElement lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
         return (fid, lid)
 
@@ -942,7 +942,10 @@ fetchHTTP url page = do
     let images_axis = (XML.fromDocument document $| XML.descendant &/ XML.element "img")
     let imageurls = mapMaybe (\cursor -> let XML.NodeElement el = XML.node cursor in lookupXMLAttribute "src" el) images_axis
     resources <- forM (S.toList $ S.fromList imageurls) $ \imgurl ->
-        fetchResource page{pageUrl=pageURI} httpman imgurl `Exc.catch` \(e :: HttpException) -> return $ warning (show e) []
+        fetchResource page{pageUrl=pageURI} httpman imgurl `Exc.catches`
+            [ Exc.Handler $ \(e :: HttpException) -> return $ warning (Exc.displayException e) []
+            , Exc.Handler $ \(e :: SDL.SDLException) -> return $ warning (Exc.displayException e) []   -- e.g. image decoding
+            ]
     endT <- getCPUTime
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
