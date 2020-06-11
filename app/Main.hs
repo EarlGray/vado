@@ -9,7 +9,8 @@ import           Control.Applicative
 import qualified Control.Exception as Exc
 import           Control.Monad
 import           Control.Monad.RWS.Strict as RWS
-import           Control.Monad.State (State, StateT(..), runState, evalStateT)
+import           Control.Monad.State (State, StateT(..))
+import qualified Control.Monad.State as St
 import qualified Data.Attoparsec.Text as Atto
 import qualified Data.ByteString.Lazy as B
 import qualified Data.ByteString as Bs
@@ -72,6 +73,7 @@ data Page = Page
   -- ^ the body DOM tree
   , pageHead :: XML.Element
   -- ^ XML source of <head></head>
+  , pageDocument :: Document
   , pageBoxes :: Maybe BoxTree
   -- ^ Rendering tree
   , pageUrl :: URI
@@ -88,6 +90,7 @@ emptyPage :: VadoWindow -> Page
 emptyPage window = Page
   { pageHead = undefined
   , pageBody = emptyNode
+  , pageDocument = emptyDocument
   , pageBoxes = Nothing
   , pageWindow = window
   , pageScroll = 0
@@ -233,7 +236,10 @@ emptyDocument = Document { documentAllNodes = IM.empty, documentNewID = succ noE
 type DocumentT m a = StateT Document m a
 
 inDocument :: Monad m => Document -> DocumentT m a -> m a
-inDocument doc f = evalStateT f doc
+inDocument doc f = St.evalStateT f doc
+
+fromEmptyDocument :: Monad m => DocumentT m a -> m Document
+fromEmptyDocument f = St.execStateT f emptyDocument
 
 takeNewID :: Monad m => DocumentT m ElementID
 takeNewID = do
@@ -345,6 +351,8 @@ domtreeTraverse = undefined
 -- | This is a DOM node
 type ElementID = Int
 
+type TagAttrs = (Text, M.Map Text Text)
+
 noElement :: ElementID
 noElement =   0
 
@@ -408,9 +416,12 @@ domtreeFromXML (XML.NodeContent txt) =
   void $ domtreeAppendChild Nothing (TextContent txt)
 
 domtreeFromXML (XML.NodeElement el) =
-  case tagName el of
+  let tag = tagName el
+      attrs = M.mapKeys xmlTextName (XML.elementAttributes el)
+      tagattrs = Just (tag, attrs)
+  in case tag of
     "hr" -> do
-      appendContent HorizLineContent
+      domAppendContent tagattrs HorizLineContent
 
     "img" -> do
       -- TODO: start fetching
@@ -419,10 +430,10 @@ domtreeFromXML (XML.NodeElement el) =
           let width = decodeXMLAttribute "width" el
           let height = decodeXMLAttribute "height" el
           let wh = liftM2 V2 width height
-          appendContent (ImageContent href wh)
+          domAppendContent tagattrs (ImageContent href wh)
         _ ->
           let alt = fromMaybe "<img>" $ lookupXMLAttribute "alt" el
-          in appendContent (TextContent alt)
+          in domAppendContent Nothing (TextContent alt)
       -- TODO: add this element to documentImages
 
     "input" -> do
@@ -436,38 +447,41 @@ domtreeFromXML (XML.NodeElement el) =
             Just "submit" -> TextContent $ fromMaybe "submit" $ lookupXMLAttribute "value" el
             Just "hidden" -> TextContent ""
             _ -> warning ("Unknown input type: " ++ show el) $ TextContent ""
-      appendContent content
+      domAppendContent tagattrs content
 
     _ -> do
-      startElement
+      domStartElement (tag, attrs)
       forM_ (XML.elementNodes el) $ \child ->
         domtreeFromXML child
       void $ domtreeEndElement
 
-  where
-    tag = tagName el
-    attrs = M.mapKeys xmlTextName (XML.elementAttributes el)
-
-    appendContent content = do
-      nid <- domtreeAppendChild (Just (tag, attrs)) content
-      parseGeneralAttributes nid
-
-    startElement = do
-      nid <- domtreeStartElement (tag, attrs)
-      parseGeneralAttributes nid
-
-    parseGeneralAttributes nid = do
-      -- TODO: parse class set
-      -- TODO: parse id and add globally
-      -- TODO: parse style=""
-      -- TODO: add builtin style and events
-      modifyElement nid $ \node -> node
-        { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
-        , elementStyleHTML = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
-        , elementStyleAttr = fromMaybe noStyle $ decodeXMLAttribute "style" el
-        }
-
 domtreeFromXML _ = return ()
+
+
+domStartElement :: Monad m => TagAttrs -> DocumentT m ()
+domStartElement tagattrs = do
+    nid <- domtreeStartElement tagattrs
+    domParseGeneralAttributes nid
+
+domAppendContent :: Monad m => Maybe TagAttrs -> DOMContent -> DocumentT m ()
+domAppendContent mbTagAttrs content = do
+    nid <- domtreeAppendChild mbTagAttrs content
+    domParseGeneralAttributes nid
+
+domParseGeneralAttributes :: Monad m => ElementID -> DocumentT m ()
+domParseGeneralAttributes nid = do
+  -- TODO: parse class set
+  -- TODO: parse id and add globally
+  -- TODO: parse style=""
+  -- TODO: add builtin style and events
+  modifyElement nid $ \node -> 
+    let tag = elementTag node
+        style = M.lookup "style" $ elementAttrs node
+    in node
+      { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
+      , elementStyleHTML = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
+      , elementStyleAttr = maybe noStyle (cssFarcer . T.unpack) $ style
+      }
 
 
 --------------------------------------------------------------------------------
@@ -938,6 +952,8 @@ fetchHTTP url page = do
     let topnodes = mapMaybe (\case XML.NodeElement el -> Just el; _ -> Nothing) $ XML.elementNodes root
     let headnode = fromMaybe (fakeNode "head" []) $ L.find (\el -> tagName el == "head") topnodes
     let bodynode = fromMaybe (fakeNode "body" $ XML.elementNodes root) $ L.find (\el -> tagName el == "body") topnodes
+    -- TODO: html attributes, if any
+    let htmlnode = xmlNode "html" (map XML.NodeElement [headnode, bodynode])
 
     let images_axis = (XML.fromDocument document $| XML.descendant &/ XML.element "img")
     let imageurls = mapMaybe (\cursor -> let XML.NodeElement el = XML.node cursor in lookupXMLAttribute "src" el) images_axis
@@ -950,12 +966,14 @@ fetchHTTP url page = do
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
 
-    let (Just dom, (_focused, states)) = runState (domFromXML (XML.NodeElement bodynode)) (NodeID 0, IM.empty)
+    let (Just dom, (_focused, states)) = St.runState (domFromXML (XML.NodeElement bodynode)) (NodeID 0, IM.empty)
+    doc <- fromEmptyDocument $ domtreeFromXML htmlnode
     when debug $ putStrLn (showdbg dom)
     return page
       { pageUrl = pageURI
       , pageHead = headnode
       , pageBody = dom
+      , pageDocument = doc
       , pageResources = M.fromList (concat resources) `mappend` pageResources page
       , pageScroll = 0
       , pageFocus = NodeID 0
@@ -965,10 +983,16 @@ fetchHTTP url page = do
     let respbody = T.decodeUtf8 $ B.toStrict body
     let text = makeTextNode respbody
     let pre = makeNode "pre" [text]
+    doc <- fromEmptyDocument $ domtreeFromXML $
+      xmlNode "html"
+        [ xmlNode "head" []
+        , xmlNode "body" [ xmlNode "pre" [ XML.NodeContent respbody ] ]
+        ]
     return page
       { pageUrl = pageURI
       , pageHead = fakeNode "head" []
       , pageBody = makeNode "body" [pre]
+      , pageDocument = doc
       , pageScroll = 0
       }
   else if "image/" `T.isPrefixOf` contentType then do
@@ -984,10 +1008,16 @@ fetchHTTP url page = do
       _ ->
         let node = makeTextNode (T.pack $ "Error[" ++ url ++ "]: Image format not supported")
         in return (node, M.fromList [])
+    doc <- fromEmptyDocument $ domtreeFromXML $
+      xmlNode "html"
+        [ xmlNode "head" []
+        , xmlNode "body" [ xmlNode "img" [] ]
+        ]
     return page
       { pageUrl = pageURI
       , pageHead = fakeNode "head" []
       , pageBody = makeNode "body" [img]
+      , pageDocument = doc
       , pageResources = resources
       , pageScroll = 0
       }
@@ -995,6 +1025,7 @@ fetchHTTP url page = do
     error $ "TODO: Content-Type " ++ T.unpack contentType
   where
     fakeNode name nodes = XML.Element (XML.Name name Nothing Nothing) M.empty nodes
+    xmlNode name nodes = XML.NodeElement $ fakeNode name nodes
 
 fetchResource :: Page -> HTTP.Manager -> Text -> IO [(Text, HTTPResource)]
 fetchResource Page{pageUrl=pageURI, pageResources=pageRes, pageWindow=pageWin} httpman imgurl = do
@@ -2122,8 +2153,8 @@ styleFontSize st =
     Just other -> warning ("styleFontSize: not computed: " ++ show other) defaultFontSize
     Nothing -> defaultFontSize
 
-defaultFont :: Canvas.Font
-defaultFont = Canvas.Font defaultFontFace defaultFontSize False False
+--defaultFont :: Canvas.Font
+--defaultFont = Canvas.Font defaultFontFace defaultFontSize False False
 
 styleFont :: Style -> Canvas.Font
 styleFont st = Canvas.Font face size (weight == Just (CSS_Keyword "bold")) (italic == Just (CSS_Keyword "italic"))
