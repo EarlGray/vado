@@ -69,11 +69,7 @@ forJust mb f = f `fmap` mb
 
 -- | State of the page
 data Page = Page
-  { pageBody :: DOMNode
-  -- ^ the body DOM tree
-  , pageHead :: XML.Element
-  -- ^ XML source of <head></head>
-  , pageDocument :: Document
+  { pageDocument :: Document
   , pageBoxes :: Maybe BoxTree
   -- ^ Rendering tree
   , pageUrl :: URI
@@ -81,87 +77,21 @@ data Page = Page
 
   , pageWindow :: VadoWindow
   , pageScroll :: Height
-
-  , pageFocus :: NodeID
-  , pageElementStates :: ElementStates
   }
 
 emptyPage :: VadoWindow -> Page
 emptyPage window = Page
-  { pageHead = undefined
-  , pageBody = emptyNode
-  , pageDocument = emptyDocument
+  { pageDocument = emptyDocument
   , pageBoxes = Nothing
   , pageWindow = window
   , pageScroll = 0
   , pageResources = M.empty
   , pageUrl = nullURI
-  , pageFocus = noState
-  , pageElementStates = IM.empty
-  }
-
-data DOMNode = DOM
-  { domContent :: Either DOMContent [DOMNode]
-  -- ^ Either a leaf element or a list of children
-  , domStyle :: Style
-  , domEvents :: Events
-  , domAttrs :: M.Map Text Text
-  , domSource :: Maybe XML.Node
-  -- ^ Backreference to the XML source of this DOM node
-  , domState :: NodeID
   }
 
 class HasDebugView a where
   showdbg :: a -> String
 
-instance HasDebugView DOMNode where
-  showdbg dom = unlines $ [name] ++ map (replicate 2 ' ' ++) ([attrs, style] ++ lines contents)
-    where
-      xmlName (XML.NodeElement el) = T.unpack $ tagName el
-      xmlName (XML.NodeContent _) = "<text>"
-      xmlName _ = "<?>"
-
-      xmlAttrs (XML.NodeElement el) = show $ XML.elementAttributes el
-      xmlAttrs _ = "{}"
-
-      name = maybe "<anon>" xmlName (domSource dom)
-      attrs = ":attrs " ++ maybe "{}" xmlAttrs (domSource dom)
-      style = ":style " ++ showdbg (domStyle dom)
-      contents = case domContent dom of
-                  Right children -> concatMap showdbg children
-                  Left content -> show content
-
-emptyNode :: DOMNode
-emptyNode = DOM
-  { domContent = Right []
-  , domStyle = noStyle
-  , domEvents = noEvents
-  , domAttrs = M.empty
-  , domSource = Nothing
-  , domState = noState
-  }
-
-makeTextNode :: Text -> DOMNode
-makeTextNode txt = emptyNode { domContent = Left (TextContent txt) }
-
-makeNode :: Text -> [DOMNode] -> DOMNode
-makeNode tag children = emptyNode { domContent=Right children, domStyle=style, domEvents=events }
-  where
-    style = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
-    events = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
-
-withAttributes :: [(Text, Text)] -> DOMNode -> DOMNode
-withAttributes attrs node = node { domAttrs = M.fromList attrs }
-
-withNodeID :: Int -> DOMNode -> DOMNode
-withNodeID nid node = node { domState = NodeID nid }
-
-withEvent :: Text -> EventHandler -> DOMNode -> DOMNode
-withEvent eventName eventHandler node = node{ domEvents = events }
-  where
-    prependEvent = Just . maybe [eventHandler] (eventHandler:)
-    events = events0{ eventsOther = M.alter prependEvent eventName (eventsOther events0) }
-    events0 = domEvents node
 
 -- | Content of a leaf DOM node,
 -- i.e. what is to be drawn in this node.
@@ -185,17 +115,6 @@ instance Show DOMContent where
   show (ImageContent href wh) = "ImageContent " ++ T.unpack href ++ " (" ++ show wh ++ ")"
   show (InputTextContent t) = "TextInputContent \"" ++ T.unpack t ++ "\""
 
--- | DOM Node States
-newtype NodeID = NodeID Int
-  deriving (Show, Eq)
-
-type ElementStates = IM.IntMap (DOMNode, DOMNodeState)
-
-noState :: NodeID
-noState = NodeID 0
-
-data DOMNodeState
-  = InputTextState !Text
 
 --------------------------------------------------------------------------------
 -- | This is a new take on the page loading and state,
@@ -348,6 +267,17 @@ domtreeTraverse :: (Traversable t, Applicative f) => (Element -> f b) -> Documen
 domtreeTraverse = undefined
 
 
+type ElementRef = (IM.IntMap ElementID Element, ElementID)
+
+elementDeref :: ElementRef -> Element
+elementDeref (nodes, nid) = nodes ! nid
+
+elementRefID :: ElementRef -> ElementID
+elementRefID (_, nid) = nid
+
+elementChildren :: ElementRef -> [Element]
+elementChildren (nodes, nid) = undefined  -- TODO
+
 -- | This is a DOM node
 type ElementID = Int
 
@@ -410,6 +340,10 @@ emptyElement = Element
   , elementStyleAttr = noStyle
   }
 
+
+--------------------------------------------------------------------------------
+-- | Normalize an XML tree of elements and text, possibly with
+-- attributes like style and event handlers.
 
 domtreeFromXML :: Monad m => XML.Node -> DocumentT m ()
 domtreeFromXML (XML.NodeContent txt) =
@@ -474,7 +408,7 @@ domParseGeneralAttributes nid = do
   -- TODO: parse id and add globally
   -- TODO: parse style=""
   -- TODO: add builtin style and events
-  modifyElement nid $ \node -> 
+  modifyElement nid $ \node ->
     let tag = elementTag node
         style = M.lookup "style" $ elementAttrs node
     in node
@@ -482,49 +416,6 @@ domParseGeneralAttributes nid = do
       , elementStyleHTML = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
       , elementStyleAttr = maybe noStyle (cssFarcer . T.unpack) $ style
       }
-
-
---------------------------------------------------------------------------------
--- | Normalize an XML tree of elements and text, possibly with
--- attributes like style and event handlers.
-domFromXML :: XML.Node -> State (NodeID, ElementStates) (Maybe DOMNode)
-
-domFromXML xml =
-  case xml of
-    XML.NodeContent txt ->
-      return $ Just (makeTextNode txt){ domSource=Just xml }
-
-    XML.NodeElement el | tagName el == "img" ->
-      return $ forJust (lookupXMLAttribute "src" el) $ \href ->
-          let width = decodeXMLAttribute "width" el
-              height = decodeXMLAttribute "height" el
-              wh = liftM2 V2 width height
-          in emptyNode{ domContent=Left (ImageContent href wh), domSource=Just xml }
-
-    XML.NodeElement el | tagName el == "hr" ->
-      return $ Just $ emptyNode{ domContent=Left HorizLineContent, domSource=Just xml }
-
-    XML.NodeElement el -> do
-      children <- catMaybes <$> mapM domFromXML (XML.elementNodes el)
-      return $ Just $ domFromElement el children
-
-    _ -> return Nothing
-  where
-    domFromElement :: XML.Element -> [DOMNode] -> DOMNode
-    domFromElement el children =
-      let attrs = M.mapKeys XML.nameLocalName $ XML.elementAttributes el
-          attr_style = fromMaybe noStyle $ decodeXMLAttribute "style" el
-          tag = tagName el
-          builtin_style = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
-          builtin_events = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
-      in DOM
-          { domContent = Right children
-          , domStyle = attr_style `overriding` builtin_style
-          , domAttrs = attrs
-          , domEvents = builtin_events
-          , domSource = Just xml
-          , domState = noState
-          }
 
 
 --------------------------------------------------------------------------------
@@ -551,13 +442,26 @@ xmlTextName name =
     Just ns -> T.concat [ns, ":", n]
     _ -> n
 
+-- Constructing XML
+xmlNode' :: Text -> M.Map Text Text -> [XML.Node] -> XML.Node
+xmlNode' name attrs nodes = XML.NodeElement $ XML.Element (xmlTextName name) (mapKeys xmlTextName attrs) nodes
+
+xmlNode :: Text -> [XML.Node] -> XML.Node
+xmlNode name nodes = xmlNode' name [] nodes
+
+xmlText :: Text -> XML.Node
+xmlText t = XML.NodeContent t
+
+xmlHtml :: XML.Node -> XML.Node
+xmlHtml body = xmlNode "html" [ xmlNode "head" [], xmlNode "body" body ]
+
 --------------------------------------------------------------------------------
 -- | A tree of bounding boxes
 type RelPos = Point V2 Double
 
 data BoxTree = BoxTree
   { boxContent :: BoxContent
-  , boxNode :: Maybe DOMNode    -- backreference to its node
+  , boxNode :: ElementID        -- backreference to its node
   , boxDim :: V2 Double         -- outer dimensions
   , boxStyling :: (StyleDiff, StyleDiff)    -- instructions for box rendering
   , boxLines :: [BoxLine]       -- lines to be drawn after the content
@@ -578,9 +482,7 @@ instance Show BoxTree where
         BoxInline inline -> show inline
         BoxOfBlocks children -> L.intercalate "\n" $ map show children
       V2 x y = dim
-      name = case node of
-        Just DOM { domSource=(Just (XML.NodeElement el)) } -> T.unpack $ tagName el
-        _ -> "-"
+      name = "@" ++ show node
 
 data BoxContent
   = BoxInline InlineContent
@@ -756,8 +658,8 @@ vadoEventLoop page = do
     --  vadoEventLoop page
 
     KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
-      case pageFocus page of
-        NodeID 0 ->
+      --case pageFocus page of
+      --  NodeID 0 ->
           case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
             SDL.KeycodePageUp -> do
               vadoRedrawEventLoop $ vadoScroll (negate $ vadoViewHeight page) page
@@ -773,21 +675,21 @@ vadoEventLoop page = do
             _ ->
               vadoEventLoop page
 
-        NodeID focus -> do
-          let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
-          let eventHandlers = eventsKeyReleased $ domEvents node
-          let foreach page' handler = handler (SDL.keyboardEventKeysym e) node page'
-          foldM foreach page eventHandlers >>= vadoRedrawEventLoop
+        --NodeID focus -> do
+        --  let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
+        --  let eventHandlers = eventsKeyReleased $ domEvents node
+        --  let foreach page' handler = handler (SDL.keyboardEventKeysym e) node page'
+        --  foldM foreach page eventHandlers >>= vadoRedrawEventLoop
 
     TextInputEvent e ->
-      case pageFocus page of
-        NodeID 0 ->
+      --case pageFocus page of
+      --  NodeID 0 ->
           vadoEventLoop page
-        NodeID focus -> do
-          let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
-          let eventHandlers = eventsTextInput $ domEvents node
-          let foreach page' handler = handler (SDL.textInputEventText e) node page'
-          foldM foreach page eventHandlers >>= vadoRedrawEventLoop
+      --  NodeID focus -> do
+      --    let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
+      --    let eventHandlers = eventsTextInput $ domEvents node
+      --    let foreach page' handler = handler (SDL.textInputEventText e) node page'
+      --    foldM foreach page eventHandlers >>= vadoRedrawEventLoop
 
     _ -> do
       vadoEventLoop page
@@ -919,11 +821,11 @@ data HTTPResource
   = ImageResource !(V2 Double) SDL.Texture
 
 fetchURL :: String -> Page -> IO Page
-fetchURL "vado:home" Page{pageWindow=w} = return $ vadoHomePage w
-fetchURL "vado:error" Page{pageWindow=w} = return $ vadoErrorPage w "vado:error"
+fetchURL "vado:home" page = return $ vadoHomePage page
+fetchURL "vado:error" page = return $ vadoErrorPage page "vado:error"
 fetchURL url page =
     fetchHTTP url page `Exc.catch` \(e :: HttpException) ->
-      return (vadoErrorPage (pageWindow page) (T.pack $ show e))
+      return (vadoErrorPage page (T.pack $ show e))
 
 fetchHTTP :: String -> Page -> IO Page
 fetchHTTP url page = do
@@ -950,8 +852,8 @@ fetchHTTP url page = do
     let document = HTML.parseLBS body
     let root = XML.documentRoot document
     let topnodes = mapMaybe (\case XML.NodeElement el -> Just el; _ -> Nothing) $ XML.elementNodes root
-    let headnode = fromMaybe (fakeNode "head" []) $ L.find (\el -> tagName el == "head") topnodes
-    let bodynode = fromMaybe (fakeNode "body" $ XML.elementNodes root) $ L.find (\el -> tagName el == "body") topnodes
+    let headnode = fromMaybe (xmlNode "head" []) $ L.find (\el -> tagName el == "head") topnodes
+    let bodynode = fromMaybe (xmlNode "body" $ XML.elementNodes root) $ L.find (\el -> tagName el == "body") topnodes
     -- TODO: html attributes, if any
     let htmlnode = xmlNode "html" (map XML.NodeElement [headnode, bodynode])
 
@@ -966,23 +868,16 @@ fetchHTTP url page = do
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
 
-    let (Just dom, (_focused, states)) = St.runState (domFromXML (XML.NodeElement bodynode)) (NodeID 0, IM.empty)
     doc <- fromEmptyDocument $ domtreeFromXML htmlnode
     when debug $ putStrLn (showdbg dom)
     return page
       { pageUrl = pageURI
-      , pageHead = headnode
-      , pageBody = dom
       , pageDocument = doc
       , pageResources = M.fromList (concat resources) `mappend` pageResources page
       , pageScroll = 0
-      , pageFocus = NodeID 0
-      , pageElementStates = states
       }
   else if "text/" `T.isPrefixOf` contentType then do
     let respbody = T.decodeUtf8 $ B.toStrict body
-    let text = makeTextNode respbody
-    let pre = makeNode "pre" [text]
     doc <- fromEmptyDocument $ domtreeFromXML $
       xmlNode "html"
         [ xmlNode "head" []
@@ -990,12 +885,11 @@ fetchHTTP url page = do
         ]
     return page
       { pageUrl = pageURI
-      , pageHead = fakeNode "head" []
-      , pageBody = makeNode "body" [pre]
       , pageDocument = doc
       , pageScroll = 0
       }
   else if "image/" `T.isPrefixOf` contentType then do
+  {-
     let body' = B.toStrict body
     (img, resources) <- case Image.format body' of
       Just _ -> do
@@ -1008,24 +902,22 @@ fetchHTTP url page = do
       _ ->
         let node = makeTextNode (T.pack $ "Error[" ++ url ++ "]: Image format not supported")
         in return (node, M.fromList [])
+        -}
+    -- TODO: insert img into resources
     doc <- fromEmptyDocument $ domtreeFromXML $
       xmlNode "html"
         [ xmlNode "head" []
-        , xmlNode "body" [ xmlNode "img" [] ]
+        , xmlNode "body" [ xmlNode' "img" (M.fromList [("href", pageURI)]) [] ]
         ]
     return page
       { pageUrl = pageURI
-      , pageHead = fakeNode "head" []
-      , pageBody = makeNode "body" [img]
       , pageDocument = doc
       , pageResources = resources
       , pageScroll = 0
       }
   else
     error $ "TODO: Content-Type " ++ T.unpack contentType
-  where
-    fakeNode name nodes = XML.Element (XML.Name name Nothing Nothing) M.empty nodes
-    xmlNode name nodes = XML.NodeElement $ fakeNode name nodes
+
 
 fetchResource :: Page -> HTTP.Manager -> Text -> IO [(Text, HTTPResource)]
 fetchResource Page{pageUrl=pageURI, pageResources=pageRes, pageWindow=pageWin} httpman imgurl = do
@@ -1125,14 +1017,13 @@ instance CanMeasureText Canvas.Canvas where
 -- Immutable parameters for a block layuot:
 data LayoutParams = LayoutParams
   { ltWidth :: Width
-  , ltElementStates :: ElementStates
   }
 
 -- Mutable state for a block layout:
 data Layout = Layout
   { ltStyle :: Style                      -- the full CSS set for the block
   , ltStyling :: (StyleDiff, StyleDiff)   -- (css-push, css-pop) for rendering
-  , ltStack :: [DOMNode]                  -- reverse DOMNode stack
+  , ltElement :: ElementRef                 -- current element
   -- current coordinates relative to the containing block:
   , ltX :: Width
   , ltY :: Height
@@ -1170,20 +1061,32 @@ newtype LayoutOver m a
 -- | Entry point for layout procedure
 layoutPage :: Page -> IO Page
 layoutPage page@Page{..} = do
-    (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle pageBody
+    let body = undefined
+    (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle body
     when debug $ print boxes
     return page{ pageBoxes=Just boxes }
   where
     ctx = LayoutCtx { ltResources = pageResources }
-    params = LayoutParams { ltWidth = w, ltElementStates = pageElementStates }
+    params = LayoutParams { ltWidth = w }
     VadoWindow { vadoViewport = V2 w _, vadoTexture = texture } = pageWindow
 
 
 elementToBoxes :: CanMeasureText m =>
-     LayoutCtx -> LayoutParams -> Style -> DOMNode ->
+     LayoutCtx -> LayoutParams -> Style -> ElementRef ->
      m (BoxTree, LayoutCtx)
-elementToBoxes ctx params parentStyle node@DOM{ domContent=Right children } = do
-    (layout', posboxes) <- RWS.execRWST (runLayout (layoutBlock children >> layoutLineBreak)) params layout
+elementToBoxes ctx params parentStyle node = do
+    let children = elementChildren node
+    let st = domStyle node `cascadingOver` parentStyle
+    let doLayout = runLayout (layoutBlock children >> layoutLineBreak)
+    (layout', posboxes) <- RWS.execRWST doLayout params Layout
+      { ltX = 0, ltY = 0
+      , ltMaxX = 0
+      , ltLS = LS { lsBoxes = [], lsGap = True, lsWords = [], lsFont = styleFont st }
+      , ltCtx = ctx
+      , ltStyle = st
+      , ltStyling = parentStyle `styleDiff` st
+      , ltElement = node
+      }
     let box = BoxTree
          { boxContent = BoxOfBlocks posboxes
          , boxNode = Just node
@@ -1192,34 +1095,25 @@ elementToBoxes ctx params parentStyle node@DOM{ domContent=Right children } = do
          , boxLines = []
          }
     return (box, ltCtx layout')
-  where
-    st = domStyle node `cascadingOver` parentStyle
-    layout = Layout
-      { ltX = 0, ltY = 0
-      , ltMaxX = 0
-      , ltLS = LS { lsBoxes = [], lsGap = True, lsWords = [], lsFont = styleFont st }
-      , ltCtx = ctx
-      , ltStyle = st
-      , ltStyling = parentStyle `styleDiff` st
-      , ltStack = [node]
-      }
 elementToBoxes _ctx _par _st node = error $ "elementToBoxes (" ++ showdbg node ++ ")"
 
-withStyle :: CanMeasureText m => DOMNode -> LayoutOver m a -> LayoutOver m a
+withStyle :: CanMeasureText m => ElementRef -> LayoutOver m a -> LayoutOver m a
 withStyle node action = do
     parentStyle <- gets ltStyle
     parentStyling <- gets ltStyling
-    parentNode <- gets ltStack
+    parentNode <- gets ltElement
     let st = domStyle node `cascadingOver` parentStyle
     let styling = parentStyle `styleDiff` st
-    modify $ \lt -> lt{ ltStyle=st, ltStyling=styling, ltStack = node:parentNode }
+    modify $ \lt -> lt{ ltStyle=st, ltStyling=styling, ltElement = node }
     result <- action
-    modify $ \lt -> lt{ ltStyle=parentStyle, ltStyling=parentStyling, ltStack = parentNode }
+    modify $ \lt -> lt{ ltStyle=parentStyle, ltStyling=parentStyling, ltElement = parentNode }
     return result
 
-layoutBlock :: CanMeasureText m => [DOMNode] -> LayoutOver m ()
-layoutBlock children = do
-  forM_ children $ \child@DOM{ domContent=content, domStyle=st } ->
+layoutBlock :: CanMeasureText m => [ElementRef] -> LayoutOver m ()
+layoutBlock children =
+  forM_ children $ \child -> do
+    let content = elementContent $ elementDeref child
+        st = undefined  -- TODO: domStyle previously
     case (content, st `cssValue` CSSDisplay) of
       (_, CSS_Keyword "none") ->
         return ()
@@ -1235,7 +1129,7 @@ layoutBlock children = do
         let lineY = h/2
         layoutBlockBox $ BoxTree
           { boxContent = BoxInline $ TextBox "" 0
-          , boxNode = Just child
+          , boxNode = elementRefID child
           , boxDim = V2 w h
           , boxStyling = noStyling
           , boxLines = [BoxLine{boxlineStart=V2 0 lineY, boxlineEnd=V2 w lineY}]
@@ -1329,8 +1223,9 @@ layoutBlock children = do
             }
       layoutBlockBox outerBox
 
-    imgBaseline (V2 _ h) DOM{domSource=Just (XML.NodeElement el)} =
-        case lookupXMLAttribute "align" el of
+    -- TODO: use text-align from style
+    imgBaseline (V2 _ h) child =
+        case lookupXMLAttribute "align" (elementAttrs $ elementDeref child) of
           Just "top" -> noBaseline
           Just "middle" -> h/2
           Just "bottom" -> h
@@ -1392,7 +1287,7 @@ layoutInlineSpace = do
         ls' = ls{ lsWords=lsWords ls ++ [" "], lsGap = True }
     in lt{ ltX=x, ltLS=ls' })
 
-layoutInlineBox :: CanMeasureText m => V2 Double -> BaselineY -> DOMNode -> BoxContent -> [BoxLine] -> LayoutOver m ()
+layoutInlineBox :: CanMeasureText m => V2 Double -> BaselineY -> ElementRef -> BoxContent -> [BoxLine] -> LayoutOver m ()
 layoutInlineBox (V2 dx dy) baseline node content boxlines = do
   x <- gets ltX
   maxwidth <- asks ltWidth
@@ -1402,7 +1297,7 @@ layoutInlineBox (V2 dx dy) baseline node content boxlines = do
   styling <- gets ltStyling
   let box = BoxTree
         { boxContent = content
-        , boxNode = Just node
+        , boxNode = elementRefID node
         , boxDim = V2 dx dy
         , boxStyling = styling
         , boxLines = boxlines
@@ -2023,9 +1918,6 @@ css properties = Style
         concatMap expandTextDecoration vals
       other -> warning ("Unknown value for text-decoration=" ++ show other) []
 
-withCSS :: [(Text, Text)] -> DOMNode -> DOMNode
-withCSS properties node = node { domStyle = css properties `overriding` domStyle node }
-
 -- | Parses a CSSValue from text for a CSS value
 cssReadValue :: Text -> UnknownOr CSSValue
 cssReadValue txtval =
@@ -2278,53 +2170,55 @@ builtinHTMLStyles =
     color c = ("color", c)
 
 
-vadoHomePage :: VadoWindow -> Page
-vadoHomePage window = (emptyPage window)
-    { pageBody = body
-    , pageFocus = NodeID inputID
-    , pageElementStates = IM.fromList [(inputID, (input, InputTextState ""))]
+-- | Built-in vado:pages
+
+
+vadoHomePage :: Page -> Page
+vadoHomePage page = emptyPage
+    { pageDocument = doc
+    , pageWindow = pageWindow page
+    , pageUrl = "vado:home"
     }
   where
-    inputID = 1
-    input0 = (makeNode "input" []){ domContent=Left (InputTextContent "") }
-    input = withEvent "change" inputChange $ withNodeID inputID input0
-    body = withCSS [("text-align", "center"), ("white-space", "pre")] $ makeNode "body"
-      [ makeNode "h1" [makeTextNode "\n\n\nVado"]
-      , makeNode "hr" []
-      , makeTextNode "type or Ctrl-V your url:"
-      , withAttributes [("action", "vado:go"), ("method", "POST")] $ makeNode "form"
-          [ withCSS inputCSS $ makeNode "span" [withAttributes inputAttrs input]
-          , makeNode "br" []
-          , withAttributes [("type", "submit"), ("value", "I go!")] $ makeNode "input" []
+    doc = runIdentity $ fromEmptyDocument $ do
+      domtreeFromXML $ xmlHtml body
+      Just nid <- getElementById "vado"
+      -- TODO: attach a handler that goes to the page
+      modifyElement nid $ \node -> node{ elementEvents = undefined }
+    body =
+      xmlNode' "body" [("style", "text-align: center; white-space: pre")]
+        [ xmlNode "h1" [ xmlText "\n\n\nVado"]
+        , xmlNode "hr" []
+        , xmlNode' "form" [("action", "vado:go"), ("method", "POST")]
+          [ xmlNode' "input" [("type", "text"), ("name", "url"), ("id", "vado"), ("autofocus", "")] []
+          -- TODO: handle autofocus
+          , xmlNode "br" []
+          , xmlNode' "input" [("type", "submit"), ("value", "I go!")] []
           ]
-      ]
-    inputCSS = [("font-size", "18px")]
-    inputAttrs = [("type", "text"), ("name", "url")]
-    inputChange DOM{ domState=(NodeID nid) } page@Page{ pageElementStates=states } =
-      case IM.lookup nid states of
-        Just (_, InputTextState url) ->
-          fetchURL (T.unpack url) page >>= layoutPage
-        _ -> return page
+        ]
 
-vadoWaitPage :: VadoWindow -> Page
-vadoWaitPage window = (emptyPage window){ pageBody = body }
+vadoErrorPage :: Text -> Page -> Page
+vadoErrorPage err page = emptyPage
+    { pageDocument = runIdentity $ fromEmptyDocument $ domtreeFromXML $ xmlHtml body
+    , pageWindow = pageWindow page
+    , pageUrl = "vado:error"
+    }
   where
-    body = withCSS [("text-align", "center")] $ makeNode "body"
-      [ withCSS [("white-space", "pre")
-                ,("font-size", "48px")
-        ] $ makeNode "h1" [makeTextNode "\n\nloading..."]
-      ]
+    body = xmlNode "body"
+          [ xmlNode' "h1" [("style",  "text-align: center; color: red; white-space: pre; font-size: 72px")]
+              [ xmlText "\noops"]
+          , xmlNode "pre" [ xmlText err ]
+          ]
 
-vadoErrorPage :: VadoWindow -> Text -> Page
-vadoErrorPage window err = (emptyPage window){ pageBody = body }
+vadoWaitPage :: Page -> Page
+vadoWaitPage page = emptyPage
+    { pageDocument = runIdentity $ fromEmptyDocument $ domtreeFromXML html
+    , pageWindow = pageWindow page
+    , pageUrl = "vado:error"
+    }
   where
-    body = withCSS [] $ makeNode "body"
-      [ withCSS [("text-align", "center")
-                ,("font-weight", "bold")
-                ,("white-space", "pre")
-                ,("color", "red")
-                ,("font-family", "FreeSerif")
-                ,("font-size", "72px")
-        ] $ makeNode "h1" [makeTextNode "\noops"]
-      , makeNode "pre" [makeTextNode err]
-      ]
+    body = xmlNode' "body" [("style", "text-align: center")]
+          [ xmlNode' "h1" [("style",  "white-space: pre; font-size: 48px")]
+              [ xmlText "\n\nloading..."]
+          , xmlNode "pre" [ xmlText err ]
+          ]
