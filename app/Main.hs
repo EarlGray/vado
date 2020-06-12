@@ -8,6 +8,7 @@
 import           Control.Applicative
 import qualified Control.Exception as Exc
 import           Control.Monad
+import qualified Control.Monad.Identity as MId
 import           Control.Monad.RWS.Strict as RWS
 import           Control.Monad.State (State, StateT(..))
 import qualified Control.Monad.State as St
@@ -63,6 +64,9 @@ whenJust = forM_
 
 forJust :: Maybe a -> (a -> b) -> Maybe b
 forJust mb f = f `fmap` mb
+
+mbHead :: [a] -> Maybe a
+mbHead = listToMaybe
 
 --------------------------------------------------------------------------------
 -- page, DOM and resources
@@ -140,6 +144,8 @@ data Document = Document
   , documentNewID :: ElementID
   , documentBuildState :: [ElementID]     -- current open elements during adding
 
+  , documentHead :: ElementID
+  , documentBody :: ElementID
   -- , documentContentType :: ContentType
   -- , documentTitle :: Text
   -- , documentElementsByClass :: M.Map Text [ElementID]
@@ -158,7 +164,16 @@ inDocument :: Monad m => Document -> DocumentT m a -> m a
 inDocument doc f = St.evalStateT f doc
 
 fromEmptyDocument :: Monad m => DocumentT m a -> m Document
-fromEmptyDocument f = St.execStateT f emptyDocument
+fromEmptyDocument f = runDocument emptyDocument f
+
+runDocument :: Monad m => Document -> DocumentT m a -> m Document
+runDocument doc f = St.execStateT f doc
+
+runPageDocument :: Monad m => Page -> DocumentT m a -> m Page
+runPageDocument page f = do
+  doc' <- runDocument (pageDocument page) f
+  return page{ pageDocument = doc' }
+
 
 takeNewID :: Monad m => DocumentT m ElementID
 takeNewID = do
@@ -172,6 +187,13 @@ getElement nid = do
   case IM.lookup nid nodes of
     Just node -> return node
     Nothing -> error $ "nodeID not found: " ++ show nid
+
+-- TODO: ElementID/Element, Id/ElementID confusion
+-- TODO: populate and use the `documentElementById` cache
+getElementById :: Monad m => Text -> DocumentT m (Maybe ElementID)
+getElementById eid = do
+  nodes <- IM.toList <$> gets documentAllNodes
+  return $ fmap fst $ L.find (\(_, elt) -> M.lookup "id" (elementAttrs elt) == Just eid) nodes
 
 getChildren :: Monad m => ElementID -> DocumentT m [Element]
 getChildren pid = do
@@ -266,17 +288,24 @@ domtreeEndElement = do
 domtreeTraverse :: (Traversable t, Applicative f) => (Element -> f b) -> Document -> f (t b)
 domtreeTraverse = undefined
 
+-- | Request a redraw for a node
+documentRedraw :: Monad m => ElementID -> DocumentT m ()
+documentRedraw nid = undefined
 
-type ElementRef = (IM.IntMap ElementID Element, ElementID)
+
+type ElementRef = (IM.IntMap Element, ElementID)
+
+elementRef :: Document -> ElementID -> ElementRef
+elementRef doc nid = (documentAllNodes doc, nid)
 
 elementDeref :: ElementRef -> Element
-elementDeref (nodes, nid) = nodes ! nid
+elementDeref (nodes, nid) = nodes IM.! nid
 
 elementRefID :: ElementRef -> ElementID
 elementRefID (_, nid) = nid
 
-elementChildren :: ElementRef -> [Element]
-elementChildren (nodes, nid) = undefined  -- TODO
+elementChildren :: ElementRef -> [ElementRef]
+elementChildren (nodes, nid) = undefined
 
 -- | This is a DOM node
 type ElementID = Int
@@ -288,9 +317,6 @@ noElement =   0
 
 htmlElement :: ElementID
 htmlElement = 1
-
---headElement = 2 :: ElementID
---bodyElement = 3 :: ElementID
 
 -- external collections:
 data ZipperList a = ZipperList
@@ -322,9 +348,10 @@ data Element = Element
   , elementTag :: Text
   , elementAttrs :: M.Map Text Text
 
-  , elementEvents :: Events
   , elementStyleHTML :: Style       -- builtin HTML styling
   , elementStyleAttr :: Style       -- style="..."
+
+  , elementEvents :: Events
   }
   deriving (Show)
 
@@ -404,10 +431,14 @@ domAppendContent mbTagAttrs content = do
 
 domParseGeneralAttributes :: Monad m => ElementID -> DocumentT m ()
 domParseGeneralAttributes nid = do
+  node <- getElement nid
+  case elementTag node of
+    "head" -> modify $ \doc -> doc{ documentHead = nid }
+    "body" -> modify $ \doc -> doc{ documentBody = nid }
+    _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
   -- TODO: parse style=""
-  -- TODO: add builtin style and events
   modifyElement nid $ \node ->
     let tag = elementTag node
         style = M.lookup "style" $ elementAttrs node
@@ -417,6 +448,12 @@ domParseGeneralAttributes nid = do
       , elementStyleAttr = maybe noStyle (cssFarcer . T.unpack) $ style
       }
 
+-- elementOwnStyle is useful for computing own style,
+-- do not use for any inheritable properties.
+-- Do not cascade it over a parent style, use cascadeStyle.
+elementOwnStyle :: ElementRef -> Style
+elementOwnStyle elt = elementStyleAttr el `cascadingOver` elementStyleHTML el
+  where el = elementDeref elt
 
 --------------------------------------------------------------------------------
 -- XML Utilities
@@ -443,8 +480,17 @@ xmlTextName name =
     _ -> n
 
 -- Constructing XML
-xmlNode' :: Text -> M.Map Text Text -> [XML.Node] -> XML.Node
-xmlNode' name attrs nodes = XML.NodeElement $ XML.Element (xmlTextName name) (mapKeys xmlTextName attrs) nodes
+xmlElement' :: Text -> [(Text, Text)] -> [XML.Node] -> XML.Element
+xmlElement' name attrs nodes = XML.Element name' attrs' nodes
+  where
+    name' = XML.Name name Nothing Nothing
+    attrs' = M.mapKeys (\a -> XML.Name a Nothing Nothing) $ M.fromList attrs
+
+xmlNode' :: Text -> [(Text, Text)] -> [XML.Node] -> XML.Node
+xmlNode' name attrs nodes = XML.NodeElement $ xmlElement' name attrs nodes
+
+xmlElement :: Text -> [XML.Node] -> XML.Element
+xmlElement name nodes = xmlElement' name [] nodes
 
 xmlNode :: Text -> [XML.Node] -> XML.Node
 xmlNode name nodes = xmlNode' name [] nodes
@@ -453,7 +499,7 @@ xmlText :: Text -> XML.Node
 xmlText t = XML.NodeContent t
 
 xmlHtml :: XML.Node -> XML.Node
-xmlHtml body = xmlNode "html" [ xmlNode "head" [], xmlNode "body" body ]
+xmlHtml body = xmlNode "html" [ xmlNode "head" [], body ]
 
 --------------------------------------------------------------------------------
 -- | A tree of bounding boxes
@@ -508,6 +554,7 @@ instance Show InlineContent where
   show (InputTextBox (V2 w h) _textX _baseline txt) =
     concat ["TextInputContent ", show w, "x", show h, ": ", T.unpack txt]
 
+-- return the stack of ancestor boxes, from bottom to top
 findInBox :: Point V2 Double -> BoxTree -> [BoxTree]
 findInBox (P xy) box0 = go [] xy box0
   where
@@ -559,7 +606,7 @@ data BoxLine = BoxLine
 main :: IO ()
 main = do
   window <- vadoWindow
-  page0 <- layoutPage $ vadoWaitPage window
+  page0 <- layoutPage $ vadoWaitPage $ emptyPage window
   renderDOM page0
 
   args <- Env.getArgs
@@ -617,7 +664,7 @@ vadoWindow = do
 
 -- | Event loop.
 vadoEventLoop :: Page -> IO ()
-vadoEventLoop page = do
+vadoEventLoop page@Page{pageDocument = doc} = do
   event <- waitEvent
   case eventPayload event of
     QuitEvent ->
@@ -641,12 +688,11 @@ vadoEventLoop page = do
         Just boxes -> do
           let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
           let stack = P pagepos `findInBox` boxes
-          case boxNode =<< listToMaybe stack of
-            Just node -> do
-              let eventHandlers = eventsMouseReleased $ domEvents node
-              let foreach page' handler = handler pagepos node page'
-              foldM foreach page eventHandlers
-            Nothing -> return page
+          case boxNode <$> mbHead stack of
+            Just nid ->
+              runPageDocument page $ dispatchMouseEvent pagepos nid
+            Nothing ->
+              return $ warning "click event without a box" page
         _ -> return page
       vadoRedrawEventLoop page'
 
@@ -666,7 +712,7 @@ vadoEventLoop page = do
             SDL.KeycodePageDown -> do
               vadoRedrawEventLoop $ vadoScroll (vadoViewHeight page) page
             SDL.KeycodeHome ->
-              if keyAltPressed (SDL.keysymModifier $ SDL.keyboardEventKeysym e)
+              if isKeyAltPressed (SDL.keysymModifier $ SDL.keyboardEventKeysym e)
               then fetchURL "vado:home" page >>= layoutPage >>= vadoRedrawEventLoop
               else vadoRedrawEventLoop $ vadoScroll (negate $ pageScroll page) page
             SDL.KeycodeEnd ->
@@ -707,7 +753,8 @@ vadoViewHeight page = h
 
 
 -- | A set of events that an element may handle.
-type EventHandler = DOMNode -> Page -> IO Page
+type DocumentIO a = DocumentT IO a
+type EventHandler = ElementID -> Page -> IO Page
 
 -- TODO: refactor to a map + an enum of known enum names
 data Events = Events
@@ -728,10 +775,15 @@ noEvents = Events
   , eventsOther = M.empty
   }
 
+-- TODO: button, modifiers, clientX/clientY
+dispatchMouseEvent :: V2 Double -> ElementID -> DocumentIO ()
+dispatchMouseEvent (V2 pageX pageY) nid = do
+  undefined
+
 builtinHTMLEvents :: HM.HashMap Text Events
 builtinHTMLEvents = HM.fromList
   [ ("a", noEvents
-      { eventsMouseReleased = [\_ node page -> clickLink node page]
+      { eventsMouseReleased = [\_ node -> clickLink node]
       })
   , ("input", noEvents
       { eventsKeyReleased = [input_onKeyReleased]
@@ -739,18 +791,17 @@ builtinHTMLEvents = HM.fromList
       })
   ]
 
-clickLink :: DOMNode -> Page -> IO Page
-clickLink DOM{ domSource=Just (XML.NodeElement el) } page =
-  case lookupXMLAttribute "href" el of
-    Nothing -> return page
-    Just href -> do
-      let waitpage = vadoWaitPage (pageWindow page)
-      layoutPage waitpage >>= renderDOM
-      page' <- fetchURL (T.unpack href) page `Exc.catch` \(e :: HttpException) ->
-        putStr "Vado error: " >> print e >> return page
-      layoutPage page'
-clickLink node page =
-  return $ warning ("clickLink: could not find address for: " ++ showdbg node) page
+clickLink :: EventHandler
+clickLink nid page = runPageDocument page $ do
+  node <- getElement nid
+  whenJust (M.lookup "href" $ elementAttrs node) $ \href -> lift $ do
+    let waitpage = vadoWaitPage page
+    layoutPage waitpage >>= renderDOM
+    page' <- fetchURL (T.unpack href) page
+    void $ layoutPage page'
+
+clickLink nid page =
+  return $ warning ("clickLink: could not find address for: " ++ show nid) page
 
 
 noKeyModifiers :: SDL.KeyModifier
@@ -768,51 +819,53 @@ noKeyModifiers = SDL.KeyModifier
   , SDL.keyModifierAltGr = False
   }
 
-keyCtrlPressed :: SDL.KeyModifier -> Bool
-keyCtrlPressed mods =
+isKeyCtrlPressed :: SDL.KeyModifier -> Bool
+isKeyCtrlPressed mods =
   (SDL.keyModifierLeftCtrl mods || SDL.keyModifierRightCtrl mods) &&
   (mods{ SDL.keyModifierLeftCtrl=False, SDL.keyModifierRightCtrl=False } == noKeyModifiers)
 
-keyAltPressed :: SDL.KeyModifier -> Bool
-keyAltPressed mods =
+isKeyAltPressed :: SDL.KeyModifier -> Bool
+isKeyAltPressed mods =
   (SDL.keyModifierLeftAlt mods || SDL.keyModifierRightAlt mods) &&
   (mods{ SDL.keyModifierLeftAlt=False, SDL.keyModifierRightAlt=False } == noKeyModifiers)
 
-input_modify :: NodeID -> Page -> (Text -> Text) -> IO Page
-input_modify (NodeID nid) page@Page{ pageElementStates=states0 } action =
-  case IM.lookup nid states0 of
-    Nothing ->
-      return $ warning ("NodeID=" ++ show nid ++ " not found") page
-    Just (noderef, InputTextState txt0) -> do
-      let txt = action txt0
-          states = IM.insert nid (noderef, InputTextState txt) states0
-      -- putStrLn $ "Input: " ++ T.unpack txt
-      layoutPage $ page{ pageElementStates = states }
+
+--- Text input events
+
+modify_input :: (Text -> Text) -> Element -> Element
+modify_input f node =
+  case elementContent node of
+    Left (InputTextContent txt) -> node{ elementContent = Left $ InputTextContent $ f txt }
+    _ -> warning ("an input event not on a text input: " ++ show node) node
 
 input_onKeyReleased :: SDL.Keysym -> EventHandler
-input_onKeyReleased keysym node@DOM{ domState=nid, domEvents=events } page =
+input_onKeyReleased keysym nid page = runPageDocument page $ do
   case SDL.keysymKeycode keysym of
     SDL.KeycodeBackspace ->
-      input_modify nid page (\case "" -> ""; t -> T.init t)
+      modifyElement nid $ modify_input (\case "" -> ""; t -> T.init t)
     SDL.KeycodeReturn ->
       -- TODO: find a parent form, use its submit action
+      undefined
+      {-
       case M.lookup "change" (eventsOther events) of
         Just handlers -> do
           let foreach page' handler = handler node page'
           foldM foreach page handlers
         Nothing ->
           return page
+          -}
     -- TODO: Mac (GUI) keyboard layout support:
-    SDL.KeycodeV | keyCtrlPressed (SDL.keysymModifier keysym) -> do
-      clipboard <- SDL.getClipboardText
-      input_modify nid page (const clipboard)
+    SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
+      clipboard <- lift $ SDL.getClipboardText
+      modifyElement nid $ modify_input (const clipboard)
     _ -> do
-      putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
-      return page
+      lift $ putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
+  documentRedraw nid
 
 input_onTextInput :: Text -> EventHandler
-input_onTextInput t DOM{ domState=nid } page =
-  input_modify nid page $ \txt -> T.append txt t
+input_onTextInput input nid page = runPageDocument page $ do
+  modifyElement nid $ modify_input (\txt -> T.append txt input)
+  documentRedraw nid
 
 --------------------------------------------------------------------------------
 -- HTTP request, caches and local storage
@@ -822,10 +875,10 @@ data HTTPResource
 
 fetchURL :: String -> Page -> IO Page
 fetchURL "vado:home" page = return $ vadoHomePage page
-fetchURL "vado:error" page = return $ vadoErrorPage page "vado:error"
+fetchURL "vado:error" page = return $ vadoErrorPage "vado:error" page
 fetchURL url page =
-    fetchHTTP url page `Exc.catch` \(e :: HttpException) ->
-      return (vadoErrorPage page (T.pack $ show e))
+    fetchHTTP url page `Exc.catch`
+      \(e :: HttpException) -> return (vadoErrorPage (T.pack $ show e) page)
 
 fetchHTTP :: String -> Page -> IO Page
 fetchHTTP url page = do
@@ -851,11 +904,12 @@ fetchHTTP url page = do
   if "text/html" `T.isPrefixOf` contentType then do
     let document = HTML.parseLBS body
     let root = XML.documentRoot document
-    let topnodes = mapMaybe (\case XML.NodeElement el -> Just el; _ -> Nothing) $ XML.elementNodes root
-    let headnode = fromMaybe (xmlNode "head" []) $ L.find (\el -> tagName el == "head") topnodes
-    let bodynode = fromMaybe (xmlNode "body" $ XML.elementNodes root) $ L.find (\el -> tagName el == "body") topnodes
     -- TODO: html attributes, if any
-    let htmlnode = xmlNode "html" (map XML.NodeElement [headnode, bodynode])
+    let htmlnode =
+          let topnodes = mapMaybe (\case XML.NodeElement el -> Just el; _ -> Nothing) $ XML.elementNodes root
+              headnode = fromMaybe (xmlElement "head" []) $ L.find (\el -> tagName el == "head") topnodes
+              bodynode = fromMaybe (xmlElement "body" $ XML.elementNodes root) $ L.find (\el -> tagName el == "body") topnodes
+          in xmlNode "html" [XML.NodeElement headnode, XML.NodeElement bodynode]
 
     let images_axis = (XML.fromDocument document $| XML.descendant &/ XML.element "img")
     let imageurls = mapMaybe (\cursor -> let XML.NodeElement el = XML.node cursor in lookupXMLAttribute "src" el) images_axis
@@ -869,7 +923,6 @@ fetchHTTP url page = do
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
 
     doc <- fromEmptyDocument $ domtreeFromXML htmlnode
-    when debug $ putStrLn (showdbg dom)
     return page
       { pageUrl = pageURI
       , pageDocument = doc
@@ -907,12 +960,12 @@ fetchHTTP url page = do
     doc <- fromEmptyDocument $ domtreeFromXML $
       xmlNode "html"
         [ xmlNode "head" []
-        , xmlNode "body" [ xmlNode' "img" (M.fromList [("href", pageURI)]) [] ]
+        , xmlNode "body" [ xmlNode' "img" [("href", T.pack $ show pageURI)] [] ]
         ]
     return page
       { pageUrl = pageURI
       , pageDocument = doc
-      , pageResources = resources
+      , pageResources = undefined
       , pageScroll = 0
       }
   else
@@ -1023,7 +1076,7 @@ data LayoutParams = LayoutParams
 data Layout = Layout
   { ltStyle :: Style                      -- the full CSS set for the block
   , ltStyling :: (StyleDiff, StyleDiff)   -- (css-push, css-pop) for rendering
-  , ltElement :: ElementRef                 -- current element
+  , ltElement :: ElementID                 -- current element
   -- current coordinates relative to the containing block:
   , ltX :: Width
   , ltY :: Height
@@ -1061,7 +1114,7 @@ newtype LayoutOver m a
 -- | Entry point for layout procedure
 layoutPage :: Page -> IO Page
 layoutPage page@Page{..} = do
-    let body = undefined
+    let body = elementRef pageDocument (documentBody pageDocument)
     (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle body
     when debug $ print boxes
     return page{ pageBoxes=Just boxes }
@@ -1076,7 +1129,7 @@ elementToBoxes :: CanMeasureText m =>
      m (BoxTree, LayoutCtx)
 elementToBoxes ctx params parentStyle node = do
     let children = elementChildren node
-    let st = domStyle node `cascadingOver` parentStyle
+    let st = (elementDeref node) `cascadeStyle` parentStyle
     let doLayout = runLayout (layoutBlock children >> layoutLineBreak)
     (layout', posboxes) <- RWS.execRWST doLayout params Layout
       { ltX = 0, ltY = 0
@@ -1085,35 +1138,35 @@ elementToBoxes ctx params parentStyle node = do
       , ltCtx = ctx
       , ltStyle = st
       , ltStyling = parentStyle `styleDiff` st
-      , ltElement = node
+      , ltElement = elementRefID node
       }
     let box = BoxTree
          { boxContent = BoxOfBlocks posboxes
-         , boxNode = Just node
+         , boxNode = elementRefID node
          , boxDim = V2 (ltMaxX layout') (ltY layout')
          , boxStyling = ltStyling layout'
          , boxLines = []
          }
     return (box, ltCtx layout')
-elementToBoxes _ctx _par _st node = error $ "elementToBoxes (" ++ showdbg node ++ ")"
+elementToBoxes _ctx _par _st node = error $ "elementToBoxes (" ++ show node ++ ")"
 
 withStyle :: CanMeasureText m => ElementRef -> LayoutOver m a -> LayoutOver m a
 withStyle node action = do
     parentStyle <- gets ltStyle
     parentStyling <- gets ltStyling
     parentNode <- gets ltElement
-    let st = domStyle node `cascadingOver` parentStyle
+    let st = (elementDeref node) `cascadeStyle` parentStyle
     let styling = parentStyle `styleDiff` st
-    modify $ \lt -> lt{ ltStyle=st, ltStyling=styling, ltElement = node }
+    modify $ \lt -> lt{ ltStyle=st, ltStyling=styling, ltElement = elementRefID node }
     result <- action
     modify $ \lt -> lt{ ltStyle=parentStyle, ltStyling=parentStyling, ltElement = parentNode }
     return result
 
 layoutBlock :: CanMeasureText m => [ElementRef] -> LayoutOver m ()
-layoutBlock children =
-  forM_ children $ \child -> do
-    let content = elementContent $ elementDeref child
-        st = undefined  -- TODO: domStyle previously
+layoutBlock elts =
+  forM_ elts $ \elt -> do
+    let st = elementOwnStyle elt
+        content = elementContent (elementDeref elt)
     case (content, st `cssValue` CSSDisplay) of
       (_, CSS_Keyword "none") ->
         return ()
@@ -1129,7 +1182,7 @@ layoutBlock children =
         let lineY = h/2
         layoutBlockBox $ BoxTree
           { boxContent = BoxInline $ TextBox "" 0
-          , boxNode = elementRefID child
+          , boxNode = elementRefID elt
           , boxDim = V2 w h
           , boxStyling = noStyling
           , boxLines = [BoxLine{boxlineStart=V2 0 lineY, boxlineEnd=V2 w lineY}]
@@ -1148,7 +1201,7 @@ layoutBlock children =
               , BoxLine{boxlineStart=V2 0 h, boxlineEnd=V2 w h}
               , BoxLine{boxlineStart=V2 w 0, boxlineEnd=V2 w h}
               ]
-        layoutInlineBox (V2 w h) baseline child box boxlines
+        layoutInlineBox (V2 w h) baseline elt box boxlines
 
       (Left (ImageContent href mbSize), _) -> do
         -- TODO: block <img>
@@ -1156,15 +1209,15 @@ layoutBlock children =
         let mbResSize = forJust (M.lookup href resources) $ \(ImageResource wh _) -> wh
         case mbSize <|> mbResSize of
           Just wh -> do
-            let baseline = imgBaseline wh child
-            layoutInlineBox wh baseline child (BoxInline $ ImageBox wh href) []
+            let baseline = imgBaseline wh elt
+            layoutInlineBox wh baseline elt (BoxInline $ ImageBox wh href) []
           _ -> return ()
 
-      (Right children', CSS_Keyword "inline") ->
-        withStyle child $ layoutBlock children'
+      (Right fid, CSS_Keyword "inline") -> do
+        withStyle elt $ layoutBlock $ elementChildren (fst elt, fid)
 
       (Right _, CSS_Keyword "list-item") ->
-        layoutListItem child
+        layoutListItem elt
 
       (Right _, display) -> do
         when (display /= CSS_Keyword "block") $
@@ -1173,7 +1226,7 @@ layoutBlock children =
         layoutLineBreak
         -- start a new containing block:
         params <- ask
-        box <- sublayout child params
+        box <- sublayout elt params
         layoutBlockBox box
 
       -- (_, display) -> error $ concat ["layoutBlock: display=", show display, ", child=", showdbg child]
@@ -1225,7 +1278,7 @@ layoutBlock children =
 
     -- TODO: use text-align from style
     imgBaseline (V2 _ h) child =
-        case lookupXMLAttribute "align" (elementAttrs $ elementDeref child) of
+        case M.lookup "align" (elementAttrs $ elementDeref child) of
           Just "top" -> noBaseline
           Just "middle" -> h/2
           Just "bottom" -> h
@@ -1343,7 +1396,7 @@ layoutInlineClose = do
     -- emit the inline box
     let box = BoxTree
           { boxContent = BoxInline (TextBox (T.pack txt') baseline)
-          , boxNode = listToMaybe $ ltStack lt
+          , boxNode = ltElement lt
           , boxDim = V2 w h
           , boxStyling = ltStyling lt
           , boxLines = boxlines
@@ -1402,7 +1455,7 @@ layoutLineBreak = do
     -- emit the line box:
     layoutBlockBox $ BoxTree
           { boxContent = BoxOfBlocks posboxes
-          , boxNode = Nothing
+          , boxNode = noElement
           , boxDim = V2 width height
           , boxStyling = noStyling
           , boxLines = []
@@ -1771,13 +1824,18 @@ mergeCSSFontValues font1 font2 = CSSFontValue
     , cssfontFamily = cssfontFamily font1 <|> cssfontFamily font2
     }
 
+-- | Given a node and a parent style, compute cascaded node style
+cascadeStyle :: Element -> Style -> Style
+cascadeStyle elt parentStyle = attrStyle `cascadingOver` parentStyle `cascadingOver` builtinStyle
+  where
+    attrStyle = elementStyleAttr elt
+    builtinStyle = elementStyleHTML elt
 
 -- | Augment/override/merge new CSS style with base style.
 -- The new style inherits/merges parent's properties, unless overriden.
 -- Some values are computed based on parent values (see `cascadingValue`).
 cascadingOver :: Style -> Style -> Style
-cascadingOver style parent =
-  style { styleInherit = inheritable `merge` styleInherit parent }
+cascadingOver style parent = style { styleInherit = inheritable `merge` styleInherit parent }
   where
     inheritable = case M.lookup CSSDisplay (styleOwn style) of
                 Just (CSS_Keyword "inline") -> M.delete CSSTextAlign (styleInherit style)
@@ -2174,13 +2232,13 @@ builtinHTMLStyles =
 
 
 vadoHomePage :: Page -> Page
-vadoHomePage page = emptyPage
+vadoHomePage page = (emptyPage $ pageWindow page)
     { pageDocument = doc
     , pageWindow = pageWindow page
-    , pageUrl = "vado:home"
+    , pageUrl = nullURI
     }
   where
-    doc = runIdentity $ fromEmptyDocument $ do
+    doc = MId.runIdentity $ fromEmptyDocument $ do
       domtreeFromXML $ xmlHtml body
       Just nid <- getElementById "vado"
       -- TODO: attach a handler that goes to the page
@@ -2198,10 +2256,9 @@ vadoHomePage page = emptyPage
         ]
 
 vadoErrorPage :: Text -> Page -> Page
-vadoErrorPage err page = emptyPage
-    { pageDocument = runIdentity $ fromEmptyDocument $ domtreeFromXML $ xmlHtml body
-    , pageWindow = pageWindow page
-    , pageUrl = "vado:error"
+vadoErrorPage err page = (emptyPage $ pageWindow page)
+    { pageDocument = MId.runIdentity $ fromEmptyDocument $ domtreeFromXML $ xmlHtml body
+    , pageUrl = nullURI
     }
   where
     body = xmlNode "body"
@@ -2211,14 +2268,12 @@ vadoErrorPage err page = emptyPage
           ]
 
 vadoWaitPage :: Page -> Page
-vadoWaitPage page = emptyPage
-    { pageDocument = runIdentity $ fromEmptyDocument $ domtreeFromXML html
-    , pageWindow = pageWindow page
-    , pageUrl = "vado:error"
+vadoWaitPage page = (emptyPage $ pageWindow page)
+    { pageDocument = MId.runIdentity $ fromEmptyDocument $ domtreeFromXML $ xmlHtml body
+    , pageUrl = nullURI
     }
   where
     body = xmlNode' "body" [("style", "text-align: center")]
           [ xmlNode' "h1" [("style",  "white-space: pre; font-size: 48px")]
               [ xmlText "\n\nloading..."]
-          , xmlNode "pre" [ xmlText err ]
           ]
