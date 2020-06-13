@@ -152,12 +152,13 @@ data Document = Document
 
   , documentHead :: ElementID
   , documentBody :: ElementID
+  , documentFocus :: ElementID      -- the keyboard focus
   -- , documentContentType :: ContentType
+  -- , documentMeta :: M.Map Text Text
   -- , documentTitle :: Text
   -- , documentElementsByClass :: M.Map Text [ElementID]
   -- , documentElementById :: M.Map Text ElementID
 
-  -- , documentFocus :: ElementID
   } deriving (Show)
 
 emptyDocument :: Document
@@ -167,13 +168,15 @@ emptyDocument = Document
   , documentBuildState = []
   , documentHead = noElement
   , documentBody = noElement
+  , documentFocus = noElement
   }
 
 instance HasDebugView Document where
   showdbg doc = unlines $
-      [ "documentHead = " ++ show (documentHead doc)
-      , "documentBody = " ++ show (documentBody doc)
-      , "documentNewID = " ++ show (documentNewID doc)
+      [ "documentHead = @" ++ show (documentHead doc)
+      , "documentBody = @" ++ show (documentBody doc)
+      , "documentNewID = @" ++ show (documentNewID doc)
+      , "documentFocus = @" ++ show (documentFocus doc)
       ] ++ shownode (elementRef doc htmlElement)
     where
       shownode :: ElementRef -> [String]
@@ -332,7 +335,7 @@ domtreeTraverse = undefined
 
 -- | Request a redraw for a node
 documentRedraw :: Monad m => ElementID -> DocumentT m ()
-documentRedraw = undefined
+documentRedraw _nid = return $ warning "TODO: documentRedraw" ()
 
 
 -- ElementRef should not live longer that the current version of the IntMap storage.
@@ -425,7 +428,7 @@ htmlDOMFromXML = \case
         domStartHTMLElement tagattrs
         forM_ (XML.elementNodes el) $ \child ->
           htmlDOMFromXML child
-        void $ domtreeEndElement
+        domEndHTMLElement
 
   XML.NodeContent txt ->
     void $ domtreeAppendChild Nothing (TextContent txt)
@@ -473,13 +476,23 @@ domAppendHTMLContent mbTagAttrs content = do
     nid <- domtreeAppendChild mbTagAttrs content
     domParseHTMLAttributes nid
 
+domEndHTMLElement :: Monad m => DocumentT m ()
+domEndHTMLElement = do
+  nid <- gets documentBuildState
+  node <- getElement (head nid)
+  void $ domtreeEndElement
+  case elementTag node of
+    "title" -> return ()    -- TODO: add documentTitle
+    "style" -> return ()    -- TODO: parse it or request the resource
+    _ -> return ()
+
 domParseHTMLAttributes :: Monad m => ElementID -> DocumentT m ()
 domParseHTMLAttributes nid = do
   node <- getElement nid
   let tag = elementTag node
   case elementTag node of
     "head" -> modify $ \doc -> doc{ documentHead = nid }
-    "body" -> modify $ \doc -> doc{ documentBody = nid }
+    "body" -> modify $ \doc -> doc{ documentBody = nid, documentFocus = nid }
     _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
@@ -490,6 +503,8 @@ domParseHTMLAttributes nid = do
       , elementStyleHTML = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
       , elementStyleAttr = maybe noStyle (cssFarcer . T.unpack) $ style
       }
+  whenJust (M.lookup "autofocus" $ elementAttrs node) $ \_ ->
+    modify $ \doc -> doc{ documentFocus = nid }
 
 -- elementOwnStyle is useful for computing own style,
 -- Do not cascade it over a parent style, use cascadeStyle.
@@ -578,7 +593,7 @@ data InlineContent
   = TextBox !Text !BaselineY
   | ImageBox (V2 Double) Text
   -- ^  an image of size (V2 Double) and source.
-  | InputTextBox (V2 Double) OffsetX BaselineY Text
+  | InputTextBox (V2 Double) OffsetX BaselineY ElementID
   -- ^ a text input with some text at OffsetX
 
 instance Show InlineContent where
@@ -586,8 +601,8 @@ instance Show InlineContent where
     "TextBox " ++ show t ++ " (baseline " ++ show baseline ++ ")"
   show (ImageBox (V2 w h) href) =
     concat ["ImageBox ", show w, "x", show h, " " ++ T.unpack href]
-  show (InputTextBox (V2 w h) _textX _baseline txt) =
-    concat ["TextInputContent ", show w, "x", show h, ": ", T.unpack txt]
+  show (InputTextBox (V2 w h) _textX _baseline nid) =
+    concat ["TextInputContent ", show w, "x", show h, ": @", show nid]
 
 -- return the stack of ancestor boxes, from bottom to top
 findInBox :: Point V2 Double -> BoxTree -> [BoxTree]
@@ -739,38 +754,13 @@ vadoEventLoop page = do
     --  vadoEventLoop page
 
     KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
-      --case pageFocus page of
-      --  NodeID 0 ->
-          case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
-            SDL.KeycodePageUp -> do
-              vadoRedrawEventLoop $ vadoScroll (negate $ vadoViewHeight page) page
-            SDL.KeycodePageDown -> do
-              vadoRedrawEventLoop $ vadoScroll (vadoViewHeight page) page
-            SDL.KeycodeHome ->
-              if isKeyAltPressed (SDL.keysymModifier $ SDL.keyboardEventKeysym e)
-              then fetchURL "vado:home" page >>= layoutPage >>= vadoRedrawEventLoop
-              else vadoRedrawEventLoop $ vadoScroll (negate $ pageScroll page) page
-            SDL.KeycodeEnd ->
-              let pageH = maybe 0 boxHeight $ pageBoxes page
-              in vadoRedrawEventLoop $ vadoScroll pageH page
-            _ ->
-              vadoEventLoop page
+      let focused = documentFocus $ pageDocument page
+      in dispatchEvent focused event page >>= vadoRedrawEventLoop
 
-        --NodeID focus -> do
-        --  let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
-        --  let eventHandlers = eventsKeyReleased $ domEvents node
-        --  let foreach page' handler = handler (SDL.keyboardEventKeysym e) node page'
-        --  foldM foreach page eventHandlers >>= vadoRedrawEventLoop
-
-    TextInputEvent e ->
-      --case pageFocus page of
-      --  NodeID 0 ->
-          vadoEventLoop page
-      --  NodeID focus -> do
-      --    let (node, _state) = fromJust $ IM.lookup focus (pageElementStates page)
-      --    let eventHandlers = eventsTextInput $ domEvents node
-      --    let foreach page' handler = handler (SDL.textInputEventText e) node page'
-      --    foldM foreach page eventHandlers >>= vadoRedrawEventLoop
+    TextInputEvent e -> do
+      let focused = documentFocus $ pageDocument page
+      page' <- dispatchEvent focused event page
+      vadoRedrawEventLoop page'
 
     _ -> do
       vadoEventLoop page
@@ -820,20 +810,21 @@ dispatchEvent nid event page = do
     foldM handle page (elementAncestors elt)
   where
     handle p node = do
-      case SDL.eventPayload event of
-        MouseButtonEvent e ->
-          let listeners = eventsMouseReleased $ elementEvents $ elementDeref node
-          in foldM (\page listener -> listener event (elementRefID node) page) p listeners
-        KeyboardEvent e ->
-          let listeners = eventsKeyReleased $ elementEvents $ elementDeref node
-          in foldM (\page listener -> listener event (elementRefID node) page) p listeners
-        _ ->
-          return p
+      let events = elementEvents $ elementDeref node
+      let listeners = case SDL.eventPayload event of
+            MouseButtonEvent e -> eventsMouseReleased events
+            KeyboardEvent e -> eventsKeyReleased events
+            TextInputEvent e -> eventsTextInput events
+            _ -> []
+      foldM (\page listener -> listener event (elementRefID node) page) p listeners
 
 builtinHTMLEvents :: HM.HashMap Text Events
 builtinHTMLEvents = HM.fromList
   [ ("a", noEvents
       { eventsMouseReleased = [clickLink]
+      })
+  , ("body", noEvents
+      { eventsKeyReleased = [body_onKeyReleased]
       })
   , ("input", noEvents
       { eventsKeyReleased = [input_onKeyReleased]
@@ -907,15 +898,35 @@ input_onKeyReleased event nid page = runPageDocument page $ do
     SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
       clipboard <- lift $ SDL.getClipboardText
       modifyElement nid $ modify_input (const clipboard)
-    _ -> do
-      lift $ putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
+    _ -> return ()
+    --  lift $ putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
   documentRedraw nid
 
 input_onTextInput :: EventHandler
 input_onTextInput event nid page = runPageDocument page $ do
-  let input = undefined
+  let TextInputEvent e = SDL.eventPayload event
+  let input = SDL.textInputEventText e
+  -- lift $ putStrLn $ "input_onTextInput: " ++ T.unpack input
   modifyElement nid $ modify_input (`T.append` input)
   documentRedraw nid
+
+body_onKeyReleased :: EventHandler
+body_onKeyReleased event nid page = do
+  let SDL.KeyboardEvent e = SDL.eventPayload event
+  case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
+    SDL.KeycodePageUp -> do
+      return $ vadoScroll (negate $ vadoViewHeight page) page
+    SDL.KeycodePageDown -> do
+      return $ vadoScroll (vadoViewHeight page) page
+    SDL.KeycodeHome ->
+      if isKeyAltPressed (SDL.keysymModifier $ SDL.keyboardEventKeysym e)
+      then fetchURL "vado:home" page >>= layoutPage
+      else return $ vadoScroll (negate $ pageScroll page) page
+    SDL.KeycodeEnd ->
+      let pageH = maybe 0 boxHeight $ pageBoxes page
+      in return $ vadoScroll pageH page
+    _ ->
+      return page
 
 --------------------------------------------------------------------------------
 -- HTTP request, caches and local storage
@@ -1241,11 +1252,12 @@ layoutElement elt = do
 
       (Left (InputTextContent t), _) -> do
         -- TODO: extract the font of own CSS (not the cascaded one), calculate wh and baseline
+        -- TODO: scroll text if too long and truncate from left
         let w = 320
         let h = 32
         let baseline = 22
         let textX = 10
-        let box = BoxInline $ InputTextBox (V2 w h) textX baseline t
+        let box = BoxInline $ InputTextBox (V2 w h) textX baseline (elementRefID elt)
         let boxlines =
               [ BoxLine{boxlineStart=V2 0 0, boxlineEnd=V2 0 h}
               , BoxLine{boxlineStart=V2 0 0, boxlineEnd=V2 w 0}
@@ -1610,7 +1622,7 @@ renderDOM page = do
     let body = fromJust $ pageBoxes page
     Canvas.background $ Canvas.rgb 255 255 255 -- TODO: set to body background color
     withStyling body (0, 0, noStyle) $ \st ->
-      renderTree (minY, minY + vadoViewHeight page) (0, 0, st) body
+      renderTree (pageDocument page) (minY, minY + vadoViewHeight page) (0, 0, st) body
   SDL.copy (vadoRenderer $ pageWindow page) texture Nothing Nothing
 
   forM_ replaced $ \(rect, content) -> do
@@ -1631,8 +1643,9 @@ renderDOM page = do
 
   SDL.present renderer
 
-renderTree :: (Double, Double) -> (Double, Double, Style) -> BoxTree -> Canvas.Canvas [(SDL.Rectangle Double, InlineContent)]
-renderTree (minY, maxY) (x, y, st0) box = do
+renderTree :: Document -> (Double, Double) -> (Double, Double, Style) -> BoxTree
+           -> Canvas.Canvas [(SDL.Rectangle Double, InlineContent)]
+renderTree doc (minY, maxY) (x, y, st0) box = do
   -- draw the lines
   forM_ (boxLines box) $ \boxline -> do
     let V2 dx1 dy1 = boxlineStart boxline
@@ -1647,7 +1660,7 @@ renderTree (minY, maxY) (x, y, st0) box = do
       replaced <- forM children $ \(P (V2 dx dy), child) -> do
         if not ((y+dy) + boxHeight child < minY || maxY < (y+dy)) then
           withStyling child (x+dx, y+dy-minY, st0) $ \st ->
-            renderTree (minY, maxY) (x + dx, y + dy, st) child
+            renderTree doc (minY, maxY) (x + dx, y + dy, st) child
         else
           return []
       return $ concat replaced
@@ -1657,7 +1670,9 @@ renderTree (minY, maxY) (x, y, st0) box = do
     BoxInline content@(ImageBox (V2 w h) _) ->
       let rect = SDL.Rectangle (P $ V2 x y) (V2 w h)
       in return [(rect, content)]
-    BoxInline (InputTextBox (V2 _bw bh) textX baseline txt) -> do
+    BoxInline (InputTextBox (V2 _bw bh) textX baseline nid) -> do
+      node <- inDocument doc $ getElement nid
+      let Left (InputTextContent txt) = elementContent node
       V2 w _ <- Canvas.textSize (T.unpack txt)
       let cursorInset = bh/6
       let cursorX = textX + w + defaultFontSize/5
@@ -2295,7 +2310,7 @@ vadoHome =
     htmlDOMFromXML $ xmlHtml body
     Just nid <- getElementById "vado"
     -- TODO: attach a handler that goes to the page
-    modifyElement nid $ \node -> node{ elementEvents = undefined }
+    modifyElement nid $ \node -> node
   where
     body =
       xmlNode' "body" [("style", "text-align: center; white-space: pre")]
