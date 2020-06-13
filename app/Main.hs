@@ -10,7 +10,7 @@ import qualified Control.Exception as Exc
 import           Control.Monad
 import qualified Control.Monad.Identity as MId
 import           Control.Monad.RWS.Strict as RWS
-import           Control.Monad.State (State, StateT(..))
+import           Control.Monad.State (StateT(..))
 import qualified Control.Monad.State as St
 import qualified Data.Attoparsec.Text as Atto
 import qualified Data.ByteString.Lazy as B
@@ -54,7 +54,7 @@ import qualified Text.XML.Cursor as XML
 import Debug.Trace as Trace
 
 debug :: Bool
-debug = False
+debug = True
 
 warning :: String -> a -> a
 warning msg = Trace.trace msg
@@ -135,7 +135,7 @@ data Navigator = Navigator
 -- |   - contains history
 data Window = Window
 
--- | This is a web-page
+-- | This is a webpage
 -- |   - contains the DOM tree
 -- |   - contains the CSS rule storage
 -- |   - contains the rendering cache(s)
@@ -155,8 +155,38 @@ data Document = Document
   } deriving (Show)
 
 emptyDocument :: Document
-emptyDocument = Document { documentAllNodes = IM.empty, documentNewID = succ noElement, documentBuildState = [] }
+emptyDocument = Document
+  { documentAllNodes = IM.empty
+  , documentNewID = succ noElement
+  , documentBuildState = []
+  , documentHead = noElement
+  , documentBody = noElement
+  }
 
+instance HasDebugView Document where
+  showdbg doc = unlines $
+      [ "documentHead = " ++ show (documentHead doc)
+      , "documentBody = " ++ show (documentBody doc)
+      , "documentNewID = " ++ show (documentNewID doc)
+      ] ++ shownode (elementRef doc htmlElement)
+    where
+      shownode :: ElementRef -> [String]
+      shownode elt =
+        let nid = elementRefID elt
+            node = elementDeref elt
+            tag = elementTag node
+            attrs = elementAttrs node
+            hdr = ["@"++show nid++":"++T.unpack tag++" "++show (M.toList attrs)++
+                   " style="++showdbg (elementStyleAttr node)++
+                   " css="++showdbg (elementStyleHTML node)]
+        in case elementContent node of
+          Right _ ->
+            hdr ++ indent (L.concatMap shownode (elementChildren elt))
+          Left content ->
+            hdr ++ indent [show content]
+
+      indent :: [String] -> [String]
+      indent = map (\s -> ' ':' ':s)
 
 type DocumentT m a = StateT Document m a
 
@@ -256,24 +286,33 @@ domtreeStartElement (tag, attrs) = do
   let pid = if null opened then noElement else head opened
 
   nid <- takeNewID
+  let node = emptyElement
+       { elementParent = pid
+       , elementContent = Right noElement
+       , elementTag = tag
+       , elementAttrs = attrs
+       }
 
-  when (pid /= noElement) $ do
+  if pid == noElement then do
+    setElement nid $
+      node{ elementSiblings = ElementSiblings{ prevSibling = nid, nextSibling = nid } }
+  else do
     parent <- getElement pid
     let Right fid = elementContent parent   -- Left should not be in opened, ever.
-    when (fid /= noElement) $ do
+    if fid == noElement then do
+      setElement pid parent{ elementContent = Right nid }
+      setElement nid $
+        node{ elementSiblings = ElementSiblings{ prevSibling = nid, nextSibling = nid } }
+    else do
       first <- getElement fid
       let lid = prevSibling $ elementSiblings first
-      setElement fid $ first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
-      modifyElement lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
-    setElement pid parent{ elementContent = Right nid }
+      setElement fid $
+        first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
+      modifyElement lid $ \node ->
+        node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
+      setElement nid $
+        node{ elementSiblings = ElementSiblings{ prevSibling = lid, nextSibling = fid } }
 
-  setElement nid emptyElement
-    { elementParent = pid
-    , elementSiblings = ElementSiblings{ prevSibling = nid, nextSibling = nid }
-    , elementContent = Right noElement
-    , elementTag = tag
-    , elementAttrs = attrs
-    }
   modify $ \doc -> doc{ documentBuildState = (nid:opened) }
   return nid
 
@@ -290,7 +329,7 @@ domtreeTraverse = undefined
 
 -- | Request a redraw for a node
 documentRedraw :: Monad m => ElementID -> DocumentT m ()
-documentRedraw nid = undefined
+documentRedraw = undefined
 
 
 type ElementRef = (IM.IntMap Element, ElementID)
@@ -305,7 +344,15 @@ elementRefID :: ElementRef -> ElementID
 elementRefID (_, nid) = nid
 
 elementChildren :: ElementRef -> [ElementRef]
-elementChildren (nodes, nid) = undefined
+elementChildren (nodes, nid) = maybe [] (nodeChildren . elementContent) $ IM.lookup nid nodes
+  where
+    nodeChildren (Left _) = []
+    nodeChildren (Right fid) = if fid == noElement then [] else go fid fid
+    go fid cid =
+      let cnode = nodes IM.! cid
+          nid = nextSibling $ elementSiblings cnode
+      in (nodes, cid) : if nid == fid then [] else go fid nid
+
 
 -- | This is a DOM node
 type ElementID = Int
@@ -432,17 +479,15 @@ domAppendContent mbTagAttrs content = do
 domParseGeneralAttributes :: Monad m => ElementID -> DocumentT m ()
 domParseGeneralAttributes nid = do
   node <- getElement nid
+  let tag = elementTag node
   case elementTag node of
     "head" -> modify $ \doc -> doc{ documentHead = nid }
     "body" -> modify $ \doc -> doc{ documentBody = nid }
     _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
-  -- TODO: parse style=""
-  modifyElement nid $ \node ->
-    let tag = elementTag node
-        style = M.lookup "style" $ elementAttrs node
-    in node
+  let style = M.lookup "style" $ elementAttrs node
+  setElement nid $ node
       { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
       , elementStyleHTML = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
       , elementStyleAttr = maybe noStyle (cssFarcer . T.unpack) $ style
@@ -452,7 +497,7 @@ domParseGeneralAttributes nid = do
 -- do not use for any inheritable properties.
 -- Do not cascade it over a parent style, use cascadeStyle.
 elementOwnStyle :: ElementRef -> Style
-elementOwnStyle elt = elementStyleAttr el `cascadingOver` elementStyleHTML el
+elementOwnStyle elt = elementStyleAttr el `overriding` elementStyleHTML el
   where el = elementDeref elt
 
 --------------------------------------------------------------------------------
@@ -606,12 +651,13 @@ data BoxLine = BoxLine
 main :: IO ()
 main = do
   window <- vadoWindow
-  page0 <- layoutPage $ vadoWaitPage $ emptyPage window
+  page0 <- layoutPage $ vadoPage vadoWait $ emptyPage window
   renderDOM page0
 
   args <- Env.getArgs
   let url = fromMaybe "vado:home" $ listToMaybe args
   page1 <- fetchURL url page0
+  when debug $ putStrLn $ showdbg (pageDocument page1)
 
   page <- layoutPage page1
   vadoRedrawEventLoop page
@@ -795,7 +841,7 @@ clickLink :: EventHandler
 clickLink nid page = runPageDocument page $ do
   node <- getElement nid
   whenJust (M.lookup "href" $ elementAttrs node) $ \href -> lift $ do
-    let waitpage = vadoWaitPage page
+    let waitpage = vadoPage vadoWait page
     layoutPage waitpage >>= renderDOM
     page' <- fetchURL (T.unpack href) page
     void $ layoutPage page'
@@ -864,7 +910,7 @@ input_onKeyReleased keysym nid page = runPageDocument page $ do
 
 input_onTextInput :: Text -> EventHandler
 input_onTextInput input nid page = runPageDocument page $ do
-  modifyElement nid $ modify_input (\txt -> T.append txt input)
+  modifyElement nid $ modify_input (`T.append` input)
   documentRedraw nid
 
 --------------------------------------------------------------------------------
@@ -874,11 +920,11 @@ data HTTPResource
   = ImageResource !(V2 Double) SDL.Texture
 
 fetchURL :: String -> Page -> IO Page
-fetchURL "vado:home" page = return $ vadoHomePage page
-fetchURL "vado:error" page = return $ vadoErrorPage "vado:error" page
+fetchURL "vado:home" page = return $ vadoPage vadoHome page
+fetchURL "vado:error" page = return $ vadoPage (vadoError "vado:error") page
 fetchURL url page =
     fetchHTTP url page `Exc.catch`
-      \(e :: HttpException) -> return (vadoErrorPage (T.pack $ show e) page)
+      \(e :: HttpException) -> return $ vadoPage (vadoError $ T.pack $ show e) page
 
 fetchHTTP :: String -> Page -> IO Page
 fetchHTTP url page = do
@@ -923,6 +969,7 @@ fetchHTTP url page = do
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
 
     doc <- fromEmptyDocument $ domtreeFromXML htmlnode
+    when debug $ putStrLn $ showdbg doc
     return page
       { pageUrl = pageURI
       , pageDocument = doc
@@ -1128,16 +1175,17 @@ elementToBoxes :: CanMeasureText m =>
      LayoutCtx -> LayoutParams -> Style -> ElementRef ->
      m (BoxTree, LayoutCtx)
 elementToBoxes ctx params parentStyle node = do
-    let children = elementChildren node
     let st = (elementDeref node) `cascadeStyle` parentStyle
-    let doLayout = runLayout (layoutBlock children >> layoutLineBreak)
+    let doLayout = runLayout $ do
+            forM_ (elementChildren node) layoutElement
+            layoutLineBreak
     (layout', posboxes) <- RWS.execRWST doLayout params Layout
       { ltX = 0, ltY = 0
       , ltMaxX = 0
       , ltLS = LS { lsBoxes = [], lsGap = True, lsWords = [], lsFont = styleFont st }
       , ltCtx = ctx
       , ltStyle = st
-      , ltStyling = parentStyle `styleDiff` st
+      , ltStyling = st `styleDiff` parentStyle
       , ltElement = elementRefID node
       }
     let box = BoxTree
@@ -1156,20 +1204,20 @@ withStyle node action = do
     parentStyling <- gets ltStyling
     parentNode <- gets ltElement
     let st = (elementDeref node) `cascadeStyle` parentStyle
-    let styling = parentStyle `styleDiff` st
+    let styling = st `styleDiff` parentStyle
     modify $ \lt -> lt{ ltStyle=st, ltStyling=styling, ltElement = elementRefID node }
     result <- action
     modify $ \lt -> lt{ ltStyle=parentStyle, ltStyling=parentStyling, ltElement = parentNode }
     return result
 
-layoutBlock :: CanMeasureText m => [ElementRef] -> LayoutOver m ()
-layoutBlock elts =
-  forM_ elts $ \elt -> do
+layoutElement :: CanMeasureText m => ElementRef -> LayoutOver m ()
+layoutElement elt = do
     let st = elementOwnStyle elt
         content = elementContent (elementDeref elt)
-    case (content, st `cssValue` CSSDisplay) of
-      (_, CSS_Keyword "none") ->
-        return ()
+        display = st `cssValue` CSSDisplay
+    if display == CSS_Keyword "none" then
+      return ()
+    else case (content, display) of
       (Left (TextContent txt), _) ->
         layoutText txt
       (Left NewlineContent, _) ->
@@ -1213,8 +1261,8 @@ layoutBlock elts =
             layoutInlineBox wh baseline elt (BoxInline $ ImageBox wh href) []
           _ -> return ()
 
-      (Right fid, CSS_Keyword "inline") -> do
-        withStyle elt $ layoutBlock $ elementChildren (fst elt, fid)
+      (Right _, CSS_Keyword "inline") -> do
+        withStyle elt $ forM_ (elementChildren elt) layoutElement
 
       (Right _, CSS_Keyword "list-item") ->
         layoutListItem elt
@@ -1267,7 +1315,8 @@ layoutBlock elts =
       let outerBox = BoxTree
             { boxContent = BoxOfBlocks
                 [ (P (V2 mx my),            markerBox)
-                , (P (V2 markerWidth 0.0),  box{ boxStyling = noStyling })  -- move styling into the outer box
+                  -- move styling into the outer box:
+                , (P (V2 markerWidth 0.0),  box{ boxStyling = noStyling })
                 ]
             , boxNode = boxNode box
             , boxDim = V2 outerWidth outerHeight
@@ -1340,7 +1389,9 @@ layoutInlineSpace = do
         ls' = ls{ lsWords=lsWords ls ++ [" "], lsGap = True }
     in lt{ ltX=x, ltLS=ls' })
 
-layoutInlineBox :: CanMeasureText m => V2 Double -> BaselineY -> ElementRef -> BoxContent -> [BoxLine] -> LayoutOver m ()
+layoutInlineBox :: CanMeasureText m =>
+                   V2 Double -> BaselineY -> ElementRef -> BoxContent -> [BoxLine]
+                   -> LayoutOver m ()
 layoutInlineBox (V2 dx dy) baseline node content boxlines = do
   x <- gets ltX
   maxwidth <- asks ltWidth
@@ -1826,10 +1877,15 @@ mergeCSSFontValues font1 font2 = CSSFontValue
 
 -- | Given a node and a parent style, compute cascaded node style
 cascadeStyle :: Element -> Style -> Style
-cascadeStyle elt parentStyle = attrStyle `cascadingOver` parentStyle `cascadingOver` builtinStyle
+cascadeStyle elt parentStyle = Style
+    { styleInherit = attrStyle `merge` (htmlStyle `merge` prntStyle)
+    , styleOwn = attrOwn `M.union` htmlOwn
+    }
   where
-    attrStyle = elementStyleAttr elt
-    builtinStyle = elementStyleHTML elt
+    Style{ styleInherit = prntStyle, styleOwn = prntOwn} = parentStyle
+    Style{ styleInherit = attrStyle, styleOwn = attrOwn} = elementStyleAttr elt
+    Style{ styleInherit = htmlStyle, styleOwn = htmlOwn} = elementStyleHTML elt
+    merge = M.mergeWithKey cascadingValue id id
 
 -- | Augment/override/merge new CSS style with base style.
 -- The new style inherits/merges parent's properties, unless overriden.
@@ -1885,20 +1941,16 @@ cascadingValue _ st _ = Just st
 -- Shadow previous values if they exist.
 overriding :: Style -> Style -> Style
 overriding newprops base = Style
-    { styleInherit = styleInherit newprops `merge` styleInherit base
-    , styleOwn = styleOwn newprops `merge` styleOwn base
+    { styleInherit = styleInherit newprops `M.union` styleInherit base
+    , styleOwn = styleOwn newprops `M.union` styleOwn base
     }
-  where
-    merge :: Ord k => M.Map k v -> M.Map k v -> M.Map k v
-    merge = M.mergeWithKey (\_ st _ -> Just st) id id
-
 
 -- | Get the difference between two (complete) styles both ways.
--- Given an old and a new style, produce a pair of style diffs: "push" and "pop", s.t.
+-- Given a new and an old style, produce a pair of style diffs: "push" and "pop", s.t.
 --   old + push -> new
 --   new + pop -> old
 styleDiff :: Style -> Style -> (StyleDiff, StyleDiff)
-styleDiff Style{styleInherit=old} Style{styleInherit=new} = (toNew, toOld)
+styleDiff Style{styleInherit=new} Style{styleInherit=old} = (toNew, toOld)
   where
     toNew = M.differenceWith (\v1 v2 -> if v1 /= v2 then Just v1 else Nothing) new old
     toOld = M.differenceWith (\v1 v2 -> if v1 /= v2 then Just v1 else Nothing) old new
@@ -1907,9 +1959,7 @@ noStyling :: (StyleDiff, StyleDiff)
 noStyling = (M.empty, M.empty)
 
 applyDiff :: Style -> StyleDiff -> Style
-applyDiff st diff = st { styleInherit = diff `patch` (styleInherit st) }
-  where
-    patch = M.mergeWithKey (\_ val _ -> Just val) id id
+applyDiff st diff = st { styleInherit = diff `M.union` (styleInherit st) }
 
 --------------------------------------------------------------------------------
 -- CSS parsers and printers
@@ -2230,48 +2280,47 @@ builtinHTMLStyles =
 
 -- | Built-in vado:pages
 
+vadoPage :: Document -> Page -> Page
+vadoPage doc page = (emptyPage $ pageWindow page)
+  { pageDocument = doc
+  , pageUrl = nullURI
+  }
 
-vadoHomePage :: Page -> Page
-vadoHomePage page = (emptyPage $ pageWindow page)
-    { pageDocument = doc
-    , pageWindow = pageWindow page
-    , pageUrl = nullURI
-    }
+
+vadoHome :: Document
+vadoHome =
+  MId.runIdentity $ fromEmptyDocument $ do
+    domtreeFromXML $ xmlHtml body
+    Just nid <- getElementById "vado"
+    -- TODO: attach a handler that goes to the page
+    modifyElement nid $ \node -> node{ elementEvents = undefined }
   where
-    doc = MId.runIdentity $ fromEmptyDocument $ do
-      domtreeFromXML $ xmlHtml body
-      Just nid <- getElementById "vado"
-      -- TODO: attach a handler that goes to the page
-      modifyElement nid $ \node -> node{ elementEvents = undefined }
     body =
       xmlNode' "body" [("style", "text-align: center; white-space: pre")]
         [ xmlNode "h1" [ xmlText "\n\n\nVado"]
         , xmlNode "hr" []
         , xmlNode' "form" [("action", "vado:go"), ("method", "POST")]
-          [ xmlNode' "input" [("type", "text"), ("name", "url"), ("id", "vado"), ("autofocus", "")] []
+          [ xmlNode' "input" inputAttrs []
           -- TODO: handle autofocus
           , xmlNode "br" []
           , xmlNode' "input" [("type", "submit"), ("value", "I go!")] []
           ]
         ]
+    inputAttrs = [("type", "text"), ("name", "url"), ("id", "vado"), ("autofocus", "")]
 
-vadoErrorPage :: Text -> Page -> Page
-vadoErrorPage err page = (emptyPage $ pageWindow page)
-    { pageDocument = MId.runIdentity $ fromEmptyDocument $ domtreeFromXML $ xmlHtml body
-    , pageUrl = nullURI
-    }
+vadoError :: Text -> Document
+vadoError err =
+  MId.runIdentity $ fromEmptyDocument $ domtreeFromXML $
+    xmlHtml $ xmlNode "body"
+      [ xmlNode' "h1" h1style
+         [ xmlText "\noops"]
+      , xmlNode "pre" [ xmlText err ]
+      ]
   where
-    body = xmlNode "body"
-          [ xmlNode' "h1" [("style",  "text-align: center; color: red; white-space: pre; font-size: 72px")]
-              [ xmlText "\noops"]
-          , xmlNode "pre" [ xmlText err ]
-          ]
+    h1style = [("style",  "text-align: center; color: red; white-space: pre; font-size: 72px")]
 
-vadoWaitPage :: Page -> Page
-vadoWaitPage page = (emptyPage $ pageWindow page)
-    { pageDocument = MId.runIdentity $ fromEmptyDocument $ domtreeFromXML $ xmlHtml body
-    , pageUrl = nullURI
-    }
+vadoWait :: Document
+vadoWait = MId.runIdentity $ fromEmptyDocument $ domtreeFromXML $ xmlHtml body
   where
     body = xmlNode' "body" [("style", "text-align: center")]
           [ xmlNode' "h1" [("style",  "white-space: pre; font-size: 48px")]
