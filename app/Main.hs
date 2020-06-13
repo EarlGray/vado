@@ -224,6 +224,11 @@ getElement nid = do
     Just node -> return node
     Nothing -> error $ "nodeID not found: " ++ show nid
 
+getElementRef :: Monad m => ElementID -> DocumentT m ElementRef
+getElementRef nid = do
+  nodes <- gets documentAllNodes
+  return (nodes, nid)
+
 -- TODO: ElementID/Element, Id/ElementID confusion
 -- TODO: populate and use the `documentElementById` cache
 getElementById :: Monad m => Text -> DocumentT m (Maybe ElementID)
@@ -352,6 +357,11 @@ elementChildren (nodes, nid) = maybe [] (nodeChildren . elementContent) $ IM.loo
           next = nextSibling $ elementSiblings cnode
       in (nodes, cid) : if next == fid then [] else go fid next
 
+elementAncestors :: ElementRef -> [ElementRef]
+elementAncestors (nodes, nid) | nid == noElement = []
+elementAncestors (nodes, nid) = (nodes, nid) : elementAncestors (nodes, pid)
+  where
+    pid = elementParent (nodes IM.! nid)
 
 -- | This is a DOM node
 type ElementID = Int
@@ -715,7 +725,7 @@ vadoEventLoop page = do
           let stack = P pagepos `findInBox` boxes
           case boxNode <$> mbHead stack of
             Just nid ->
-              runPageDocument page $ dispatchMouseEvent pagepos nid
+              dispatchEvent nid event $ warning ("MouseButtonEvent: dispatchEvent @" ++ show nid) page
             Nothing ->
               return $ warning "click event without a box" page
         _ -> return page
@@ -779,13 +789,13 @@ vadoViewHeight page = h
 
 -- | A set of events that an element may handle.
 type DocumentIO a = DocumentT IO a
-type EventHandler = ElementID -> Page -> IO Page
+type EventHandler = SDL.Event -> ElementID -> Page -> IO Page
 
 -- TODO: refactor to a map + an enum of known enum names
 data Events = Events
-  { eventsMouseReleased :: [V2 Double -> EventHandler]
-  , eventsKeyReleased :: [SDL.Keysym -> EventHandler]
-  , eventsTextInput :: [Text -> EventHandler]
+  { eventsMouseReleased :: [EventHandler]
+  , eventsKeyReleased :: [EventHandler]
+  , eventsTextInput :: [EventHandler]
   , eventsOther :: M.Map Text [EventHandler]
   }
 
@@ -801,14 +811,29 @@ noEvents = Events
   }
 
 -- TODO: button, modifiers, clientX/clientY
-dispatchMouseEvent :: V2 Double -> ElementID -> DocumentIO ()
-dispatchMouseEvent (V2 pageX pageY) nid = do
-  undefined
+dispatchEvent :: ElementID -> SDL.Event -> Page -> IO Page
+dispatchEvent nid event page = do
+    -- TODO: stopPropagation()
+    -- TODO: custom listeners and preventDefault()
+    -- TODO: page can change under ElementRefs; a page event loop
+    elt <- inDocument (pageDocument page) $ getElementRef nid
+    foldM handle page (elementAncestors elt)
+  where
+    handle p node = do
+      case SDL.eventPayload event of
+        MouseButtonEvent e ->
+          let listeners = eventsMouseReleased $ elementEvents $ elementDeref node
+          in foldM (\page listener -> listener event (elementRefID node) page) p listeners
+        KeyboardEvent e ->
+          let listeners = eventsKeyReleased $ elementEvents $ elementDeref node
+          in foldM (\page listener -> listener event (elementRefID node) page) p listeners
+        _ ->
+          return p
 
 builtinHTMLEvents :: HM.HashMap Text Events
 builtinHTMLEvents = HM.fromList
   [ ("a", noEvents
-      { eventsMouseReleased = [\_ node -> clickLink node]
+      { eventsMouseReleased = [clickLink]
       })
   , ("input", noEvents
       { eventsKeyReleased = [input_onKeyReleased]
@@ -817,13 +842,14 @@ builtinHTMLEvents = HM.fromList
   ]
 
 clickLink :: EventHandler
-clickLink nid page = runPageDocument page $ do
-  node <- getElement nid
-  whenJust (M.lookup "href" $ elementAttrs node) $ \href -> lift $ do
-    let waitpage = vadoPage vadoWait page
-    layoutPage waitpage >>= renderDOM
-    page' <- fetchURL (T.unpack href) page
-    void $ layoutPage page'
+clickLink event nid page = do
+  node <- inDocument (pageDocument page) $ getElement nid
+  case M.lookup "href" $ elementAttrs node of
+    Just href -> do
+      layoutPage (vadoPage vadoWait page) >>= renderDOM
+      fetchURL (T.unpack href) page >>= layoutPage
+    Nothing ->
+      return page
 
 noKeyModifiers :: SDL.KeyModifier
 noKeyModifiers = SDL.KeyModifier
@@ -859,8 +885,10 @@ modify_input f node =
     Left (InputTextContent txt) -> node{ elementContent = Left $ InputTextContent $ f txt }
     _ -> warning ("an input event not on a text input: " ++ show node) node
 
-input_onKeyReleased :: SDL.Keysym -> EventHandler
-input_onKeyReleased keysym nid page = runPageDocument page $ do
+input_onKeyReleased :: EventHandler
+input_onKeyReleased event nid page = runPageDocument page $ do
+  let KeyboardEvent e = SDL.eventPayload event
+  let keysym = SDL.keyboardEventKeysym e
   case SDL.keysymKeycode keysym of
     SDL.KeycodeBackspace ->
       modifyElement nid $ modify_input (\case "" -> ""; t -> T.init t)
@@ -883,8 +911,9 @@ input_onKeyReleased keysym nid page = runPageDocument page $ do
       lift $ putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
   documentRedraw nid
 
-input_onTextInput :: Text -> EventHandler
-input_onTextInput input nid page = runPageDocument page $ do
+input_onTextInput :: EventHandler
+input_onTextInput event nid page = runPageDocument page $ do
+  let input = undefined
   modifyElement nid $ modify_input (`T.append` input)
   documentRedraw nid
 
