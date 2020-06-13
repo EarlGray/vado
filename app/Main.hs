@@ -46,7 +46,8 @@ import           SDL.Vect
 import           System.CPUTime (getCPUTime)
 import qualified System.Environment as Env
 import qualified Text.HTML.DOM as HTML
-import           Text.Printf
+import           Text.Printf (printf)
+import           Text.Read (readMaybe)
 import qualified Text.XML as XML
 import           Text.XML.Cursor (($|), (&/))
 import qualified Text.XML.Cursor as XML
@@ -54,10 +55,12 @@ import qualified Text.XML.Cursor as XML
 import Debug.Trace as Trace
 
 debug :: Bool
-debug = True
+debug = False
 
 warning :: String -> a -> a
 warning msg = Trace.trace msg
+
+-- Meaningful names:
 
 whenJust :: Monad m => Maybe a -> (a -> m ()) -> m ()
 whenJust = forM_
@@ -67,6 +70,9 @@ forJust mb f = f `fmap` mb
 
 mbHead :: [a] -> Maybe a
 mbHead = listToMaybe
+
+mbReadText :: Read a => Text -> Maybe a
+mbReadText = readMaybe . T.unpack
 
 --------------------------------------------------------------------------------
 -- page, DOM and resources
@@ -105,7 +111,7 @@ data DOMContent
   -- ^ A text node
   | NewlineContent
   -- ^ Force newline here, usually corresponds to <br>
-  | ImageContent !Text !(Maybe (V2 Double))
+  | ImageContent !Text (Maybe (V2 Double))
   -- ^           ^href
   | HorizLineContent
   -- ^ <hr>
@@ -225,18 +231,6 @@ getElementById eid = do
   nodes <- IM.toList <$> gets documentAllNodes
   return $ fmap fst $ L.find (\(_, elt) -> M.lookup "id" (elementAttrs elt) == Just eid) nodes
 
-getChildren :: Monad m => ElementID -> DocumentT m [Element]
-getChildren pid = do
-    node <- getElement pid
-    case elementContent node of
-      Right fid | fid /= noElement -> go fid fid
-      _ -> return []
-  where
-    go fid nid = do
-      node <- getElement nid
-      let nextid = nextSibling $ elementSiblings node
-      (node:) <$> if fid == nid then return [] else go fid nextid
-
 alterNode :: Monad m => ElementID -> (Maybe Element -> Maybe Element) -> DocumentT m ()
 alterNode nid f = do
   nodes <- gets documentAllNodes
@@ -249,8 +243,10 @@ setElement nid element = alterNode nid $ \_ -> Just element
 modifyElement :: Monad m => ElementID -> (Element -> Element) -> DocumentT m ()
 modifyElement nid f = alterNode nid (fmap f)
 
--- | Building document DOM tree
-domtreeAppendChild :: Monad m => Maybe (Text, M.Map Text Text) -> DOMContent -> DocumentT m ElementID
+-- | domtree low-level functions: Building document DOM tree
+domtreeAppendChild :: Monad m =>
+                      Maybe (Text, M.Map Text Text) -> DOMContent
+                      -> DocumentT m ElementID
 domtreeAppendChild mbXML content = do
   opened <- gets documentBuildState
   let pid = head opened
@@ -264,8 +260,10 @@ domtreeAppendChild mbXML content = do
       else do
         first <- getElement fid
         let lid = prevSibling $ elementSiblings first
-        setElement fid $ first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
-        modifyElement lid $ \node -> node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
+        setElement fid $
+          first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
+        modifyElement lid $ \node ->
+          node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
         return (fid, lid)
 
       let (tag, attrs) = fromMaybe ("", M.empty) mbXML
@@ -332,6 +330,7 @@ documentRedraw :: Monad m => ElementID -> DocumentT m ()
 documentRedraw = undefined
 
 
+-- ElementRef should not live longer that the current version of the IntMap storage.
 type ElementRef = (IM.IntMap Element, ElementID)
 
 elementRef :: Document -> ElementID -> ElementRef
@@ -346,12 +345,12 @@ elementRefID (_, nid) = nid
 elementChildren :: ElementRef -> [ElementRef]
 elementChildren (nodes, nid) = maybe [] (nodeChildren . elementContent) $ IM.lookup nid nodes
   where
-    nodeChildren (Left _) = []
-    nodeChildren (Right fid) = if fid == noElement then [] else go fid fid
+    nodeChildren (Right fid) | fid /= noElement = go fid fid
+    nodeChildren _ = []
     go fid cid =
       let cnode = nodes IM.! cid
-          nid = nextSibling $ elementSiblings cnode
-      in (nodes, cid) : if nid == fid then [] else go fid nid
+          next = nextSibling $ elementSiblings cnode
+      in (nodes, cid) : if next == fid then [] else go fid next
 
 
 -- | This is a DOM node
@@ -365,25 +364,10 @@ noElement =   0
 htmlElement :: ElementID
 htmlElement = 1
 
--- external collections:
-data ZipperList a = ZipperList
-  { zipperPrev :: [a]
-  , zipperHead :: a
-  , zipperNext :: [a]
-  } deriving (Show, Eq)
-
-type ElementZList = ZipperList ElementID
-
 -- intrusive collections:
 data ElementSiblings = ElementSiblings
   { prevSibling :: ElementID
   , nextSibling :: ElementID
-  }
-  deriving (Show)
-
-data ElementChildren = ElementChildren
-  { firstChild :: ElementID
-  , lastChild :: ElementID
   }
   deriving (Show)
 
@@ -392,7 +376,7 @@ data Element = Element
   , elementSiblings :: ElementSiblings
 
   , elementContent :: Either DOMContent ElementID -- content or the first child
-  , elementTag :: Text
+  , elementTag :: !Text
   , elementAttrs :: M.Map Text Text
 
   , elementStyleHTML :: Style       -- builtin HTML styling
@@ -419,65 +403,68 @@ emptyElement = Element
 -- | Normalize an XML tree of elements and text, possibly with
 -- attributes like style and event handlers.
 
-domtreeFromXML :: Monad m => XML.Node -> DocumentT m ()
-domtreeFromXML (XML.NodeContent txt) =
-  void $ domtreeAppendChild Nothing (TextContent txt)
+htmlDOMFromXML :: Monad m => XML.Node -> DocumentT m ()
+htmlDOMFromXML = \case
+  XML.NodeElement el ->
+    let attrs = M.mapKeys xmlTextName (XML.elementAttributes el)
+        tagattrs = (tagName el, attrs)
+    in case htmlDOMContent tagattrs of
+      Just content ->
+        domAppendHTMLContent (Just tagattrs) content
+      _ -> do
+        domStartHTMLElement tagattrs
+        forM_ (XML.elementNodes el) $ \child ->
+          htmlDOMFromXML child
+        void $ domtreeEndElement
 
-domtreeFromXML (XML.NodeElement el) =
-  let tag = tagName el
-      attrs = M.mapKeys xmlTextName (XML.elementAttributes el)
-      tagattrs = Just (tag, attrs)
-  in case tag of
-    "hr" -> do
-      domAppendContent tagattrs HorizLineContent
+  XML.NodeContent txt ->
+    void $ domtreeAppendChild Nothing (TextContent txt)
 
-    "img" -> do
-      -- TODO: start fetching
-      case lookupXMLAttribute "src" el of
-        Just href -> do
-          let width = decodeXMLAttribute "width" el
-          let height = decodeXMLAttribute "height" el
-          let wh = liftM2 V2 width height
-          domAppendContent tagattrs (ImageContent href wh)
+  _ -> return ()
+
+-- decide if this HTML tag is a piece of content or a container:
+htmlDOMContent :: TagAttrs -> Maybe DOMContent
+htmlDOMContent = \case
+    ("hr", _) ->
+      Just $ HorizLineContent
+
+    ("img", attrs) -> do
+      case M.lookup "src" attrs of
+        Just href ->
+          let width = mbReadText =<< M.lookup "width" attrs
+              height = mbReadText =<< M.lookup "height" attrs
+              wh = liftM2 V2 width height
+          in Just $ ImageContent href wh
         _ ->
-          let alt = fromMaybe "<img>" $ lookupXMLAttribute "alt" el
-          in domAppendContent Nothing (TextContent alt)
-      -- TODO: add this element to documentImages
+          let alt = fromMaybe "<img>" $ M.lookup "alt" attrs
+          in Just $ TextContent alt
 
-    "input" -> do
-      let value = fromMaybe "" $ lookupXMLAttribute "value" el
-      let content = case lookupXMLAttribute "type" el of
-            Nothing -> InputTextContent value
-            Just "text" -> InputTextContent value
-            Just "password" -> InputTextContent value    -- TODO: a password input
-            Just "button" -> TextContent value
-            Just "checkbox" -> TextContent $ maybe "\x2610" (\_ -> "\x2611") $ lookupXMLAttribute "checked" el
-            Just "submit" -> TextContent $ fromMaybe "submit" $ lookupXMLAttribute "value" el
-            Just "hidden" -> TextContent ""
-            _ -> warning ("Unknown input type: " ++ show el) $ TextContent ""
-      domAppendContent tagattrs content
+    ("input", attrs) ->
+      let value = fromMaybe "" $ M.lookup "value" attrs
+      in Just $ case M.lookup "type" attrs  of
+          Nothing -> InputTextContent value
+          Just "text" -> InputTextContent value
+          Just "password" -> InputTextContent value    -- TODO: a password input
+          Just "button" -> TextContent value
+          Just "checkbox" -> TextContent $ maybe "\x2610" (\_ -> "\x2611") $ M.lookup "checked" attrs
+          Just "submit" -> TextContent $ fromMaybe "submit" $ M.lookup "value" attrs
+          Just "hidden" -> TextContent ""
+          inpty -> warning ("Unknown input type: " ++ show inpty) $ TextContent ""
 
-    _ -> do
-      domStartElement (tag, attrs)
-      forM_ (XML.elementNodes el) $ \child ->
-        domtreeFromXML child
-      void $ domtreeEndElement
+    _ -> Nothing
 
-domtreeFromXML _ = return ()
-
-
-domStartElement :: Monad m => TagAttrs -> DocumentT m ()
-domStartElement tagattrs = do
+domStartHTMLElement :: Monad m => TagAttrs -> DocumentT m ()
+domStartHTMLElement tagattrs = do
     nid <- domtreeStartElement tagattrs
-    domParseGeneralAttributes nid
+    domParseHTMLAttributes nid
 
-domAppendContent :: Monad m => Maybe TagAttrs -> DOMContent -> DocumentT m ()
-domAppendContent mbTagAttrs content = do
+domAppendHTMLContent :: Monad m => Maybe TagAttrs -> DOMContent -> DocumentT m ()
+domAppendHTMLContent mbTagAttrs content = do
     nid <- domtreeAppendChild mbTagAttrs content
-    domParseGeneralAttributes nid
+    domParseHTMLAttributes nid
 
-domParseGeneralAttributes :: Monad m => ElementID -> DocumentT m ()
-domParseGeneralAttributes nid = do
+domParseHTMLAttributes :: Monad m => ElementID -> DocumentT m ()
+domParseHTMLAttributes nid = do
   node <- getElement nid
   let tag = elementTag node
   case elementTag node of
@@ -486,6 +473,7 @@ domParseGeneralAttributes nid = do
     _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
+  -- TODO: if <img>, add this element to documentImages and request the resource
   let style = M.lookup "style" $ elementAttrs node
   setElement nid $ node
       { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
@@ -494,7 +482,6 @@ domParseGeneralAttributes nid = do
       }
 
 -- elementOwnStyle is useful for computing own style,
--- do not use for any inheritable properties.
 -- Do not cascade it over a parent style, use cascadeStyle.
 elementOwnStyle :: ElementRef -> Style
 elementOwnStyle elt = elementStyleAttr el `overriding` elementStyleHTML el
@@ -506,13 +493,6 @@ elementOwnStyle elt = elementStyleAttr el `overriding` elementStyleHTML el
 lookupXMLAttribute :: Text -> XML.Element -> Maybe Text
 lookupXMLAttribute attr node = M.lookup xmlattr (XML.elementAttributes node)
   where xmlattr = XML.Name attr Nothing Nothing
-
-decodeXMLAttribute :: Read a => Text -> XML.Element -> Maybe a
-decodeXMLAttribute attr node = do
-  s <- lookupXMLAttribute attr node
-  case reads (T.unpack s) of
-    [(value, "")] -> Just value
-    _ -> Nothing
 
 tagName :: XML.Element -> Text
 tagName = XML.nameLocalName . XML.elementName
@@ -630,7 +610,6 @@ boxFirstBaselineY = \case
     maybeBaseline (P (V2 _ dy), box) = (dy + ) <$> boxFirstBaselineY box
 
 -- | BoxLine can be used for underlines, strikethroughs, borders, etc.
--- | They are drawn after the content.
 data BoxLine = BoxLine
   { boxlineStart :: V2 Double
   , boxlineEnd :: V2 Double
@@ -710,7 +689,7 @@ vadoWindow = do
 
 -- | Event loop.
 vadoEventLoop :: Page -> IO ()
-vadoEventLoop page@Page{pageDocument = doc} = do
+vadoEventLoop page = do
   event <- waitEvent
   case eventPayload event of
     QuitEvent ->
@@ -846,10 +825,6 @@ clickLink nid page = runPageDocument page $ do
     page' <- fetchURL (T.unpack href) page
     void $ layoutPage page'
 
-clickLink nid page =
-  return $ warning ("clickLink: could not find address for: " ++ show nid) page
-
-
 noKeyModifiers :: SDL.KeyModifier
 noKeyModifiers = SDL.KeyModifier
   { SDL.keyModifierLeftShift = False
@@ -945,7 +920,7 @@ fetchHTTP url page = do
     body <- B.fromChunks <$> HTTP.brConsume (HTTP.responseBody pageResp)
     return (body, headers, uri)
 
-  let contentType = T.toLower $ maybe "text/html" (T.decodeLatin1 . snd) $ L.find (\(name, _) -> name == "Content-Type") headers
+  let contentType = maybe "text/html" (T.toLower . T.decodeLatin1 . snd) $ L.find (\(name, _) -> name == "Content-Type") headers
 
   if "text/html" `T.isPrefixOf` contentType then do
     let document = HTML.parseLBS body
@@ -968,7 +943,7 @@ fetchHTTP url page = do
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
 
-    doc <- fromEmptyDocument $ domtreeFromXML htmlnode
+    doc <- fromEmptyDocument $ htmlDOMFromXML htmlnode
     when debug $ putStrLn $ showdbg doc
     return page
       { pageUrl = pageURI
@@ -978,7 +953,7 @@ fetchHTTP url page = do
       }
   else if "text/" `T.isPrefixOf` contentType then do
     let respbody = T.decodeUtf8 $ B.toStrict body
-    doc <- fromEmptyDocument $ domtreeFromXML $
+    doc <- fromEmptyDocument $ htmlDOMFromXML $
       xmlNode "html"
         [ xmlNode "head" []
         , xmlNode "body" [ xmlNode "pre" [ XML.NodeContent respbody ] ]
@@ -1004,7 +979,7 @@ fetchHTTP url page = do
         in return (node, M.fromList [])
         -}
     -- TODO: insert img into resources
-    doc <- fromEmptyDocument $ domtreeFromXML $
+    doc <- fromEmptyDocument $ htmlDOMFromXML $
       xmlNode "html"
         [ xmlNode "head" []
         , xmlNode "body" [ xmlNode' "img" [("href", T.pack $ show pageURI)] [] ]
@@ -1196,7 +1171,6 @@ elementToBoxes ctx params parentStyle node = do
          , boxLines = []
          }
     return (box, ltCtx layout')
-elementToBoxes _ctx _par _st node = error $ "elementToBoxes (" ++ show node ++ ")"
 
 withStyle :: CanMeasureText m => ElementRef -> LayoutOver m a -> LayoutOver m a
 withStyle node action = do
@@ -1254,7 +1228,7 @@ layoutElement elt = do
       (Left (ImageContent href mbSize), _) -> do
         -- TODO: block <img>
         resources <- gets (ltResources . ltCtx)
-        let mbResSize = forJust (M.lookup href resources) $ \(ImageResource wh _) -> wh
+        let mbResSize = (\(ImageResource wh _) -> wh) <$> M.lookup href resources
         case mbSize <|> mbResSize of
           Just wh -> do
             let baseline = imgBaseline wh elt
@@ -1267,9 +1241,9 @@ layoutElement elt = do
       (Right _, CSS_Keyword "list-item") ->
         layoutListItem elt
 
-      (Right _, display) -> do
+      (Right _, _) -> do
         when (display /= CSS_Keyword "block") $
-          return $ warning ("TODO: display=" ++ show display ++ ", falling back to display=block") ()
+          return $ warning ("TODO: unknown display=" ++ show display ++ ", defaulting to block") ()
         -- wrap up the previous line (if any):
         layoutLineBreak
         -- start a new containing block:
@@ -1277,7 +1251,7 @@ layoutElement elt = do
         box <- sublayout elt params
         layoutBlockBox box
 
-      -- (_, display) -> error $ concat ["layoutBlock: display=", show display, ", child=", showdbg child]
+      -- _ -> error $ concat ["layoutBlock: display=", show display , ", element=", show (elementDeref elt)]
   where
     sublayout child params = do
       parentSt <- gets ltStyle
@@ -1333,7 +1307,6 @@ layoutElement elt = do
           Just "bottom" -> h
           Just other -> warning ("unknown <img align='" ++ T.unpack other ++ "'>") h
           Nothing -> h
-    imgBaseline (V2 _ h) _ = h
 
 
 layoutBlockBox :: CanMeasureText m => BoxTree -> LayoutOver m ()
@@ -1878,16 +1851,15 @@ mergeCSSFontValues font1 font2 = CSSFontValue
 -- | Given a node and a parent style, compute cascaded node style
 cascadeStyle :: Element -> Style -> Style
 cascadeStyle elt parentStyle = Style
-    { styleInherit = attrStyle `merge` (htmlStyle `merge` prntStyle)
+    { styleInherit = attrStyle `merge` htmlStyle `merge` styleInherit parentStyle
     , styleOwn = attrOwn `M.union` htmlOwn
     }
   where
-    Style{ styleInherit = prntStyle, styleOwn = prntOwn} = parentStyle
     Style{ styleInherit = attrStyle, styleOwn = attrOwn} = elementStyleAttr elt
     Style{ styleInherit = htmlStyle, styleOwn = htmlOwn} = elementStyleHTML elt
     merge = M.mergeWithKey cascadingValue id id
 
--- | Augment/override/merge new CSS style with base style.
+{- | Augment/override/merge new CSS style with base style.
 -- The new style inherits/merges parent's properties, unless overriden.
 -- Some values are computed based on parent values (see `cascadingValue`).
 cascadingOver :: Style -> Style -> Style
@@ -1897,6 +1869,7 @@ cascadingOver style parent = style { styleInherit = inheritable `merge` styleInh
                 Just (CSS_Keyword "inline") -> M.delete CSSTextAlign (styleInherit style)
                 _ -> styleInherit style
     merge = M.mergeWithKey cascadingValue id id
+-- -}
 
 cascadingValue :: CSSProperty -> CSSValue -> CSSValue -> Maybe CSSValue
 cascadingValue CSSFont new@(CSS_Font font1) old@(CSS_Font font2) =
@@ -2290,7 +2263,7 @@ vadoPage doc page = (emptyPage $ pageWindow page)
 vadoHome :: Document
 vadoHome =
   MId.runIdentity $ fromEmptyDocument $ do
-    domtreeFromXML $ xmlHtml body
+    htmlDOMFromXML $ xmlHtml body
     Just nid <- getElementById "vado"
     -- TODO: attach a handler that goes to the page
     modifyElement nid $ \node -> node{ elementEvents = undefined }
@@ -2310,7 +2283,7 @@ vadoHome =
 
 vadoError :: Text -> Document
 vadoError err =
-  MId.runIdentity $ fromEmptyDocument $ domtreeFromXML $
+  MId.runIdentity $ fromEmptyDocument $ htmlDOMFromXML $
     xmlHtml $ xmlNode "body"
       [ xmlNode' "h1" h1style
          [ xmlText "\noops"]
@@ -2320,7 +2293,7 @@ vadoError err =
     h1style = [("style",  "text-align: center; color: red; white-space: pre; font-size: 72px")]
 
 vadoWait :: Document
-vadoWait = MId.runIdentity $ fromEmptyDocument $ domtreeFromXML $ xmlHtml body
+vadoWait = MId.runIdentity $ fromEmptyDocument $ htmlDOMFromXML $ xmlHtml body
   where
     body = xmlNode' "body" [("style", "text-align: center")]
           [ xmlNode' "h1" [("style",  "white-space: pre; font-size: 48px")]
