@@ -65,9 +65,6 @@ warning msg = Trace.trace msg
 whenJust :: Monad m => Maybe a -> (a -> m ()) -> m ()
 whenJust = forM_
 
-forJust :: Maybe a -> (a -> b) -> Maybe b
-forJust mb f = f `fmap` mb
-
 mbHead :: [a] -> Maybe a
 mbHead = listToMaybe
 
@@ -134,12 +131,12 @@ instance Show DOMContent where
 -- | The navigator is a "browser" abstraction.
 -- |   - stores settings and the collection of windows.
 -- |   - does network requests and caching.
-data Navigator = Navigator
+--data Navigator = Navigator
 
 -- | This is a window to render on the screen.
 -- |   - contains a document
 -- |   - contains history
-data Window = Window
+--data Window = Window
 
 -- | This is a webpage
 -- |   - contains the DOM tree
@@ -199,12 +196,14 @@ instance HasDebugView Document where
 
 type DocumentT m a = StateT Document m a
 
+-- | Run a computation in DocumentT, return the result, discard document changes.
 inDocument :: Monad m => Document -> DocumentT m a -> m a
 inDocument doc f = St.evalStateT f doc
 
-fromEmptyDocument :: Monad m => DocumentT m a -> m Document
-fromEmptyDocument f = runDocument emptyDocument f
+inPageDocument :: Monad m => Page -> DocumentT m a -> m a
+inPageDocument page f = inDocument (pageDocument page) f
 
+-- | Run an action on DocumentT, return a changed document.
 runDocument :: Monad m => Document -> DocumentT m a -> m Document
 runDocument doc f = St.execStateT f doc
 
@@ -252,6 +251,10 @@ modifyElement :: Monad m => ElementID -> (Element -> Element) -> DocumentT m ()
 modifyElement nid f = alterNode nid (fmap f)
 
 -- | domtree low-level functions: Building document DOM tree
+
+fromEmptyDocument :: Monad m => DocumentT m a -> m Document
+fromEmptyDocument f = runDocument emptyDocument f
+
 domtreeAppendChild :: Monad m =>
                       Maybe (Text, M.Map Text Text) -> DOMContent
                       -> DocumentT m ElementID
@@ -310,12 +313,12 @@ domtreeStartElement (tag, attrs) = do
       setElement nid $
         node{ elementSiblings = ElementSiblings{ prevSibling = nid, nextSibling = nid } }
     else do
-      first <- getElement fid
-      let lid = prevSibling $ elementSiblings first
+      fnode <- getElement fid
+      let lid = prevSibling $ elementSiblings fnode
       setElement fid $
-        first{ elementSiblings = (elementSiblings first){ prevSibling = nid } }
-      modifyElement lid $ \node ->
-        node{ elementSiblings = (elementSiblings node){ nextSibling = nid } }
+        fnode{ elementSiblings = (elementSiblings fnode){ prevSibling = nid } }
+      modifyElement lid $ \lnode ->
+        lnode{ elementSiblings = (elementSiblings lnode){ nextSibling = nid } }
       setElement nid $
         node{ elementSiblings = ElementSiblings{ prevSibling = lid, nextSibling = fid } }
 
@@ -326,17 +329,30 @@ domtreeEndElement :: Monad m => DocumentT m ElementID
 domtreeEndElement = do
   (_:opened) <- gets documentBuildState
   modify $ \doc -> doc{ documentBuildState = opened }
-  return $ if null opened then noElement else head opened
+  return $ fromMaybe noElement $ mbHead opened
 
 
 -- | Traversing document DOM tree
-domtreeTraverse :: (Traversable t, Applicative f) => (Element -> f b) -> Document -> f (t b)
-domtreeTraverse = undefined
+--domtreeTraverse :: (Traversable t, Applicative f) => (ElementRef -> f b) -> Document -> f (t b)
+--domtreeTraverse = undefined
 
 -- | Request a redraw for a node
 documentRedraw :: Monad m => ElementID -> DocumentT m ()
 documentRedraw _nid = return $ warning "TODO: documentRedraw" ()
 
+addEventListener :: Monad m => ElementID -> Text -> EventHandler -> DocumentT m ()
+addEventListener nid eventname handler = do
+  node <- getElement nid
+  let events = elementEvents node
+  let events' = case eventname of
+        "keyup" -> events{ eventsKeyReleased = handler : eventsKeyReleased events }
+        "click" -> events{ eventsMouseReleased = handler : eventsMouseReleased events }
+        "input" -> events{ eventsTextInput = handler : eventsTextInput events }
+        _ ->
+          let otherevts0 =  eventsOther events
+              otherevts = M.alter (\vs -> Just (handler : fromMaybe [] vs)) eventname otherevts0
+          in events{ eventsOther = otherevts }
+  setElement nid $ node{ elementEvents = events' }
 
 -- ElementRef should not live longer that the current version of the IntMap storage.
 type ElementRef = (IM.IntMap Element, ElementID)
@@ -361,7 +377,7 @@ elementChildren (nodes, nid) = maybe [] (nodeChildren . elementContent) $ IM.loo
       in (nodes, cid) : if next == fid then [] else go fid next
 
 elementAncestors :: ElementRef -> [ElementRef]
-elementAncestors (nodes, nid) | nid == noElement = []
+elementAncestors (_nodes, nid) | nid == noElement = []
 elementAncestors (nodes, nid) = (nodes, nid) : elementAncestors (nodes, pid)
   where
     pid = elementParent (nodes IM.! nid)
@@ -431,7 +447,7 @@ htmlDOMFromXML = \case
         domEndHTMLElement
 
   XML.NodeContent txt ->
-    void $ domtreeAppendChild Nothing (TextContent txt)
+    domAppendHTMLContent Nothing (TextContent txt)
 
   _ -> return ()
 
@@ -567,11 +583,12 @@ boxHeight :: BoxTree -> Height
 boxHeight BoxTree{ boxDim=V2 _ h } = h
 
 instance Show BoxTree where
-  show BoxTree{boxContent=content, boxNode=node, boxDim=dim, boxStyling=(stpush, stpop)} =
-    unlines (concat ["BoxTree <", name, "> : ", rshow x, "x", rshow y, dostyle, undostyle] : contents)
+  show BoxTree{boxContent=content, boxNode=node, boxDim=dim, boxStyling=(stpush, stpop), boxLines=blns} =
+    unlines (concat ["BoxTree <", name, "> : ", rshow x, "x", rshow y, dostyle, undostyle, boxlines] : contents)
     where
       dostyle = if M.null stpush then "" else " style=" ++ show (M.toList stpush)
       undostyle = if M.null stpop then "" else " unstyle=" ++ show (M.toList stpop)
+      boxlines = if null blns then "" else " lines:" ++ show (length blns)
       rshow v = show (round v :: Int)
       contents = map ("  " ++ ) $ lines contents'
       contents' = case content of
@@ -757,7 +774,7 @@ vadoEventLoop page = do
       let focused = documentFocus $ pageDocument page
       in dispatchEvent focused event page >>= vadoRedrawEventLoop
 
-    TextInputEvent e -> do
+    TextInputEvent _ -> do
       let focused = documentFocus $ pageDocument page
       page' <- dispatchEvent focused event page
       vadoRedrawEventLoop page'
@@ -777,10 +794,12 @@ vadoViewHeight page = h
   where V2 _ h = pageViewport page
 
 
--- | A set of events that an element may handle.
-type DocumentIO a = DocumentT IO a
+--------------------------------------------------------------------------------
+-- Events, event handlers, event dispatch.
+
 type EventHandler = SDL.Event -> ElementID -> Page -> IO Page
 
+-- | A set of events that an element may handle.
 -- TODO: refactor to a map + an enum of known enum names
 data Events = Events
   { eventsMouseReleased :: [EventHandler]
@@ -802,21 +821,21 @@ noEvents = Events
 
 -- TODO: button, modifiers, clientX/clientY
 dispatchEvent :: ElementID -> SDL.Event -> Page -> IO Page
-dispatchEvent nid event page = do
+dispatchEvent nid event page0 = do
     -- TODO: stopPropagation()
     -- TODO: custom listeners and preventDefault()
     -- TODO: page can change under ElementRefs; a page event loop
-    elt <- inDocument (pageDocument page) $ getElementRef nid
-    foldM handle page (elementAncestors elt)
+    elt <- inPageDocument page0 $ getElementRef nid
+    foldM handle page0 (elementAncestors elt)
   where
-    handle p node = do
+    handle page node = do
       let events = elementEvents $ elementDeref node
       let listeners = case SDL.eventPayload event of
-            MouseButtonEvent e -> eventsMouseReleased events
-            KeyboardEvent e -> eventsKeyReleased events
-            TextInputEvent e -> eventsTextInput events
+            MouseButtonEvent _ -> eventsMouseReleased events
+            KeyboardEvent _ -> eventsKeyReleased events
+            TextInputEvent _ -> eventsTextInput events
             _ -> []
-      foldM (\page listener -> listener event (elementRefID node) page) p listeners
+      foldM (\p listener -> listener event (elementRefID node) p) page listeners
 
 builtinHTMLEvents :: HM.HashMap Text Events
 builtinHTMLEvents = HM.fromList
@@ -833,8 +852,8 @@ builtinHTMLEvents = HM.fromList
   ]
 
 clickLink :: EventHandler
-clickLink event nid page = do
-  node <- inDocument (pageDocument page) $ getElement nid
+clickLink _event nid page = do
+  node <- inPageDocument page $ getElement nid
   case M.lookup "href" $ elementAttrs node of
     Just href -> do
       layoutPage (vadoPage vadoWait page) >>= renderDOM
@@ -883,17 +902,10 @@ input_onKeyReleased event nid page = runPageDocument page $ do
   case SDL.keysymKeycode keysym of
     SDL.KeycodeBackspace ->
       modifyElement nid $ modify_input (\case "" -> ""; t -> T.init t)
-    SDL.KeycodeReturn ->
+    -- SDL.KeycodeReturn ->
+      -- undefined
       -- TODO: find a parent form, use its submit action
-      undefined
-      {-
-      case M.lookup "change" (eventsOther events) of
-        Just handlers -> do
-          let foreach page' handler = handler node page'
-          foldM foreach page handlers
-        Nothing ->
-          return page
-          -}
+      -- emitEvent nid "change"
     -- TODO: Mac (GUI) keyboard layout support:
     SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
       clipboard <- lift $ SDL.getClipboardText
@@ -911,7 +923,7 @@ input_onTextInput event nid page = runPageDocument page $ do
   documentRedraw nid
 
 body_onKeyReleased :: EventHandler
-body_onKeyReleased event nid page = do
+body_onKeyReleased event _nid page = do
   let SDL.KeyboardEvent e = SDL.eventPayload event
   case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
     SDL.KeycodePageUp -> do
@@ -1250,7 +1262,7 @@ layoutElement elt = do
           , boxLines = [BoxLine{boxlineStart=V2 0 lineY, boxlineEnd=V2 w lineY}]
           }
 
-      (Left (InputTextContent t), _) -> do
+      (Left (InputTextContent _), _) -> do
         -- TODO: extract the font of own CSS (not the cascaded one), calculate wh and baseline
         -- TODO: scroll text if too long and truncate from left
         let w = 320
@@ -2150,11 +2162,15 @@ cssColorAliases = M.fromList (cssColorsLevel1 ++ cssColorsLevel2)
 --------------------------------------------------------------------------------
 -- | Default CSS values and getters
 
+-- TODO: sensible choice depending on the OS
 defaultFontFace :: String
-defaultFontFace = "Noto Serif"
+defaultFontFace = "serif"
+
+defaultFontFaceSans :: String
+defaultFontFaceSans = "sans"
 
 defaultFontFaceMono :: String
-defaultFontFaceMono = "Noto Mono"
+defaultFontFaceMono = "monospace"
 
 defaultFontSize :: Double
 defaultFontSize = 18
@@ -2169,9 +2185,6 @@ styleFontSize st =
     Just (CSS_Pt pt) -> 1.3333 * pt
     Just other -> warning ("styleFontSize: not computed: " ++ show other) defaultFontSize
     Nothing -> defaultFontSize
-
---defaultFont :: Canvas.Font
---defaultFont = Canvas.Font defaultFontFace defaultFontSize False False
 
 styleFont :: Style -> Canvas.Font
 styleFont st = Canvas.Font face size (weight == Just (CSS_Keyword "bold")) (italic == Just (CSS_Keyword "italic"))
@@ -2223,7 +2236,7 @@ inputStyle = css
   , ("color", "black")
   , ("cursor", "text")
   , ("display", "inline")
-  , ("font-family", "sans")
+  , ("font-family", T.pack $ "\"" ++ defaultFontFaceSans ++ "\"")
   , ("font-size", T.pack $ show defaultFontSize ++ "px")
   , ("width", "32em")
   ]
@@ -2309,8 +2322,7 @@ vadoHome =
   MId.runIdentity $ fromEmptyDocument $ do
     htmlDOMFromXML $ xmlHtml body
     Just nid <- getElementById "vado"
-    -- TODO: attach a handler that goes to the page
-    modifyElement nid $ \node -> node
+    addEventListener nid "keyup" url_onKeyReleased
   where
     body =
       xmlNode' "body" [("style", "text-align: center; white-space: pre")]
@@ -2324,6 +2336,20 @@ vadoHome =
           ]
         ]
     inputAttrs = [("type", "text"), ("name", "url"), ("id", "vado"), ("autofocus", "")]
+
+    -- TODO: use a "change" event
+    url_onKeyReleased :: EventHandler
+    url_onKeyReleased event nid page = do
+      let KeyboardEvent e = SDL.eventPayload event
+      let keysym = SDL.keyboardEventKeysym e
+      case SDL.keysymKeycode keysym of
+        SDL.KeycodeReturn -> do
+          node <- inPageDocument page $ getElement nid
+          let Left (InputTextContent href) = elementContent node
+          layoutPage (vadoPage vadoWait page) >>= renderDOM
+          fetchURL (T.unpack href) page >>= layoutPage
+        _ -> return page
+
 
 vadoError :: Text -> Document
 vadoError err =
