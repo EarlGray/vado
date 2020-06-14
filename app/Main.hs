@@ -1298,29 +1298,42 @@ layoutElement elt = do
         when (display /= CSS_Keyword "block") $
           return $ warning ("TODO: unknown display=" ++ show display ++ ", defaulting to block") ()
         -- wrap up the previous line (if any):
-        layoutLineBreak
-        -- start a new containing block:
         params <- ask
+        layoutLineBreak
         box <- sublayout elt params
         layoutBlockBox box
 
       -- _ -> error $ concat ["layoutBlock: display=", show display , ", element=", show (elementDeref elt)]
   where
-    sublayout child params = do
+    sublayout :: CanMeasureText m => ElementRef -> LayoutParams -> LayoutOver m BoxTree
+    sublayout elt params = do
       parentSt <- gets ltStyle
       ctx <- gets ltCtx
-      (box, ctx') <- lift $ elementToBoxes ctx params parentSt child
+      let st = elementOwnStyle elt
+      -- check margins:
+      let availWidth = ltWidth params
+      let margleft = fmap cssValueToPixels (st `cssValueMaybe` CSSMarginLeft)
+      let margright = fmap cssValueToPixels (st `cssValueMaybe` CSSMarginRight)
+      let (dx, dy, width) = case (margleft, margright) of
+            (Nothing, Nothing) -> (0, 0, availWidth)
+            _ -> error $ "TODO: handle mleft=" ++ show margleft ++ ", mright=" ++ show margright
+
+      -- layout the inner block:
+      let params' = params{ ltWidth = width }
+      (box, ctx') <- lift $ elementToBoxes ctx params parentSt elt  -- TODO: not parent style
       modify (\lt -> lt{ ltCtx=ctx' })
+
+      -- TODO: move block by (dx, dy)
       return box
 
-    layoutListItem child = do
+    layoutListItem elt = do
       let markerText = "\x2022"   -- TODO: numbered lists
       let markerWidth = 20        -- TODO: why 20?
 
       params0 <- ask
       let outerWidth = ltWidth params0
       let params = params0{ ltWidth = outerWidth - markerWidth }
-      box <- sublayout child params   -- layout the inner block
+      box <- sublayout elt params   -- layout the inner block
 
       font <- gets (styleFont . ltStyle)
       (mh, mb) <- lift $ measureHeightAndBaseline font
@@ -1353,8 +1366,8 @@ layoutElement elt = do
       layoutBlockBox outerBox
 
     -- TODO: use text-align from style
-    imgBaseline (V2 _ h) child =
-        case M.lookup "align" (elementAttrs $ elementDeref child) of
+    imgBaseline (V2 _ h) elt =
+        case M.lookup "align" (elementAttrs $ elementDeref elt) of
           Just "top" -> noBaseline
           Just "middle" -> h/2
           Just "bottom" -> h
@@ -1814,25 +1827,34 @@ instance HasDebugView CSSProperty where
 
 -- | Non-inheritable properties:
 data CSSOwnProperty
-  = CSSDisplay
-  | CSSMargin
-  | CSSBorder
-  | CSSPadding
+  = CSSBorder
+  | CSSDisplay
+  | CSSMarginBottom
+  | CSSMarginLeft
+  | CSSMarginRight
+  | CSSMarginTop
+  -- | CSSPadding
   deriving (Show, Eq, Ord, Enum)
 
 cssOwnPropertyNames :: M.Map CSSOwnProperty Text
 cssOwnPropertyNames = M.fromList
-  [ (CSSDisplay,                "display")
-  , (CSSMargin,                 "margin")
-  , (CSSBorder,                 "border")
-  , (CSSPadding,                "padding")
+  [ (CSSBorder,                 "border")
+  , (CSSDisplay,                "display")
+  , (CSSMarginBottom,           "margin-bottom")
+  , (CSSMarginLeft,             "margin-left")
+  , (CSSMarginRight,            "margin-right")
+  , (CSSMarginTop,              "margin-top")
+  -- , (CSSPadding,                "padding")
   ]
 cssOwnPropertyDefaults :: M.Map CSSOwnProperty CSSValue
 cssOwnPropertyDefaults = M.fromList
-  [ (CSSDisplay,        CSS_Keyword "block")
-  , (CSSMargin,         CSS_Px 0)
-  , (CSSBorder,         CSS_Px 0)
-  , (CSSPadding,        CSS_Px 0)
+  [ (CSSBorder,         CSS_Px 0)
+  , (CSSDisplay,        CSS_Keyword "block")
+  , (CSSMarginBottom,   CSS_Px 0)
+  , (CSSMarginLeft,     CSS_Px 0)
+  , (CSSMarginRight,    CSS_Px 0)
+  , (CSSMarginTop,      CSS_Px 0)
+  -- , (CSSPadding,        CSS_Px 0)
   ]
 
 cssNamesOfOwnProperties :: M.Map Text CSSOwnProperty
@@ -2030,6 +2052,7 @@ css properties = Style
                   case M.lookup name cssShorthands of
                     Just unshorthand -> unshorthand val
                     Nothing ->
+                      -- TODO: expand "font" as well, remove this early hack.
                       let mkFont font = [Right (CSSFont, CSS_Font font)]
                       in case name of
                         "font-weight" -> mkFont $ noCSSFont{ cssfontWeight = Just val }
@@ -2039,13 +2062,16 @@ css properties = Style
                         _ -> if "-" `T.isPrefixOf` name then []
                              else warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) []
 
-    desugarValues (Right (prop, CSS_Keyword color)) | prop `elem` [CSSColor, CSSBackgroundColor] = Right (prop, color')
-      where
-        Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases  -- yes, it's always Right:
-    desugarValues other = other
+    desugarValues = \case
+      (Right (prop, CSS_Keyword color)) | prop `elem` [CSSColor, CSSBackgroundColor] ->
+        -- yes, it's always Right:
+        let Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases
+        in Right (prop, color')
+      other -> other
 
     cssShorthands = M.fromList
       [ ("text-decoration", expandTextDecoration)
+      , ("margin",          expandMargin)
       ]
 
     expandTextDecoration = \case
@@ -2054,6 +2080,28 @@ css properties = Style
       CSS_List vals ->
         concatMap expandTextDecoration vals
       other -> warning ("Unknown value for text-decoration=" ++ show other) []
+
+    expandMargin :: CSSValue -> [Either (CSSOwnProperty, CSSValue) (CSSProperty, CSSValue)]
+    expandMargin = \case
+      CSS_List [top, right, bottom, left] -> map Left    -- own properties
+        [ (CSSMarginTop,    top)
+        , (CSSMarginRight,  right)
+        , (CSSMarginBottom, bottom)
+        , (CSSMarginLeft,   left)
+        ]
+      CSS_List [vert, horiz] -> expandMargin $ CSS_List [vert, horiz, vert, horiz]
+      CSS_List [top, horiz, bottom] -> expandMargin $ CSS_List [top, horiz, bottom, horiz]
+      val -> expandMargin $ CSS_List [val, val, val, val]
+
+-- | CSS values utils
+cssValueToPixels :: CSSValue -> Maybe Double
+cssValueToPixels = \case
+  CSS_Num size -> Just size
+  CSS_Px size -> Just size
+  CSS_Em em -> Just $ defaultFontSize * em      -- TODO: use current font size
+  CSS_Pt pt -> Just (1.3333 * pt)
+  CSS_Percent _ -> undefined                   -- TODO: use current element dimension
+  other -> warning ("styleFontSize: not computed: " ++ show other) Nothing
 
 -- | Parses a CSSValue from text for a CSS value
 cssReadValue :: Text -> UnknownOr CSSValue
@@ -2178,6 +2226,7 @@ defaultFontSize = 18
 styleFontSize :: Style -> Double
 styleFontSize st =
   let CSS_Font font = st `cssValue` CSSFont
+  {-
   in case cssfontSize font of
     Just (CSS_Num size) -> size
     Just (CSS_Px size) -> size
@@ -2185,6 +2234,8 @@ styleFontSize st =
     Just (CSS_Pt pt) -> 1.3333 * pt
     Just other -> warning ("styleFontSize: not computed: " ++ show other) defaultFontSize
     Nothing -> defaultFontSize
+  -}
+  in fromMaybe defaultFontSize (cssValueToPixels =<< cssfontSize font)
 
 styleFont :: Style -> Canvas.Font
 styleFont st = Canvas.Font face size (weight == Just (CSS_Keyword "bold")) (italic == Just (CSS_Keyword "italic"))
