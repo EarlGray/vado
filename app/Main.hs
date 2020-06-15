@@ -1630,12 +1630,19 @@ test_chunksFromTokens_Pre = run_tests (chunksFromTokens (CSS_Keyword "pre")) [
 -- Rendering engine
 
 renderDOM :: Page -> IO ()
-renderDOM page = do
+renderDOM Page{ pageBoxes = Nothing } =
+  return $ warning "renderDOM: page is not layed out yet" ()
+renderDOM page@Page{ pageBoxes = Just body } = do
   let minY = pageScroll page
   let (texture, renderer) = let win = pageWindow page in (vadoTexture win, vadoRenderer win)
+
+  let (stpush, _) = boxStyling body
+  let backgroundColor = case M.lookup CSSBackgroundColor stpush of
+        Just (CSS_RGB r g b) -> Canvas.rgb r g b
+        _ -> Canvas.rgb 255 255 255
+
   replaced <- Canvas.withCanvas texture $ do
-    let body = fromJust $ pageBoxes page
-    Canvas.background $ Canvas.rgb 255 255 255 -- TODO: set to body background color
+    Canvas.background backgroundColor
     withStyling body (0, 0, noStyle) $ \st ->
       renderTree (pageDocument page) (minY, minY + vadoViewHeight page) (0, 0, st) body
   SDL.copy (vadoRenderer $ pageWindow page) texture Nothing Nothing
@@ -1898,7 +1905,7 @@ data CSSFontValue = CSSFontValue
   , cssfontSize :: Maybe CSSValue
   , cssfontWeight :: Maybe CSSValue
   , cssfontFamily :: Maybe CSSValue
-  } deriving (Show, Eq)
+  } deriving (Eq)
 
 noCSSFont :: CSSFontValue
 noCSSFont = CSSFontValue
@@ -1907,6 +1914,10 @@ noCSSFont = CSSFontValue
   , cssfontWeight = Nothing
   , cssfontFamily = Nothing
   }
+
+instance Show CSSFontValue where
+  show CSSFontValue{..} =
+    L.intercalate ":" $ map (maybe "-" show) [cssfontFamily, cssfontStyle, cssfontSize, cssfontWeight]
 
 mergeCSSFontValues :: CSSFontValue -> CSSFontValue -> CSSFontValue
 mergeCSSFontValues font1 font2 = CSSFontValue
@@ -2199,7 +2210,7 @@ styleFontSize st =
     Nothing -> defaultFontSize
 
 styleFont :: Style -> Canvas.Font
-styleFont st = Canvas.Font face size (weight == Just (CSS_Keyword "bold")) (italic == Just (CSS_Keyword "italic"))
+styleFont st = Canvas.Font face size weight italic
   where
     CSS_Font font = st `cssValue` CSSFont
     face =
@@ -2209,8 +2220,8 @@ styleFont st = Canvas.Font face size (weight == Just (CSS_Keyword "bold")) (ital
         Just other -> error $ "styleFont: unknown " ++ show other
         Nothing -> defaultFontFace
     size = styleFontSize st
-    weight = cssfontWeight font
-    italic = cssfontStyle font
+    weight = (cssfontWeight font == Just (CSS_Keyword "bold"))
+    italic = (cssfontStyle font == Just (CSS_Keyword "italic"))
 
 stylePreservesNewlines :: Style -> Bool
 stylePreservesNewlines st =
@@ -2235,8 +2246,8 @@ bodyStyle = css (own ++ inheritable)
       [ ("background-color","white")
       , ("color",           "black")
       , ("font-weight",     "normal")
-      , ("font-family",     T.pack ("\"" ++ defaultFontFace ++ "\""))
-      , ("font-size",       T.pack (show defaultFontSize ++ "px"))
+      , ("font-family",     T.pack $ show defaultFontFace)
+      , ("font-size",       T.pack $ show defaultFontSize ++ "px")
       , ("font-style",      "normal")
       , ("white-space",     "normal")
       ]
@@ -2316,7 +2327,7 @@ builtinHTMLStyles =
     fontsize sz = ("font-size", T.pack (show sz ++ "px"))
     fontstyle_italic = ("font-style", "italic")
     fontweight_bold = ("font-weight", "bold")
-    fontfamily fam = ("font-family", T.pack ("\"" ++ fam ++ "\""))
+    fontfamily fam = ("font-family", T.pack $ show fam)
     color c = ("color", c)
 
 
@@ -2342,7 +2353,6 @@ vadoHome =
         , xmlNode "hr" []
         , xmlNode' "form" [("action", "vado:go"), ("method", "POST")]
           [ xmlNode' "input" inputAttrs []
-          -- TODO: handle autofocus
           , xmlNode "br" []
           , xmlNode' "input" [("type", "submit"), ("value", "I go!")] []
           ]
