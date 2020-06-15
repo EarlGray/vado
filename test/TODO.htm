@@ -32,10 +32,10 @@
 <li>[DONE: 2020/05/30] HTML: &lt;hr&gt;</li>
 <li>[DONE: 2020/05/30] CSS: <code>text-decoration: line-through</code>, HTML: <code>&lt;s&gt;</code>/<code>&lt;strike&gt;</code></li>
 <li>[DONE: 2020/06/13] Refactor: DOM as an IntMap with integer "pointers"; page monad</li>
+<li>[DONE: 2020/06/14] UI: basic event dispatch for elements</li>
 <li>[WIP] Refactor: a proper CSS parser from <code>css-text</code></li>
-<li>UI: basic event dispatch for elements</li>
-<li>UI: text input widget</li>
-<li>UI: dispatching keyboard events to focusable elements, moving between focusable elements</li>
+<li>UI: better text input widget</li>
+<li>UI, HTML: walk focusable elements with <kbd>Tab</kbd> key, handling <code>tabindex</code></li>
 <li>Fonts: font/glyph cache, fallbacks for different writing systems.</li>
 <li>Fonts: choose sensible default fonts depending on the platform</li>
 <li>HTML: support for non-UTF encodings (e.g. piping through iconv?)</li>
@@ -48,6 +48,7 @@
 <li>CSS: <code>line-height</code></li>
 <li>Refactor: TileIndex from BoxTree, findBox using TileIndex; rendering using TileIndex too?</li>
 <li>Refactor: split fetching data, decoding data and presenting content; future: progressive encoding and presenting</li>
+<li>Misc: command-line options (e.g. default fonts)</li>
 <li>Misc: profiling, CPU and memory optimization</li>
 <li>Misc: persistent settings and cache (SQLite?)</li>
 <li>Network: <code>file://</code> resource scheme</li>
@@ -61,11 +62,10 @@
     <li>HTML: <code>&lt;input type="text"&gt;</code></li>
   </ul>
 </li>
-<li>UI: buttons</li>
+<li>UI, CSS: buttons</li>
 <li>UI: history, going back and forth</li>
 <li>UI: optimized scroll (skiplist of subboxes in large boxes?) - blit copy + TileIndex</li>
 <li>UI: custom cursors; CSS: <code>cursor</code></li>
-<li>UI, HTML: handling <code>tabindex</code></li>
 <li>UI: scaling, zooming</li>
 <li>UI: optimized resize</li>
 <li>Network: a separate green thread</li>
