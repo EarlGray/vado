@@ -515,9 +515,10 @@ domParseHTMLAttributes nid = do
   -- TODO: parse id and add globally
   -- TODO: if <img>, add this element to documentImages and request the resource
   let style = M.lookup "style" $ elementAttrs node
+  let htmlStyle = builtinHTMLStyleFor tag (elementAttrs node)
   setElement nid $ node
       { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
-      , elementStyleHTML = fromMaybe noStyle $ HM.lookup tag builtinHTMLStyles
+      , elementStyleHTML = fromMaybe noStyle htmlStyle
       , elementStyleAttr = maybe noStyle (cssFarcer . T.unpack) $ style
       }
   whenJust (M.lookup "autofocus" $ elementAttrs node) $ \_ ->
@@ -1813,7 +1814,7 @@ cssPropertyDefaults = M.fromList
   , (CSSWhiteSpace,         CSS_Keyword "normal")
   , (CSSTextAlign,          CSS_Keyword "left")
   , (CSSTextDecorationLine, CSS_Keyword "none")
-  --, (CSSFont,               CSSFontValue )
+  , (CSSFont,               CSS_Font noCSSFont )
   ]
 
 instance IsCSSProperty CSSProperty where
@@ -2237,38 +2238,52 @@ noStyle :: Style
 noStyle = Style { styleOwn = M.empty, styleInherit = M.empty }
 
 bodyStyle :: Style
-bodyStyle = css (own ++ inheritable)
-  where
-    own =
-      [ ("margin",          "8px")
-      ]
-    inheritable =
-      [ ("background-color","white")
-      , ("color",           "black")
-      , ("font-weight",     "normal")
-      , ("font-family",     T.pack $ show defaultFontFace)
-      , ("font-size",       T.pack $ show defaultFontSize ++ "px")
-      , ("font-style",      "normal")
-      , ("white-space",     "normal")
-      ]
+bodyStyle = css
+  [ ("background-color","white")
+  , ("color",           "black")
+  , ("font-family",     T.pack $ show defaultFontFace)   -- TODO: default
+  , ("font-size",       T.pack $ show defaultFontSize ++ "px")
+  , ("font-style",      "normal")   -- TODO: make this default
+  , ("font-weight",     "normal")
+  , ("margin",          "8px")
+  , ("white-space",     "normal")
+  ]
 
-inputStyle :: Style
-inputStyle = css
+-- interactive UI elements must stand out from the surrounding elements,
+-- unless explicitly overriden.
+uiStyle :: Style
+uiStyle = css
   [ ("background-color", "#f8f8f8")
-  , ("border", "grey inset 2px")
   , ("color", "black")
-  , ("cursor", "text")
-  , ("display", "inline")
   , ("font-family", T.pack $ show defaultFontFaceSans)
   , ("font-size", T.pack $ show defaultFontSize ++ "px")
-  , ("width", "32em")
+  , ("font-style", "normal")
+  , ("font-weight", "normal")
+  , ("text-decoration", "none")
+  , ("white-space", "pre")
   ]
+
+textinputStyle :: Style
+textinputStyle = css
+  [ ("border", "rgb(218,218,218) inset 2px")
+  , ("cursor", "text")
+  , ("display", "inline")    -- "inline-block", actually
+  , ("width", "32em")
+  ] `overriding` uiStyle
+
+buttonStyle :: Style
+buttonStyle = css
+  [ ("background-color", "#f8f8f8")
+  , ("border", "rgb(218,218,218) outset 2px")
+  , ("display", "inline")   -- "inline-block", actually
+  , ("padding", "0 0.5em")
+  , ("text-align", "center")
+  ] `overriding` uiStyle
 
 -- | Default stylings for standard HTML elements.
 builtinHTMLStyles :: HM.HashMap Text Style
-builtinHTMLStyles =
-  HM.fromList
-    ([ ("h1",       css [fontsize (2.00 * defaultFontSize), fontweight_bold])
+builtinHTMLStyles = HM.fromList $
+     [ ("h1",       css [fontsize (2.00 * defaultFontSize), fontweight_bold])
      , ("h2",       css [fontsize (1.50 * defaultFontSize), fontweight_bold])
      , ("h3",       css [fontsize (1.17 * defaultFontSize), fontweight_bold])
      , ("h4",       css [fontsize (1.00 * defaultFontSize), fontweight_bold])
@@ -2283,14 +2298,14 @@ builtinHTMLStyles =
      , ("big",      css [("font-size", "117%"), display_inline])
      , ("blockquote", css [("margin", "40px 15px")])
      , ("body",     bodyStyle)
-     , ("button",   inline)
+     , ("button",   buttonStyle)
      , ("cite",     css [fontstyle_italic, display_inline])
      , ("code",     css [fontfamily defaultFontFaceMono, display_inline])
      , ("dfn",      inline)
      , ("em",       css [fontstyle_italic, display_inline])
      , ("i",        css [fontstyle_italic, display_inline])
      , ("img",      inline)
-     , ("input",    inputStyle)
+     , ("input",    textinputStyle)   -- TODO: different types
      , ("kbd",      inline)
      , ("label",    inline)
      , ("li",       css [("display", "list-item")])
@@ -2319,7 +2334,7 @@ builtinHTMLStyles =
      [ ("script",   nodisplay)
      , ("style",    nodisplay)
      , ("svg",      nodisplay)  -- TODO
-     ])
+     ]
   where
     inline = css [display_inline]
     nodisplay = css [("display", "none")]
@@ -2330,6 +2345,23 @@ builtinHTMLStyles =
     fontfamily fam = ("font-family", T.pack $ show fam)
     color c = ("color", c)
 
+builtinInputStyles :: HM.HashMap (Text, Text) Style
+builtinInputStyles = HM.fromList
+  [ (("input", "button"),   buttonStyle)
+  , (("input", "password"), textinputStyle)
+  , (("input", "reset"),    buttonStyle)
+  , (("input", "submit"),   buttonStyle)
+  , (("input", "text"),     textinputStyle)
+  ]
+
+builtinHTMLStyleFor :: Text -> M.Map Text Text -> Maybe Style
+builtinHTMLStyleFor tag attrs = do
+  case M.lookup "type" attrs of
+    Just typeA ->
+      case HM.lookup (tag, typeA) builtinInputStyles of
+        Just val -> Just val
+        Nothing -> HM.lookup tag builtinHTMLStyles
+    Nothing -> HM.lookup tag builtinHTMLStyles
 
 -- | Built-in vado:pages
 
