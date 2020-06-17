@@ -1723,15 +1723,15 @@ withStyling BoxTree{boxDim=V2 w h, boxStyling=(stpush, stpop)} (x, y, st0) actio
   where
     applyStyling :: Style -> StyleDiff -> Canvas.Canvas ()
     applyStyling st diff = do
-      forM_ (M.toList diff) $ \(prop, val) ->
-        case (prop, val) of
-          (CSSFont, CSS_Font _) ->
-            Canvas.textFont $ styleFont st
-          (CSSColor, CSS_RGB r g b) ->
-            Canvas.stroke $ Canvas.rgb r g b
-          (CSSBackgroundColor, _) ->
-            return ()
-          other -> return $ warning ("stpush property ignored: " ++ show other) ()
+      when (any (`M.member` diff) [CSSFontSize, CSSFontFamily, CSSFontSize, CSSFontWeight]) $
+        Canvas.textFont $ styleFont st
+      forM_ (M.toList diff) $ \case
+        (CSSColor, CSS_RGB r g b) ->
+          Canvas.stroke $ Canvas.rgb r g b
+        (CSSBackgroundColor, _) ->
+          return ()
+        other ->
+          return $ warning ("stpush property ignored: " ++ show other) ()
 
     applyBackgroundColor st (CSS_RGB r g b) = do
       Canvas.stroke $ Canvas.rgb r g b
@@ -1781,14 +1781,14 @@ class IsCSSProperty prop where
   cssValue st prop = fromMaybe (cssDefault prop) (cssValueMaybe st prop)
 
 
--- | CSS properties and values
-type UnknownOr a = Either Text a
-
 -- | Inheritable properites:
 data CSSProperty
   = CSSBackgroundColor
   | CSSColor
-  | CSSFont
+  | CSSFontFamily
+  | CSSFontSize
+  | CSSFontStyle
+  | CSSFontWeight
   | CSSWhiteSpace
   | CSSTextAlign
   | CSSTextDecorationLine
@@ -1798,6 +1798,10 @@ cssPropertyNames :: M.Map CSSProperty Text
 cssPropertyNames = M.fromList
   [ (CSSBackgroundColor,    "background-color")
   , (CSSColor,              "color")
+  , (CSSFontFamily,         "font-family")
+  , (CSSFontSize,           "font-size")
+  , (CSSFontStyle,          "font-style")
+  , (CSSFontWeight,         "font-weight")
   , (CSSWhiteSpace,         "white-space")
   , (CSSTextAlign,          "text-align")
   , (CSSTextDecorationLine, "text-decoraton-line")
@@ -1811,10 +1815,13 @@ cssPropertyDefaults :: M.Map CSSProperty CSSValue
 cssPropertyDefaults = M.fromList
   [ (CSSBackgroundColor,    CSS_RGB 255 255 255)
   , (CSSColor,              CSS_RGB 0 0 0)
-  , (CSSWhiteSpace,         CSS_Keyword "normal")
+  , (CSSFontFamily,         CSS_Keyword "serif")      -- ?
+  , (CSSFontSize,           CSS_Keyword "medium")      -- ?
+  , (CSSFontStyle,          CSS_Keyword "normal")
+  , (CSSFontWeight,         CSS_Keyword "normal")
   , (CSSTextAlign,          CSS_Keyword "left")
   , (CSSTextDecorationLine, CSS_Keyword "none")
-  , (CSSFont,               CSS_Font noCSSFont )
+  , (CSSWhiteSpace,         CSS_Keyword "normal")
   ]
 
 instance IsCSSProperty CSSProperty where
@@ -1835,24 +1842,24 @@ instance HasDebugView CSSProperty where
 -- | Non-inheritable properties:
 data CSSOwnProperty
   = CSSDisplay
-  | CSSMargin
-  | CSSBorder
-  | CSSPadding
+  -- | CSSMargin
+  -- | CSSBorder
+  -- | CSSPadding
   deriving (Show, Eq, Ord, Enum)
 
 cssOwnPropertyNames :: M.Map CSSOwnProperty Text
 cssOwnPropertyNames = M.fromList
   [ (CSSDisplay,                "display")
-  , (CSSMargin,                 "margin")
-  , (CSSBorder,                 "border")
-  , (CSSPadding,                "padding")
+  -- , (CSSMargin,                 "margin")
+  -- , (CSSBorder,                 "border")
+  -- , (CSSPadding,                "padding")
   ]
 cssOwnPropertyDefaults :: M.Map CSSOwnProperty CSSValue
 cssOwnPropertyDefaults = M.fromList
   [ (CSSDisplay,        CSS_Keyword "block")
-  , (CSSMargin,         CSS_Px 0)
-  , (CSSBorder,         CSS_Px 0)
-  , (CSSPadding,        CSS_Px 0)
+  -- , (CSSMargin,         CSS_Px 0)
+  -- , (CSSBorder,         CSS_Px 0)
+  -- , (CSSPadding,        CSS_Px 0)
   ]
 
 cssNamesOfOwnProperties :: M.Map Text CSSOwnProperty
@@ -1884,8 +1891,9 @@ data CSSValue
   | CSS_Percent Double
   | CSS_Url Text
   | CSS_String Text
-  | CSS_List [CSSValue]
-  | CSS_Font CSSFontValue
+  | CSS_Seq [CSSValue]      -- space-separated list
+  | CSS_List [CSSValue]     -- comma-separated list
+  | CSS_Tuple [CSSValue]    -- slash-separated list
   | CSS_RGB Word8 Word8 Word8
   deriving (Show, Eq)
 
@@ -1899,34 +1907,6 @@ instance HasDebugView CSSValue where
   showdbg (CSS_String s) = "\"" ++ T.unpack s ++ "\""
   showdbg (CSS_RGB r g b) = concat ["rgb(", show r, ", ", show g, ", ", show b, ")"]
   showdbg other = "TODO:showdbg(" ++ show other ++ ")"
-
-
-data CSSFontValue = CSSFontValue
-  { cssfontStyle :: Maybe CSSValue
-  , cssfontSize :: Maybe CSSValue
-  , cssfontWeight :: Maybe CSSValue
-  , cssfontFamily :: Maybe CSSValue
-  } deriving (Eq)
-
-noCSSFont :: CSSFontValue
-noCSSFont = CSSFontValue
-  { cssfontStyle = Nothing
-  , cssfontSize = Nothing
-  , cssfontWeight = Nothing
-  , cssfontFamily = Nothing
-  }
-
-instance Show CSSFontValue where
-  show CSSFontValue{..} =
-    L.intercalate ":" $ map (maybe "-" show) [cssfontFamily, cssfontStyle, cssfontSize, cssfontWeight]
-
-mergeCSSFontValues :: CSSFontValue -> CSSFontValue -> CSSFontValue
-mergeCSSFontValues font1 font2 = CSSFontValue
-    { cssfontStyle = cssfontStyle font1 <|> cssfontStyle font2
-    , cssfontSize = cssfontSize font1 <|> cssfontSize font2
-    , cssfontWeight = cssfontWeight font1 <|> cssfontWeight font2
-    , cssfontFamily = cssfontFamily font1 <|> cssfontFamily font2
-    }
 
 -- | Given a node and a parent style, compute cascaded node style
 cascadeStyle :: Element -> Style -> Style
@@ -1952,27 +1932,18 @@ cascadingOver style parent = style { styleInherit = inheritable `merge` styleInh
 -- -}
 
 cascadingValue :: CSSProperty -> CSSValue -> CSSValue -> Maybe CSSValue
-cascadingValue CSSFont new@(CSS_Font font1) old@(CSS_Font font2) =
-  case cssfontSize font1 of
-    Just (CSS_Keyword kw) ->
+cascadingValue CSSFontSize new (CSS_Px oldsz) =
+  case new of
+    CSS_Keyword kw ->
       case kw `L.lookup` relkeywords of
         Just val ->
-          cascadingValue CSSFont (CSS_Font font1{ cssfontSize=Just val }) old
+          cascadingValue CSSFontSize val (CSS_Px oldsz)
         Nothing ->
           case kw `L.lookup` abskeywords of
-            Just val -> Just $ CSS_Font $ font1{ cssfontSize=Just val }
-            Nothing -> warning ("font-size ignored: " ++ show kw) $ Just new
-    Just (CSS_Percent perc) ->
-      let sz = case cssfontSize font2 of
-            Just (CSS_Px size) -> size
-            other -> warning ("font-size=" ++ show other ++ " is not computed, falling back to default") defaultFontSize
-      in Just $ CSS_Font $ font1{ cssfontSize=Just (CSS_Px (sz * (perc / 100))) }
-    Just (CSS_Em em) ->
-      let sz = case cssfontSize font2 of
-            Just (CSS_Px size) -> size
-            other -> warning ("font-size=" ++ show other ++ " is not computed, falling back to default") defaultFontSize
-      in Just $ CSS_Font $ font1{ cssfontSize=Just (CSS_Px (sz * em)) }
-    _ -> Just new
+            Just val -> Just val
+            Nothing -> warning ("font-size ignored: " ++ show kw) Nothing
+    _ ->
+      CSS_Px <$> cssRelEmLength oldsz oldsz new
   where
     relkeywords =
       [ ("smaller", CSS_Percent 70)
@@ -2026,24 +1997,23 @@ cssFarcer s = css $ mapMaybe parseProp $ T.splitOn ";" (T.pack s)
       (_, "") -> Nothing
       (key, val) -> Just (T.strip key, T.strip $ T.tail val)
 
+type OwnOrInheritable = Either (CSSOwnProperty, CSSValue) (CSSProperty, CSSValue)
+
 -- | Read and split properties into own and inheritable
 -- Warn about unknown properties and values, ignore them.
 css :: [(Text, Text)] -> Style
 css properties = Style
-    { styleOwn = M.fromListWith mergePropVal own
-    , styleInherit = M.fromListWith mergePropVal inherit
+    { styleOwn = M.fromList own
+    , styleInherit = M.fromList inherit
     }
   where
-    mergePropVal (CSS_Font new) (CSS_Font old) = CSS_Font (mergeCSSFontValues new old)
-    mergePropVal new _old = new
-
     (own, inherit) = partitionEithers $ map desugarValues $ concatMap readProperty properties
 
-    readProperty :: (Text, Text) -> [Either (CSSOwnProperty, CSSValue) (CSSProperty, CSSValue)]
+    readProperty :: (Text, Text) -> [OwnOrInheritable]
     readProperty (name, textval) =
       case cssReadValue textval of
         Left _ ->
-          warning (concat ["Unknown value of a property: ", T.unpack name, "=", T.unpack textval]) []
+          warning (concat ["Unknown css value: ", T.unpack name, "=", T.unpack textval]) []
         Right val ->
           case M.lookup name cssNamesOfProperties of
             Just prop -> [Right (prop, val)]
@@ -2054,42 +2024,124 @@ css properties = Style
                   case M.lookup name cssShorthands of
                     Just unshorthand -> unshorthand val
                     Nothing ->
-                      let mkFont font = [Right (CSSFont, CSS_Font font)]
-                      in case name of
-                        "font-weight" -> mkFont $ noCSSFont{ cssfontWeight = Just val }
-                        "font-style" -> mkFont $ noCSSFont{ cssfontStyle = Just val }
-                        "font-size" -> mkFont $ noCSSFont{ cssfontSize = Just val }
-                        "font-family" ->  mkFont $ noCSSFont{ cssfontFamily = Just val }
-                        _ -> if "-" `T.isPrefixOf` name then []
-                             else warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) []
+                      if "-" `T.isPrefixOf` name
+                      then []
+                      else warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) []
 
-    desugarValues (Right (prop, CSS_Keyword color)) | prop `elem` [CSSColor, CSSBackgroundColor] = Right (prop, color')
-      where
-        Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases  -- yes, it's always Right:
-    desugarValues other = other
+    desugarValues = \case
+      (Right (prop, CSS_Keyword color)) | prop `elem` [CSSColor, CSSBackgroundColor] ->
+        let mbUnaliased = M.lookup color cssColorAliases
+            -- yes, it's always Right:
+            Right color' = cssReadValue $ fromMaybe color $ mbUnaliased
+        in Right (prop, color')
+      other -> other
 
+    cssShorthands :: M.Map Text (CSSValue -> [OwnOrInheritable])
     cssShorthands = M.fromList
-      [ ("text-decoration", expandTextDecoration)
+      [ ("font",            expandFont)
+      , ("text-decoration", expandTextDecoration)
       ]
+
+    -- https://developer.mozilla.org/en-US/docs/Web/CSS/font
+    expandFont = \case
+        (CSS_Keyword kw) | kw `elem` uiFonts ->
+          map Right $ M.toList $ styleInherit uiFont
+        CSS_Seq vals ->
+          parseFontFamily $ reverse vals
+        other ->
+          warning ("unknown font=" ++ show other) []
+      where
+        uiFonts = ["caption", "icon", "menu", "message-box", "small-caption", "status-bar"]
+        fontStretch = "normal" : [T.concat [pre, stem] |
+           pre <- ["", "ultra-", "semi-", "extra-"],
+           stem <- ["condensed", "expanded"]]
+        fontSizes =
+           [ "xx-small", "x-small", "small", "medium"
+           , "large", "x-large", "xx-large", "xxx-large"
+           , "smaller", "larger"]
+
+        parseFontFamily [] = warning ("CSS font: expected font-family") []
+        parseFontFamily (val:vals) =
+          case val of
+            CSS_Keyword _ -> Right (CSSFontFamily, val) : parseFontSize vals
+            CSS_String _ -> Right (CSSFontFamily, val) : parseFontSize vals
+            -- TODO: CSS_List ["font1", "font2", ...]
+            _ -> warning ("CSS unknown font=" ++ show val) $ parseFontSize vals
+
+        -- TODO: slash-separated line-height
+        parseFontSize [] = warning ("CSS font: expected font-size") []
+        parseFontSize (val:vals) =
+            case val of
+              CSS_Num _ -> Right (CSSFontSize, val) : parseFont vals
+              CSS_Px _ -> Right (CSSFontSize, val) : parseFont vals
+              CSS_Pt pt -> Right (CSSFontSize, CSS_Px (pt * 4/3)) : parseFont vals
+              CSS_Percent _ -> Right (CSSFontSize, val) : parseFont vals
+              CSS_Em _ -> Right (CSSFontSize, val) : parseFont vals
+              CSS_Keyword kw | kw `elem` fontSizes -> Right (CSSFontSize, val) : parseFont vals
+              _ -> warning ("unknown font[-size]=" ++ show val) $ parseFont vals
+
+        parseFont [] = []
+        parseFont (val:vals) =
+          case val of
+            -- font-style?
+            CSS_Keyword kw | kw `elem` ["normal", "italic", "oblique"] ->
+              Right (CSSFontStyle, val) : parseFont vals
+            -- font-variant-css21?
+            CSS_Keyword "small-caps" ->
+              warning "font: small-caps ignored" $ parseFont vals
+            -- font-weight?
+            CSS_Keyword kw | kw `elem` ["normal", "bold", "lighter", "bolder"] ->
+              Right (CSSFontWeight, val) : parseFont vals
+            CSS_Num num | (num `elem` [100,200..900] || num == 950) ->
+              Right (CSSFontWeight, val) : parseFont vals
+            -- font-stretch?
+            CSS_Keyword kw | kw `elem` fontStretch ->
+              warning ("font: ignoring font-stretch=" ++ show val) $ parseFont vals
+            CSS_Percent _ ->
+              warning ("font: ignoring font-stretch=" ++ show val) $ parseFont vals
+            _ -> warning ("unknown font[-prop]=" ++ show val) $ parseFont vals
+
 
     expandTextDecoration = \case
       CSS_Keyword kw | kw `elem` ["none", "underline", "overline", "line-through"] ->
         [Right (CSSTextDecorationLine, CSS_Keyword kw)]
-      CSS_List vals ->
+      CSS_Seq vals ->
         concatMap expandTextDecoration vals
       other -> warning ("Unknown value for text-decoration=" ++ show other) []
 
+cssRelEmLength :: Double -> Double -> CSSValue -> Maybe Double
+cssRelEmLength relsz _ (CSS_Percent pcnt) = Just (relsz * pcnt/100)
+cssRelEmLength _ emsz val = cssEmLength emsz val
+
+cssEmLength :: Double -> CSSValue -> Maybe Double
+cssEmLength emsz (CSS_Em em) = Just (em * emsz)
+cssEmLength _ val = cssLength val
+
+cssLength :: CSSValue -> Maybe Double
+cssLength = \case
+  CSS_Px num -> Just num
+  CSS_Num num -> Just num
+  CSS_Pt pt -> Just (pt * 4/3)
+  _ -> Nothing
+
 -- | Parses a CSSValue from text for a CSS value
-cssReadValue :: Text -> UnknownOr CSSValue
+cssReadValue :: Text -> Either Text CSSValue
 cssReadValue txtval =
   case Atto.parseOnly cssparseValue txtval of
     Left _ -> Left txtval
     Right val -> Right val
 
 cssparseValue :: Atto.Parser CSSValue
-cssparseValue = valp <* Atto.skipSpace <* Atto.endOfInput
+cssparseValue = valp <* Atto.endOfInput
   where
-    valp = Atto.choice [cssparseUrl, cssparseColor, cssparseString, cssparseIdentifier, cssparseLength, cssparseNum]
+    valp = do
+      let parsers = [ cssparseUrl, cssparseColor, cssparseString
+                    , cssparseIdentifier, cssparseLength, cssparseNum
+                    ]
+      vals <- Atto.many1 $ (Atto.choice parsers <* Atto.skipSpace)
+      case vals of
+        [val] -> return val
+        _ -> return $ CSS_Seq vals
     strp = do
       void $ Atto.char '"'
       cs <- Atto.many' (Atto.notChar '"' <|> (Atto.char '\\' *> Atto.anyChar))
@@ -2139,46 +2191,51 @@ cssparseValue = valp <* Atto.skipSpace <* Atto.endOfInput
 cssColorAliases :: M.Map Text Text
 cssColorAliases = M.fromList (cssColorsLevel1 ++ cssColorsLevel2)
   where
-    cssColorsLevel1 =
-        -- CSS Level 1 colors:
-        [ ("aqua",      "#00ffff")
-        , ("black",     "#000000")
-        , ("blue",      "#0000ff")
-        , ("fuchsia",   "#ff00ff")
-        , ("gray",      "#808080")
-        , ("green",     "#008000")
-        , ("maroon",    "#800000")
-        , ("navy",      "#000080")
-        , ("lime",      "#00ff00")
-        , ("olive",     "#808000")
-        , ("purple",    "#800080")
-        , ("red",       "#ff0000")
-        , ("silver",    "#c0c0c0")
-        , ("teal",      "#008080")
-        , ("white",     "#ffffff")
-        , ("yellow",    "#ffff00")
+    cssColorsLevel1 =                  -- CSS Level 1 colors:
+        [ ("aqua",      "#00ffff") , ("black",     "#000000")
+        , ("blue",      "#0000ff") , ("fuchsia",   "#ff00ff")
+        , ("gray",      "#808080") , ("green",     "#008000")
+        , ("maroon",    "#800000") , ("navy",      "#000080")
+        , ("lime",      "#00ff00") , ("olive",     "#808000")
+        , ("purple",    "#800080") , ("red",       "#ff0000")
+        , ("silver",    "#c0c0c0") , ("teal",      "#008080")
+        , ("white",     "#ffffff") , ("yellow",    "#ffff00")
         ]
-    cssColorsLevel2 =
-        -- CSS Level 2 (Revision 1)
-        [ ("orange",        "#ffa500") , ("aliceblue",     "#f0f8ff") , ("antiquewhite",  "#faebd7") , ("aquamarine",    "#7fffd4")
-        , ("azure",         "#f0ffff") , ("beige",         "#f5f5d ") , ("bisque",        "#ffe4c4") , ("blanchedalmond","#ffebcd")
-        , ("blueviolet",    "#8a2be2") , ("brown",         "#a52a2a") , ("burlywood",     "#deb887") , ("cadetblue",     "#5f9ea0")
-        , ("chartreuse",    "#7fff00") , ("chocolate",     "#d2691e") , ("coral",         "#ff7f50") , ("cornflowerblue","#6495ed")
-        , ("cornsilk",      "#fff8dc") , ("crimson",       "#dc143c") , ("cyan",          "#00ffff") , ("darkblue",      "#00008b")
-        , ("darkcyan",      "#008b8b") , ("darkgoldenrod", "#b8860b") , ("darkgray",      "#a9a9a9") , ("darkgreen",     "#006400")
-        , ("darkgrey",      "#a9a9a9") , ("darkkhaki",     "#bdb76b") , ("darkmagenta",   "#8b008b") , ("darkolivegreen","#556b2f")
-        , ("darkorange",    "#ff8c00") , ("darkorchid",    "#9932cc") , ("darkred",       "#8b0000") , ("darksalmon",    "#e9967a")
-        , ("darkseagreen",  "#8fbc8f") , ("darkslateblue", "#483d8b") , ("darkslategray", "#2f4f4f") , ("darkslategrey", "#2f4f4f")
-        , ("darkturquoise", "#00ced1") , ("darkviolet",    "#9400d3") , ("deeppink",      "#ff1493") , ("deepskyblue",   "#00bfff")
-        , ("dimgray",       "#696969") , ("dimgrey",       "#696969") , ("dodgerblue",    "#1e90ff") , ("firebrick",     "#b22222")
-        , ("floralwhite",   "#fffaf0") , ("forestgreen",   "#228b22") , ("gainsboro",     "#dcdcdc") , ("ghostwhite",    "#f8f8ff")
-        , ("gold",          "#ffd700") , ("goldenrod",     "#daa520") , ("greenyellow",   "#adff2f") , ("grey",          "#808080")
-        , ("honeydew",      "#f0fff0") , ("hotpink",       "#ff69b4") , ("indianred",     "#cd5c5c") , ("indigo",        "#4b0082")
-        , ("ivory",         "#fffff0") , ("khaki",         "#f0e68c") , ("lavender",      "#e6e6fa") , ("lavenderblush", "#fff0f5")
-        , ("lawngreen",     "#7cfc00") , ("lemonchiffon",  "#fffacd") , ("lightblue",     "#add8e6") , ("lightcoral",    "#f08080")
+    cssColorsLevel2 =                     -- CSS Level 2 (Revision 1)
+        [ ("orange",        "#ffa500") , ("aliceblue",     "#f0f8ff")
+        , ("antiquewhite",  "#faebd7") , ("aquamarine",    "#7fffd4")
+        , ("azure",         "#f0ffff") , ("beige",         "#f5f5d ")
+        , ("bisque",        "#ffe4c4") , ("blanchedalmond","#ffebcd")
+        , ("blueviolet",    "#8a2be2") , ("brown",         "#a52a2a")
+        , ("burlywood",     "#deb887") , ("cadetblue",     "#5f9ea0")
+        , ("chartreuse",    "#7fff00") , ("chocolate",     "#d2691e")
+        , ("coral",         "#ff7f50") , ("cornflowerblue","#6495ed")
+        , ("cornsilk",      "#fff8dc") , ("crimson",       "#dc143c")
+        , ("cyan",          "#00ffff") , ("darkblue",      "#00008b")
+        , ("darkcyan",      "#008b8b") , ("darkgoldenrod", "#b8860b")
+        , ("darkgray",      "#a9a9a9") , ("darkgreen",     "#006400")
+        , ("darkgrey",      "#a9a9a9") , ("darkkhaki",     "#bdb76b")
+        , ("darkmagenta",   "#8b008b") , ("darkolivegreen","#556b2f")
+        , ("darkorange",    "#ff8c00") , ("darkorchid",    "#9932cc")
+        , ("darkred",       "#8b0000") , ("darksalmon",    "#e9967a")
+        , ("darkseagreen",  "#8fbc8f") , ("darkslateblue", "#483d8b")
+        , ("darkslategray", "#2f4f4f") , ("darkslategrey", "#2f4f4f")
+        , ("darkturquoise", "#00ced1") , ("darkviolet",    "#9400d3")
+        , ("deeppink",      "#ff1493") , ("deepskyblue",   "#00bfff")
+        , ("dimgray",       "#696969") , ("dimgrey",       "#696969")
+        , ("dodgerblue",    "#1e90ff") , ("firebrick",     "#b22222")
+        , ("floralwhite",   "#fffaf0") , ("forestgreen",   "#228b22")
+        , ("gainsboro",     "#dcdcdc") , ("ghostwhite",    "#f8f8ff")
+        , ("gold",          "#ffd700") , ("goldenrod",     "#daa520")
+        , ("greenyellow",   "#adff2f") , ("grey",          "#808080")
+        , ("honeydew",      "#f0fff0") , ("hotpink",       "#ff69b4")
+        , ("indianred",     "#cd5c5c") , ("indigo",        "#4b0082")
+        , ("ivory",         "#fffff0") , ("khaki",         "#f0e68c")
+        , ("lavender",      "#e6e6fa") , ("lavenderblush", "#fff0f5")
+        , ("lawngreen",     "#7cfc00") , ("lemonchiffon",  "#fffacd")
+        , ("lightblue",     "#add8e6") , ("lightcoral",    "#f08080")
         , ("lightcyan",     "#e0fff-")
         ]
-
 
 -- | TODO: cursors bitmap collection
 -- https://developer.mozilla.org/en-US/docs/Web/CSS/cursor
@@ -2188,41 +2245,32 @@ cssColorAliases = M.fromList (cssColorsLevel1 ++ cssColorsLevel2)
 
 -- TODO: sensible choice depending on the OS
 defaultFontFace :: String
-defaultFontFace = "serif"
+defaultFontFace = "Noto Serif"
 
 defaultFontFaceSans :: String
-defaultFontFaceSans = "sans"
+defaultFontFaceSans = "Noto Sans"
 
 defaultFontFaceMono :: String
-defaultFontFaceMono = "monospace"
+defaultFontFaceMono = "Noto Mono"
 
 defaultFontSize :: Double
 defaultFontSize = 18
 
-styleFontSize :: Style -> Double
-styleFontSize st =
-  let CSS_Font font = st `cssValue` CSSFont
-  in case cssfontSize font of
-    Just (CSS_Num size) -> size
-    Just (CSS_Px size) -> size
-    Just (CSS_Em em) -> defaultFontSize * em
-    Just (CSS_Pt pt) -> 1.3333 * pt
-    Just other -> warning ("styleFontSize: not computed: " ++ show other) defaultFontSize
-    Nothing -> defaultFontSize
-
 styleFont :: Style -> Canvas.Font
 styleFont st = Canvas.Font face size weight italic
   where
-    CSS_Font font = st `cssValue` CSSFont
     face =
-      case cssfontFamily font of
+      case st `cssValueMaybe` CSSFontFamily of
         Just (CSS_String name) -> T.unpack name
         Just (CSS_Keyword name) -> T.unpack name
-        Just other -> error $ "styleFont: unknown " ++ show other
+        Just other -> error $ "styleFont: unknown font-family=" ++ show other
         Nothing -> defaultFontFace
-    size = styleFontSize st
-    weight = (cssfontWeight font == Just (CSS_Keyword "bold"))
-    italic = (cssfontStyle font == Just (CSS_Keyword "italic"))
+    size =
+      case st `cssValueMaybe` CSSFontSize of
+        Just (CSS_Px px) -> px
+        other -> warning ("styleFont: unknown font-size=" ++ show other) defaultFontSize
+    weight = (st `cssValueMaybe` CSSFontWeight == Just (CSS_Keyword "bold"))
+    italic = (st `cssValueMaybe` CSSFontStyle == Just (CSS_Keyword "italic"))
 
 stylePreservesNewlines :: Style -> Bool
 stylePreservesNewlines st =
@@ -2251,17 +2299,21 @@ bodyStyle = css
 
 -- interactive UI elements must stand out from the surrounding elements,
 -- unless explicitly overriden.
+uiFont :: Style
+uiFont = css
+  [ ("font-family", T.pack $ show defaultFontFaceSans)
+  , ("font-size", T.pack $ show defaultFontSize ++ "px")
+  , ("font-style", "normal")
+  , ("font-weight", "normal")
+  ]
+
 uiStyle :: Style
 uiStyle = css
   [ ("background-color", "#f8f8f8")
   , ("color", "black")
-  , ("font-family", T.pack $ show defaultFontFaceSans)
-  , ("font-size", T.pack $ show defaultFontSize ++ "px")
-  , ("font-style", "normal")
-  , ("font-weight", "normal")
   , ("text-decoration", "none")
   , ("white-space", "pre")
-  ]
+  ] `overriding` uiFont
 
 textinputStyle :: Style
 textinputStyle = css
