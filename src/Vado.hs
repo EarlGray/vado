@@ -5,6 +5,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
 
+module Vado where
+
 import           Control.Applicative
 import qualified Control.Exception as Exc
 import           Control.Monad
@@ -671,8 +673,8 @@ data BoxLine = BoxLine
 -- * Create an SDL window.
 -- * Render the content.
 --
-main :: IO ()
-main = do
+vadoMain :: IO ()
+vadoMain = do
   window <- vadoWindow
   page0 <- layoutPage $ vadoPage vadoWait $ emptyPage window
   renderDOM page0

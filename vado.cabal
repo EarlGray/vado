@@ -12,10 +12,11 @@ build-type:          Simple
 extra-source-files:  README.md
 cabal-version:       >=1.10
 
-executable vado
-  hs-source-dirs:      app
-  main-is:             Main.hs
-  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -O2 -Wall
+library
+  hs-source-dirs:      src
+  exposed-modules:
+      Vado
+  other-modules:       Paths_vado
   default-language:    Haskell2010
   build-depends:       attoparsec
                      , base
@@ -37,3 +38,13 @@ executable vado
                      , text
                      , unordered-containers
                      , xml-conduit
+
+executable vado
+  hs-source-dirs:      app
+  main-is:             Main.hs
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -O2 -Wall
+  other-modules:       Paths_vado
+  default-language:    Haskell2010
+  build-depends:
+      vado
+    , base
