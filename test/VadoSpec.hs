@@ -17,7 +17,7 @@ spec = do
     it "should produce two spaces"  $ f "hello  world" `shouldBe` ["hello", " ", " ", "world"]
     it "should produce newlines" $
       f "hello \nworld\n" `shouldBe` ["hello", " ", "\n", "world", "\n"]
-      
+
   describe "chunksFromTokens" $ do
     describe "for whitespace:normal" $ do
       let f = chunksFromTokens (CSS_Keyword "normal")
