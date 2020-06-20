@@ -965,7 +965,7 @@ fetchHTTP url page = do
         if URI.isAbsoluteURI url then fromJust $ URI.parseURI url
         else maybe (error $ "invalid url: " ++ url) (`URI.relativeTo` prevuri) (URI.parseURIReference url)
   request0 <- HTTP.parseRequest (show absuri)
-  let pageReq = request0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "github.com/chrisdone/vado") ] }
+  let pageReq = request0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "Vado") ] }
   when debug $ print pageReq
 
   httpman <- HTTP.newManager TLS.tlsManagerSettings
