@@ -56,10 +56,6 @@ import qualified Text.XML.Cursor as XML
 
 import Debug.Trace as Trace
 
--- TODO: make this a command-line switch
-debug :: Bool
-debug = False
-
 warning :: String -> a -> a
 warning msg = Trace.trace msg
 
@@ -85,6 +81,7 @@ data Page = Page
   , pageUrl :: URI
   , pageHistory :: ([URI], [URI])   -- back, forward
   , pageResources :: M.Map Text HTTPResource  -- TODO: use URI
+  , pageDebugNetwork :: Bool
 
   , pageWindow :: VadoWindow
   , pageScroll :: Height
@@ -97,6 +94,7 @@ emptyPage window = Page
   , pageWindow = window
   , pageScroll = 0
   , pageResources = M.empty
+  , pageDebugNetwork = False
   , pageUrl = nullURI
   , pageHistory = ([], [])
   }
@@ -684,7 +682,6 @@ vadoMain = do
   args <- Env.getArgs
   let url = fromMaybe "vado:home" $ listToMaybe args
   page1 <- fetchURL url page0
-  when debug $ putStrLn $ showdbg (pageDocument page1)
 
   page <- layoutPage page1
   vadoRedrawEventLoop page
@@ -726,7 +723,6 @@ vadoWindow = do
   let scale = V2 1.3 1.3
         --let (V2 w0 h0) = defaultWindowSize
         --in V2 (fromIntegral w / w0) (fromIntegral h / h0)
-  when debug $ print scale
   texture0 <- Cairo.createCairoTexture renderer viewport
   return $ VadoWindow
     { vadoRenderer = renderer
@@ -897,6 +893,11 @@ noKeyModifiers = SDL.KeyModifier
   , SDL.keyModifierAltGr = False
   }
 
+isKeyCtrlShiftPressed :: SDL.KeyModifier -> Bool
+isKeyCtrlShiftPressed mods =
+  (SDL.keyModifierLeftShift mods || SDL.keyModifierRightShift mods) &&
+  isKeyCtrlPressed mods{ SDL.keyModifierLeftShift=False, SDL.keyModifierRightShift=False }
+
 isKeyCtrlPressed :: SDL.KeyModifier -> Bool
 isKeyCtrlPressed mods =
   (SDL.keyModifierLeftCtrl mods || SDL.keyModifierRightCtrl mods) &&
@@ -947,14 +948,26 @@ body_onKeyReleased :: EventHandler
 body_onKeyReleased event _nid page = do
   let SDL.KeyboardEvent e = SDL.eventPayload event
   let modifiers = SDL.keysymModifier $ SDL.keyboardEventKeysym e
+  -- putStrLn $ "body_onKeyReleased: " ++ show e
   case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
+    SDL.KeycodeE | isKeyCtrlShiftPressed modifiers -> do
+      return page{ pageDebugNetwork = not (pageDebugNetwork page) } -- toggle network debug output
     SDL.KeycodeEnd ->
       let pageH = maybe 0 boxHeight $ pageBoxes page
       in return $ vadoScroll pageH page
+    SDL.KeycodeH | isKeyCtrlShiftPressed modifiers -> do
+      printHistory (pageHistory page) (pageUrl page) -- show History
+      return page
     SDL.KeycodeHome | isKeyAltPressed modifiers ->
       fetchURL "vado:home" page >>= layoutPage
     SDL.KeycodeHome ->
       return $ vadoScroll (negate $ pageScroll page) page
+    SDL.KeycodeI | isKeyCtrlShiftPressed modifiers -> do
+      putStrLn (showdbg $ pageDocument page)   -- Inspect the DOM tree:
+      return page
+    SDL.KeycodeK | isKeyCtrlShiftPressed modifiers ->
+      -- Inspect rendering boxes:
+      print (pageBoxes page) >> return page
     SDL.KeycodeLeft | isKeyAltPressed modifiers ->
       case pageHistory page of
         (prevurl:_, _) -> fetchURL (show prevurl) page >>= layoutPage
@@ -992,7 +1005,7 @@ fetchHTTP url page = do
         else maybe (error $ "invalid url: " ++ url) (`URI.relativeTo` prevuri) (URI.parseURIReference url)
   request0 <- HTTP.parseRequest (show absuri)
   let pageReq = request0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "Vado Browser") ] }
-  when debug $ print pageReq
+  when (pageDebugNetwork page) $ print pageReq
 
   httpman <- HTTP.newManager TLS.tlsManagerSettings
   (body, headers, pageURI) <- HTTP.withResponseHistory pageReq httpman $ \respHistory -> do
@@ -1003,7 +1016,6 @@ fetchHTTP url page = do
     return (body, headers, uri)
 
   let history = historyRewind (pageHistory page) prevuri pageURI
-  when debug $ printHistory history pageURI
 
   let contentType = maybe "text/html" (T.toLower . T.decodeLatin1 . snd) $ L.find (\(name, _) -> name == "Content-Type") headers
 
@@ -1029,7 +1041,6 @@ fetchHTTP url page = do
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
 
     doc <- fromEmptyDocument $ htmlDOMFromXML htmlnode
-    when debug $ putStrLn $ showdbg doc
     return page
       { pageUrl = pageURI
       , pageDocument = doc
@@ -1226,7 +1237,6 @@ layoutPage :: Page -> IO Page
 layoutPage page@Page{..} = do
     let body = elementRef pageDocument (documentBody pageDocument)
     (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle body
-    when debug $ print boxes
     return page{ pageBoxes=Just boxes }
   where
     ctx = LayoutCtx { ltResources = pageResources }
