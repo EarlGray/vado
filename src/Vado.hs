@@ -83,6 +83,7 @@ data Page = Page
   , pageBoxes :: Maybe BoxTree
   -- ^ Rendering tree
   , pageUrl :: URI
+  , pageHistory :: ([URI], [URI])   -- back, forward
   , pageResources :: M.Map Text HTTPResource  -- TODO: use URI
 
   , pageWindow :: VadoWindow
@@ -97,6 +98,7 @@ emptyPage window = Page
   , pageScroll = 0
   , pageResources = M.empty
   , pageUrl = nullURI
+  , pageHistory = ([], [])
   }
 
 class HasDebugView a where
@@ -797,6 +799,21 @@ vadoViewHeight :: Page -> Double
 vadoViewHeight page = h
   where V2 _ h = pageViewport page
 
+historyRewind :: ([URI], [URI]) -> URI -> URI -> ([URI], [URI])
+historyRewind (back, forward) old new =
+  case (back, forward) of
+    (prev:pback, _) | prev == new ->
+      (pback, old:forward)
+    (_, next:nforward) | next == new ->
+      (old:back, nforward)
+    _ ->
+      (old:back, [])
+
+printHistory :: ([URI], [URI]) -> URI -> IO ()
+printHistory (back, forward) current = mapM_ putStrLn $
+    ["History:"] ++ map indent (reverse back) ++ [">>" ++ show current] ++ map indent forward
+  where
+    indent url = ' ':' ':show url
 
 --------------------------------------------------------------------------------
 -- Events, event handlers, event dispatch.
@@ -929,18 +946,27 @@ input_onTextInput event nid page = runPageDocument page $ do
 body_onKeyReleased :: EventHandler
 body_onKeyReleased event _nid page = do
   let SDL.KeyboardEvent e = SDL.eventPayload event
+  let modifiers = SDL.keysymModifier $ SDL.keyboardEventKeysym e
   case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
-    SDL.KeycodePageUp -> do
-      return $ vadoScroll (negate $ vadoViewHeight page) page
-    SDL.KeycodePageDown -> do
-      return $ vadoScroll (vadoViewHeight page) page
-    SDL.KeycodeHome ->
-      if isKeyAltPressed (SDL.keysymModifier $ SDL.keyboardEventKeysym e)
-      then fetchURL "vado:home" page >>= layoutPage
-      else return $ vadoScroll (negate $ pageScroll page) page
     SDL.KeycodeEnd ->
       let pageH = maybe 0 boxHeight $ pageBoxes page
       in return $ vadoScroll pageH page
+    SDL.KeycodeHome | isKeyAltPressed modifiers ->
+      fetchURL "vado:home" page >>= layoutPage
+    SDL.KeycodeHome ->
+      return $ vadoScroll (negate $ pageScroll page) page
+    SDL.KeycodeLeft | isKeyAltPressed modifiers ->
+      case pageHistory page of
+        (prevurl:_, _) -> fetchURL (show prevurl) page >>= layoutPage
+        _ -> return page
+    SDL.KeycodePageDown -> do
+      return $ vadoScroll (vadoViewHeight page) page
+    SDL.KeycodePageUp -> do
+      return $ vadoScroll (negate $ vadoViewHeight page) page
+    SDL.KeycodeRight | isKeyAltPressed modifiers ->
+      case pageHistory page of
+        (_, nexturl:_) -> fetchURL (show nexturl) page >>= layoutPage
+        _ -> return page
     _ ->
       return page
 
@@ -965,7 +991,7 @@ fetchHTTP url page = do
         if URI.isAbsoluteURI url then fromJust $ URI.parseURI url
         else maybe (error $ "invalid url: " ++ url) (`URI.relativeTo` prevuri) (URI.parseURIReference url)
   request0 <- HTTP.parseRequest (show absuri)
-  let pageReq = request0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "Vado") ] }
+  let pageReq = request0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "Vado Browser") ] }
   when debug $ print pageReq
 
   httpman <- HTTP.newManager TLS.tlsManagerSettings
@@ -975,6 +1001,9 @@ fetchHTTP url page = do
     let headers = HTTP.responseHeaders pageResp
     body <- B.fromChunks <$> HTTP.brConsume (HTTP.responseBody pageResp)
     return (body, headers, uri)
+
+  let history = historyRewind (pageHistory page) prevuri pageURI
+  when debug $ printHistory history pageURI
 
   let contentType = maybe "text/html" (T.toLower . T.decodeLatin1 . snd) $ L.find (\(name, _) -> name == "Content-Type") headers
 
@@ -1006,6 +1035,7 @@ fetchHTTP url page = do
       , pageDocument = doc
       , pageResources = M.fromList (concat resources) `mappend` pageResources page
       , pageScroll = 0
+      , pageHistory = history
       }
   else if "text/" `T.isPrefixOf` contentType then do
     let respbody = T.decodeUtf8 $ B.toStrict body
@@ -1018,6 +1048,7 @@ fetchHTTP url page = do
       { pageUrl = pageURI
       , pageDocument = doc
       , pageScroll = 0
+      , pageHistory = history
       }
   else if "image/" `T.isPrefixOf` contentType then do
   {-
@@ -1045,6 +1076,7 @@ fetchHTTP url page = do
       , pageDocument = doc
       , pageResources = undefined
       , pageScroll = 0
+      , pageHistory = history
       }
   else
     error $ "TODO: Content-Type " ++ T.unpack contentType
