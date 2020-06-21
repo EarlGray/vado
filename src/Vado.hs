@@ -8,7 +8,7 @@
 module Vado where
 
 import           Control.Applicative
-import qualified Control.Exception as Exc
+import qualified Control.Exception as Exc   -- TODO: safe-exceptions?
 import           Control.Monad
 import qualified Control.Monad.Identity as MId
 import           Control.Monad.RWS.Strict as RWS
@@ -993,8 +993,12 @@ fetchURL :: String -> Page -> IO Page
 fetchURL "vado:home" page = return $ vadoPage vadoHome page
 fetchURL "vado:error" page = return $ vadoPage (vadoError "vado:error") page
 fetchURL url page =
-    fetchHTTP url page `Exc.catch`
-      \(e :: HttpException) -> return $ vadoPage (vadoError $ T.pack $ show e) page
+    fetchHTTP url page `Exc.catches`
+      [ Exc.Handler $ \(e :: HttpException) -> errorPage (show e)
+      , Exc.Handler $ \(e :: Exc.SomeException) -> errorPage ("SomeException: " ++ show e)
+      -- ^ "thanks" to TLS code.
+      ]
+  where errorPage msg = return $ vadoPage (vadoError $ T.pack msg) page
 
 fetchHTTP :: String -> Page -> IO Page
 fetchHTTP url page = do
@@ -1033,9 +1037,12 @@ fetchHTTP url page = do
     let imageurls = mapMaybe (\cursor -> let XML.NodeElement el = XML.node cursor in lookupXMLAttribute "src" el) images_axis
     resources <- forM (S.toList $ S.fromList imageurls) $ \imgurl ->
         fetchResource page{pageUrl=pageURI} httpman imgurl `Exc.catches`
-            [ Exc.Handler $ \(e :: HttpException) -> return $ warning (Exc.displayException e) []
-            , Exc.Handler $ \(e :: SDL.SDLException) -> return $ warning (Exc.displayException e) []   -- e.g. image decoding
-            ]
+          [ Exc.Handler $ \(e :: HttpException) -> return $ warning (Exc.displayException e) []
+          , Exc.Handler $ \(e :: SDL.SDLException) -> return $ warning (Exc.displayException e) []
+          -- ^ e.g. image decoding
+          , Exc.Handler $ \(e :: Exc.SomeException) -> return $ warning (Exc.displayException e) []
+          -- ^ "thanks" to TLS code.
+          ]
     endT <- getCPUTime
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
@@ -2474,3 +2481,4 @@ vadoWait = MId.runIdentity $ fromEmptyDocument $ htmlDOMFromXML $ xmlHtml body
           [ xmlNode' "h1" [("style",  "white-space: pre; font-size: 48px")]
               [ xmlText "\n\nloading..."]
           ]
+
