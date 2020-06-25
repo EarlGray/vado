@@ -43,7 +43,6 @@ import qualified SDL.Cairo as Cairo
 import qualified SDL.Cairo.Canvas as Canvas
 import           SDL.Event as SDL
 import qualified SDL.Image as Image
---import qualified SDL.Input.Mouse as SDL
 import           SDL.Vect
 import           System.CPUTime (getCPUTime)
 import qualified System.Environment as Env
@@ -744,6 +743,7 @@ vadoEventLoop page = do
     WindowResizedEvent e -> do
       let size = windowResizedEventSize e
       let win = pageWindow page
+      SDL.destroyTexture $ vadoTexture win
       texture' <- Cairo.createCairoTexture (vadoRenderer win) (fromIntegral <$> size)
       let win' = win{ vadoTexture=texture', vadoViewport=(fromIntegral <$> size) }
       -- TODO: optimize, don't do full layout again:
@@ -990,15 +990,21 @@ data HTTPResource
   = ImageResource !(V2 Double) SDL.Texture
 
 fetchURL :: String -> Page -> IO Page
-fetchURL "vado:home" page = return $ vadoPage vadoHome page
-fetchURL "vado:error" page = return $ vadoPage (vadoError "vado:error") page
-fetchURL url page =
-    fetchHTTP url page `Exc.catches`
-      [ Exc.Handler $ \(e :: HttpException) -> errorPage (show e)
-      , Exc.Handler $ \(e :: Exc.SomeException) -> errorPage ("SomeException: " ++ show e)
-      -- ^ "thanks" to TLS code.
-      ]
-  where errorPage msg = return $ vadoPage (vadoError $ T.pack msg) page
+fetchURL url page = do
+  -- drop page resources: nope, they are cached.
+  case url of
+    "vado:home" ->
+      return $ vadoPage vadoHome page
+    "vado:error" ->
+      errorPage "vado:error"
+    _ ->
+      fetchHTTP url page `Exc.catches`
+        [ Exc.Handler $ \(e :: HttpException) -> errorPage (show e)
+        , Exc.Handler $ \(e :: Exc.SomeException) -> errorPage ("SomeException: " ++ show e)
+        -- ^ "thanks" to TLS code.
+        ]
+  where
+    errorPage msg = return $ vadoPage (vadoError $ T.pack msg) page
 
 fetchHTTP :: String -> Page -> IO Page
 fetchHTTP url page = do
