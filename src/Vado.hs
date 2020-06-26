@@ -50,8 +50,6 @@ import qualified Text.HTML.DOM as HTML
 import           Text.Printf (printf)
 import           Text.Read (readMaybe)
 import qualified Text.XML as XML
-import           Text.XML.Cursor (($|), (&/))
-import qualified Text.XML.Cursor as XML
 
 import Debug.Trace as Trace
 
@@ -68,6 +66,10 @@ mbHead = listToMaybe
 
 mbReadText :: Read a => Text -> Maybe a
 mbReadText = readMaybe . T.unpack
+
+intmapAppend :: a -> IM.IntMap a -> IM.IntMap a
+intmapAppend val im | IM.null im = IM.fromList [(0, val)]
+intmapAppend val im = let (i, _) = IM.findMax im in IM.insert (i+1) val im
 
 --------------------------------------------------------------------------------
 -- page, DOM and resources
@@ -152,6 +154,7 @@ data Document = Document
   , documentHead :: ElementID
   , documentBody :: ElementID
   , documentFocus :: ElementID      -- the keyboard focus
+  , documentImages :: IM.IntMap ElementID
   -- , documentContentType :: ContentType
   -- , documentMeta :: M.Map Text Text
   -- , documentTitle :: Text
@@ -168,6 +171,7 @@ emptyDocument = Document
   , documentHead = noElement
   , documentBody = noElement
   , documentFocus = noElement
+  , documentImages = IM.empty
   }
 
 instance HasDebugView Document where
@@ -511,10 +515,10 @@ domParseHTMLAttributes nid = do
   case elementTag node of
     "head" -> modify $ \doc -> doc{ documentHead = nid }
     "body" -> modify $ \doc -> doc{ documentBody = nid, documentFocus = nid }
+    "img" -> modify $ \doc -> doc { documentImages = intmapAppend nid (documentImages doc) } -- TODO: request the resource
     _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
-  -- TODO: if <img>, add this element to documentImages and request the resource
   let style = M.lookup "style" $ elementAttrs node
   let htmlStyle = builtinHTMLStyleFor tag (elementAttrs node)
   setElement nid $ node
@@ -539,7 +543,7 @@ lookupXMLAttribute attr node = M.lookup xmlattr (XML.elementAttributes node)
   where xmlattr = XML.Name attr Nothing Nothing
 
 tagName :: XML.Element -> Text
-tagName = XML.nameLocalName . XML.elementName
+tagName = xmlTextName . XML.elementName
 
 xmlTextName :: XML.Name -> Text
 xmlTextName name =
@@ -1033,14 +1037,16 @@ fetchHTTP url page = do
     let document = HTML.parseLBS body
     let root = XML.documentRoot document
     -- TODO: html attributes, if any
+    -- TODO: move the structure fixup into htmlDOMFromXML
     let htmlnode =
           let topnodes = mapMaybe (\case XML.NodeElement el -> Just el; _ -> Nothing) $ XML.elementNodes root
               headnode = fromMaybe (xmlElement "head" []) $ L.find (\el -> tagName el == "head") topnodes
               bodynode = fromMaybe (xmlElement "body" $ XML.elementNodes root) $ L.find (\el -> tagName el == "body") topnodes
           in xmlNode "html" [XML.NodeElement headnode, XML.NodeElement bodynode]
 
-    let images_axis = (XML.fromDocument document $| XML.descendant &/ XML.element "img")
-    let imageurls = mapMaybe (\cursor -> let XML.NodeElement el = XML.node cursor in lookupXMLAttribute "src" el) images_axis
+    doc <- fromEmptyDocument $ htmlDOMFromXML htmlnode
+
+    let imageurls = mapMaybe (\nid -> M.lookup "src" $ elementAttrs (documentAllNodes doc IM.! nid)) $ IM.elems $ documentImages doc
     resources <- forM (S.toList $ S.fromList imageurls) $ \imgurl ->
         fetchResource page{pageUrl=pageURI} httpman imgurl `Exc.catches`
           [ Exc.Handler $ \(e :: HttpException) -> return $ warning (Exc.displayException e) []
@@ -1053,7 +1059,6 @@ fetchHTTP url page = do
     let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
     putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
 
-    doc <- fromEmptyDocument $ htmlDOMFromXML htmlnode
     return page
       { pageUrl = pageURI
       , pageDocument = doc
