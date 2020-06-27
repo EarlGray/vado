@@ -737,7 +737,7 @@ vadoWindow = do
 -- | Event loop.
 vadoEventLoop :: Page -> IO ()
 vadoEventLoop page = do
-  event <- waitEvent
+  event <- SDL.waitEvent
   case eventPayload event of
     QuitEvent ->
       return ()

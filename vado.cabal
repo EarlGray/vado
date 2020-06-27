@@ -16,6 +16,7 @@ library
   hs-source-dirs:      src
   exposed-modules:
       Vado
+      Vado.Resource
   other-modules:       Paths_vado
   ghc-options:         -Wall
   default-language:    Haskell2010
@@ -39,6 +40,11 @@ library
                      , text
                      , unordered-containers
                      , xml-conduit
+                     , conduit
+                     , resourcet
+                     , stm
+                     , stm-conduit
+                     , xml-types
 
 executable vado
   hs-source-dirs:      app
