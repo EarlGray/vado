@@ -8,17 +8,14 @@
 module Vado where
 
 import           Control.Applicative
-import qualified Control.Exception as Exc   -- TODO: safe-exceptions?
 import           Control.Monad
 import qualified Control.Monad.Identity as MId
 import           Control.Monad.RWS.Strict as RWS
 import           Control.Monad.State (StateT(..))
 import qualified Control.Monad.State as St
 import qualified Data.Attoparsec.Text as Atto
-import qualified Data.ByteString.Lazy as B
-import qualified Data.ByteString as Bs
-import qualified Data.ByteString.Base64 as B64
-import qualified Data.ByteString.Char8 as Bc
+--import qualified Data.ByteString.Lazy as B
+--import qualified Data.ByteString as Bs
 import qualified Data.Char as C
 import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
@@ -30,13 +27,9 @@ import           Data.Word (Word8)
 import           Data.Either (partitionEithers)
 import           Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
+import           Foreign.C.Types (CInt)
 import           Linear.V2 (V2(..))
 import qualified Network.HTTP.Client as HTTP
-import           Network.HTTP.Client.Internal (HttpException)
-import qualified Network.HTTP.Client.TLS as TLS
-import           Network.HTTP.Types.URI (urlDecode)
-import qualified Network.HTTP.Types.Header as HTTP
 import           Network.URI as URI
 import qualified SDL
 import qualified SDL.Cairo as Cairo
@@ -44,14 +37,17 @@ import qualified SDL.Cairo.Canvas as Canvas
 import           SDL.Event as SDL
 import qualified SDL.Image as Image
 import           SDL.Vect
-import           System.CPUTime (getCPUTime)
+--import           System.CPUTime (getCPUTime)
 import qualified System.Environment as Env
-import qualified Text.HTML.DOM as HTML
-import           Text.Printf (printf)
+import           System.Exit (exitSuccess)
 import           Text.Read (readMaybe)
 import qualified Text.XML as XML
+import qualified Data.XML.Types as XMLTy
 
 import Debug.Trace as Trace
+
+import qualified Vado.Resource as Resource
+
 
 warning :: String -> a -> a
 warning msg = Trace.trace msg
@@ -71,71 +67,63 @@ intmapAppend :: a -> IM.IntMap a -> IM.IntMap a
 intmapAppend val im | IM.null im = IM.fromList [(0, val)]
 intmapAppend val im = let (i, _) = IM.findMax im in IM.insert (i+1) val im
 
---------------------------------------------------------------------------------
--- page, DOM and resources
-
--- | State of the page
-data Page = Page
-  { pageDocument :: Document
-  , pageBoxes :: Maybe BoxTree
-  -- ^ Rendering tree
-  , pageUrl :: URI
-  , pageHistory :: ([URI], [URI])   -- back, forward
-  , pageResources :: M.Map Text HTTPResource  -- TODO: use URI
-  , pageDebugNetwork :: Bool
-
-  , pageWindow :: VadoWindow
-  , pageScroll :: Height
-  }
-
-emptyPage :: VadoWindow -> Page
-emptyPage window = Page
-  { pageDocument = emptyDocument
-  , pageBoxes = Nothing
-  , pageWindow = window
-  , pageScroll = 0
-  , pageResources = M.empty
-  , pageDebugNetwork = False
-  , pageUrl = nullURI
-  , pageHistory = ([], [])
-  }
-
 class HasDebugView a where
   showdbg :: a -> String
 
-
--- | Content of a leaf DOM node,
--- i.e. what is to be drawn in this node.
--- either a block or inline element, e.g. some text.
-data DOMContent
-  = TextContent !Text
-  -- ^ A text node
-  | NewlineContent
-  -- ^ Force newline here, usually corresponds to <br>
-  | ImageContent !Text (Maybe (V2 Double))
-  -- ^           ^href
-  | HorizLineContent
-  -- ^ <hr>
-  | InputTextContent !Text
-  -- ^ <input type="text">
-
-instance Show DOMContent where
-  show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
-  show NewlineContent = "NewlineContent"
-  show HorizLineContent = "HorizLineContent"
-  show (ImageContent href wh) = "ImageContent " ++ T.unpack href ++ " (" ++ show wh ++ ")"
-  show (InputTextContent t) = "TextInputContent \"" ++ T.unpack t ++ "\""
-
-
 --------------------------------------------------------------------------------
--- | This is a new take on the page loading and state,
--- | to replace DOMNode and Page in the future.
-
+-- Navigator, Window, DOM
 
 -- | The navigator is a "browser" abstraction.
 -- |   - stores settings and the collection of windows.
 -- |   - does network requests and caching.
---data Navigator = Navigator
+data Page = Page
+  { pageState :: PageState
+  , pageDocument :: Document
+  , pageBoxes :: Maybe BoxTree
+  -- ^ Rendering tree
+
+  , pageResMan :: Resource.Manager
+  , pageUrl :: URI
+  , pageHistory :: ([URI], [URI])   -- back, forward
+  , pageDebugNetwork :: Bool
+  , pageResources :: M.Map Text HTTPResource  -- TODO: use URI
+
+  , pageWindow :: VadoWindow
+  }
+
+-- | Set of states in the page state machine:
+data PageState
+  = PageConnecting      -- page at uri: awaiting headers or connection error
+  | PageStreaming       -- streaming page and a set of resources
+  -- | PageWaitResources   -- DOM tree is ready, but there are pending resource requests.
+  | PageReady           -- DOM and resources are loaded.
+  deriving (Eq, Show)
+
+newtype BrowserT m a = BrowserT { runBrowserT :: StateT Page m a }
+  deriving (Functor, Applicative, Monad, MonadIO, MonadState Page)
+type Browser a = BrowserT IO a
+
+withPage :: (Page -> IO a) -> Browser a
+withPage action = do
+  page <- get
+  liftIO $ action page
+
+modifyPage :: (Page -> IO (Maybe Page)) -> Browser ()
+modifyPage action = do
+  page0 <- get
+  mbPage <- liftIO $ action page0
+  whenJust mbPage put
+
+changePage :: (Page -> IO (Maybe Page)) -> Browser ()
+changePage action = do
+  page0 <- get
+  mbPage <- liftIO $ action page0
+  whenJust mbPage $ \page -> do
+    page' <- case pageBoxes page of
+      Nothing -> liftIO $ layoutPage page
+      _ -> return page
+    liftIO $ renderDOM page'
+    put page'
 
 -- | This is a window to render on the screen.
 -- |   - contains a document
@@ -151,6 +139,12 @@ data Document = Document
   , documentNewID :: ElementID
   , documentBuildState :: [ElementID]     -- current open elements during adding
 
+  , documentLocation :: URI
+  , documentXMLType :: Maybe XML.Doctype
+  , documentResources :: DOMResourceMap
+  , documentResourcesLoading :: M.Map URI (S.Set ElementID)   -- to remember what's in flight
+  , documentResourceRequests :: [(URI, ElementID)]  -- to queue requests from inside DocumentT
+
   , documentHead :: ElementID
   , documentBody :: ElementID
   , documentFocus :: ElementID      -- the keyboard focus
@@ -160,18 +154,34 @@ data Document = Document
   -- , documentTitle :: Text
   -- , documentElementsByClass :: M.Map Text [ElementID]
   -- , documentElementById :: M.Map Text ElementID
-
   } deriving (Show)
 
 emptyDocument :: Document
 emptyDocument = Document
-  { documentAllNodes = IM.empty
-  , documentNewID = succ noElement
-  , documentBuildState = []
+  { documentAllNodes = IM.fromList [(htmlElement, documentElement)]
+  , documentNewID = htmlElement + 1
+  , documentBuildState = [htmlElement]
+  , documentLocation = nullURI
+  , documentXMLType = Nothing
+  , documentResources = M.empty
+  , documentResourcesLoading = M.empty
+  , documentResourceRequests = []
   , documentHead = noElement
   , documentBody = noElement
   , documentFocus = noElement
   , documentImages = IM.empty
+  }
+
+documentElement :: Element
+documentElement = Element
+  { elementParent = noElement
+  , elementSiblings = ElementSiblings htmlElement htmlElement
+  , elementContent = Right noElement
+  , elementTag = ""
+  , elementAttrs = M.empty
+  , elementStyleHTML = noStyle
+  , elementStyleAttr = noStyle
+  , elementEvents = noEvents
   }
 
 instance HasDebugView Document where
@@ -218,6 +228,11 @@ runPageDocument page f = do
   doc' <- runDocument (pageDocument page) f
   return page{ pageDocument = doc' }
 
+runBrowserDocument :: DocumentT IO a -> Browser ()
+runBrowserDocument f = BrowserT $ do
+  doc <- gets pageDocument
+  doc' <- liftIO $ runDocument doc f
+  modify $ \page -> page{ pageDocument = doc' }
 
 takeNewID :: Monad m => DocumentT m ElementID
 takeNewID = do
@@ -266,6 +281,7 @@ domtreeAppendChild :: Monad m =>
                       -> DocumentT m ElementID
 domtreeAppendChild mbXML content = do
   opened <- gets documentBuildState
+  when (L.null opened) $ error "domtreeAppendChild: no opened elements"
   let pid = head opened
   parent <- getElement pid
   case elementContent parent of
@@ -333,8 +349,8 @@ domtreeStartElement (tag, attrs) = do
 
 domtreeEndElement :: Monad m => DocumentT m ElementID
 domtreeEndElement = do
-  (_:opened) <- gets documentBuildState
-  modify $ \doc -> doc{ documentBuildState = opened }
+  opened <- gets documentBuildState
+  modify $ \doc -> doc{ documentBuildState = tail opened }
   return $ fromMaybe noElement $ mbHead opened
 
 
@@ -410,7 +426,8 @@ data Element = Element
   { elementParent :: ElementID
   , elementSiblings :: ElementSiblings
 
-  , elementContent :: Either DOMContent ElementID -- content or the first child
+  , elementContent :: Either DOMContent ElementID
+  -- ^ DOM content or the first child (may be noElement)
   , elementTag :: !Text
   , elementAttrs :: M.Map Text Text
 
@@ -434,6 +451,38 @@ emptyElement = Element
   }
 
 
+-- | Content of a leaf DOM node,
+-- i.e. what is to be drawn in this node.
+-- either a block or inline element, e.g. some text.
+data DOMContent
+  = TextContent !Text
+  -- ^ A text node
+  | NewlineContent
+  -- ^ Force newline here, usually corresponds to <br>
+  | ImageContent !Text (Maybe (V2 Double))
+  -- ^           ^href
+  | HorizLineContent
+  -- ^ <hr>
+  | InputTextContent !Text
+  -- ^ <input type="text">
+
+instance Show DOMContent where
+  show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
+  show NewlineContent = "NewlineContent"
+  show HorizLineContent = "HorizLineContent"
+  show (ImageContent href wh) = "ImageContent " ++ T.unpack href ++ " (" ++ show wh ++ ")"
+  show (InputTextContent t) = "TextInputContent \"" ++ T.unpack t ++ "\""
+
+
+-- Map from a URI to the resource and the list of elements that use this resource
+type DOMResourceMap = M.Map URI (HTTPResource, S.Set ElementID)
+
+data HTTPResource
+  = ImageResource !(V2 Double) SDL.Texture
+
+instance Show HTTPResource where
+  show (ImageResource dim _) = show $ "ImageResource " ++ show dim
+
 --------------------------------------------------------------------------------
 -- | Normalize an XML tree of elements and text, possibly with
 -- attributes like style and event handlers.
@@ -450,18 +499,47 @@ htmlDOMFromXML = \case
         domStartHTMLElement tagattrs
         forM_ (XML.elementNodes el) $ \child ->
           htmlDOMFromXML child
-        domEndHTMLElement
+        domEndHTMLElement (tagName el)
 
   XML.NodeContent txt ->
     domAppendHTMLContent Nothing (TextContent txt)
 
   _ -> return ()
 
+htmlDOMFromEvents :: Monad m => XMLTy.Event -> DocumentT m ()
+htmlDOMFromEvents = \case
+    XMLTy.EventBeginDoctype doctype mbExtID ->
+      modify $ \doc -> doc{ documentXMLType = Just $ XMLTy.Doctype doctype mbExtID }
+    XMLTy.EventContent content -> do
+      domAppendHTMLContent Nothing (TextContent $ xmlContent content)
+    XMLTy.EventBeginElement name attrs0 -> do
+      let tag = xmlTextName name
+      let attrs = M.fromList $ map xmlAttr attrs0
+      case htmlDOMContent (tag, attrs) of
+        Just content -> domAppendHTMLContent (Just (tag, attrs)) content
+        Nothing -> domStartHTMLElement (tag, attrs)
+    XMLTy.EventEndElement name -> do
+      domEndHTMLElement (xmlTextName name)
+    XMLTy.EventBeginDocument -> return ()
+    XMLTy.EventEndDocument -> return ()    -- TODO: close all open tags
+    XMLTy.EventEndDoctype -> return ()
+    XMLTy.EventInstruction _ -> return ()
+    XMLTy.EventComment _ -> return ()
+    other -> return $ warning ("htmlDOMFromEvents: " ++ show other) ()
+  where
+    xmlContent (XMLTy.ContentText t) = t
+    xmlContent (XMLTy.ContentEntity t) = t
+
+    xmlAttr (k, []) = (xmlTextName k, "")
+    xmlAttr (k, vs) = (xmlTextName k, xmlContent $ last vs)
+
 -- decide if this HTML tag is a piece of content or a container:
 htmlDOMContent :: TagAttrs -> Maybe DOMContent
 htmlDOMContent = \case
     ("hr", _) ->
       Just $ HorizLineContent
+    ("br", _) ->
+      Just $ NewlineContent
 
     ("img", attrs) -> do
       case M.lookup "src" attrs of
@@ -498,24 +576,40 @@ domAppendHTMLContent mbTagAttrs content = do
     nid <- domtreeAppendChild mbTagAttrs content
     domParseHTMLAttributes nid
 
-domEndHTMLElement :: Monad m => DocumentT m ()
-domEndHTMLElement = do
-  nid <- gets documentBuildState
-  node <- getElement (head nid)
+domEndHTMLElement :: Monad m => Text -> DocumentT m ()
+domEndHTMLElement name | name `elem` ["hr", "br", "img", "input"] =
+  return ()
+domEndHTMLElement name = do
+  opened <- gets documentBuildState
+  whenJust (mbHead opened) $ \nid -> do
+    node <- getElement nid
+    when (elementTag node /= name) $
+      error $ "domEndHTMLElement: " ++ show (elementTag node) ++ " /= " ++ show name
+    case elementTag node of
+      "title" -> return ()    -- TODO: add documentTitle
+      "style" -> return ()    -- TODO: parse it or request the resource
+      _ -> return ()
   void $ domtreeEndElement
-  case elementTag node of
-    "title" -> return ()    -- TODO: add documentTitle
-    "style" -> return ()    -- TODO: parse it or request the resource
-    _ -> return ()
 
 domParseHTMLAttributes :: Monad m => ElementID -> DocumentT m ()
 domParseHTMLAttributes nid = do
   node <- getElement nid
   let tag = elementTag node
   case elementTag node of
-    "head" -> modify $ \doc -> doc{ documentHead = nid }
-    "body" -> modify $ \doc -> doc{ documentBody = nid, documentFocus = nid }
-    "img" -> modify $ \doc -> doc { documentImages = intmapAppend nid (documentImages doc) } -- TODO: request the resource
+    "head" -> modify $ \doc ->
+        if documentHead doc == noElement
+        then doc{ documentHead = nid }
+        else warning "domParseHTMLAttributes: more than one <head>" doc
+    "body" -> modify $ \doc ->
+        if documentBody doc == noElement
+        then doc{ documentBody = nid, documentFocus = nid }
+        else warning "domParseHTMLAttributes: more than one <body>" doc
+    "img" -> do
+        let src = M.lookup "src" $ elementAttrs node
+            mbResHref = (URI.parseURIReference . T.unpack) =<< src
+        whenJust mbResHref (domResourceFetch nid)
+        modify $ \doc ->
+          doc{ documentImages = intmapAppend nid (documentImages doc) }
     _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
@@ -528,6 +622,11 @@ domParseHTMLAttributes nid = do
       }
   whenJust (M.lookup "autofocus" $ elementAttrs node) $ \_ ->
     modify $ \doc -> doc{ documentFocus = nid }
+
+domResourceFetch :: Monad m => ElementID -> URI -> DocumentT m ()
+domResourceFetch nid href = modify $ \doc ->
+  let resuri = href `URI.relativeTo` documentLocation doc
+  in doc{ documentResourceRequests = (resuri, nid) : documentResourceRequests doc }
 
 -- elementOwnStyle is useful for computing own style,
 -- Do not cascade it over a parent style, use cascadeStyle.
@@ -573,6 +672,32 @@ xmlText t = XML.NodeContent t
 
 xmlHtml :: XML.Node -> XML.Node
 xmlHtml body = xmlNode "html" [ xmlNode "head" [], body ]
+
+{-
+xmlEvents :: XML.Document -> [XML.Event]
+xmlEvents doc = [XML.EventBeginDocument] ++ prologue ++ root ++ epilogue ++ [XML.EventEndDocument]
+  where
+    emitMisc (XML.MiscInstruction instr) =
+      XML.EventInstruction instr
+    emitDoctype XML.Doctype{XML.doctypeName=name, XML.doctypeID=mbExtID} =
+      [XML.EventBeginDoctype name mbExtID, XML.EventEndDoctype]
+    emitElement (XML.Element el) = undefined -- [XML.EventBeginElement bbbb
+
+    emitNode = \case
+      XML.NodeElement el -> emitElement el
+      XML.NodeInstruction instr -> [XML.EventInstruction instr]
+      XML.NodeContent content -> [XML.Content content]
+      XML.NodeComment comment -> [XML.EventComment comment]
+
+    prologue =
+      let pro = XML.documentPrologue doc
+      in map emitMisc (XML.prologueBefore pro)
+          ++ maybe [] emitDoctype (XML.prologueDoctype)
+          ++ map emitMisc (XML.prologueAfter pro)
+    rootelem = XML.documentRoot doc
+    root = emitNode (XML.NodeElement rootelem)
+    epilogue = map emitMisc $ XML.documentEpilogue doc
+-}
 
 --------------------------------------------------------------------------------
 -- | A tree of bounding boxes
@@ -678,33 +803,227 @@ data BoxLine = BoxLine
 --
 vadoMain :: IO ()
 vadoMain = do
+  args <- Env.getArgs
   window <- vadoWindow
-  page0 <- layoutPage $ vadoPage vadoWait $ emptyPage window
+  resman <- Resource.runManager
+
+  page0 <- layoutPage $ vadoPage vadoWait $ Page
+    { pageState = PageReady
+    , pageDocument = emptyDocument
+    , pageBoxes = Nothing
+    , pageResMan = resman
+    , pageUrl = fromJust $ URI.parseURI "vado:wait"
+    , pageHistory = ([], [])
+    , pageDebugNetwork = False
+    , pageResources = M.empty
+    , pageWindow = window
+    }
   renderDOM page0
 
-  args <- Env.getArgs
-  let url = fromMaybe "vado:home" $ listToMaybe args
-  page1 <- fetchURL url page0
+  let address = fromMaybe "vado:home" $ listToMaybe args
+  let url = fromMaybe (webSearch address) $ URI.parseURI address
+  flip St.evalStateT page0 $ runBrowserT $ do
+    changePage $ \page -> Just <$> navigatePage url page
+    asyncEventLoop
 
-  page <- layoutPage page1
-  vadoRedrawEventLoop page
+webSearch :: String -> URI
+webSearch s = fromJust $ URI.parseAbsoluteURI $ "https://google.com/search?q=" ++ es
+  where es = URI.escapeURIString URI.isAllowedInURI s
 
+navigatePage :: URI -> Page -> IO Page
+navigatePage uri page0 | uriScheme uri == "vado:" = do
+  case uriPath uri of
+    "home" -> do
+      -- TODO: cancel all pending resource requests
+      page <- layoutPage $ vadoPage vadoHome page0
+      return page{ pageState = PageReady }
+    _ ->
+      error $ "unknown address " ++ show uri
+navigatePage uri page = do
+  let resman = pageResMan page
+  let fullURI = uri `URI.relativeTo` (documentLocation $ pageDocument page)
+  -- TODO: check if fullURI is canonicalized:
+  liftIO $ do
+    Resource.requestGetMaybeStreaming resman fullURI ["text/html", "text"]
+    when (pageDebugNetwork page) $ putStrLn $ "navigatePage " ++ show fullURI
+  return $ page
+    { pageState = PageConnecting
+    , pageUrl = fullURI
+    , pageHistory = historyRewind (pageHistory page) (pageUrl page) fullURI
+    }
+  -- TODO: loading UI indicator, e.g. refresh button -> stop button
+
+-- | Page event loop.
+fps :: CInt
+fps = 60
+
+asyncEventLoop :: Browser ()
+asyncEventLoop = forever $ do
+  -- UI events
+  mbUIEvent <- liftIO $ SDL.waitEventTimeout (1000 `div` fps)
+  whenJust mbUIEvent $ \event -> do
+    case SDL.eventPayload event of
+      SDL.QuitEvent ->
+        liftIO $ exitSuccess
+      SDL.MouseMotionEvent _ ->
+        return ()
+
+      SDL.WindowResizedEvent e -> changePage $ \page -> do
+        let size = windowResizedEventSize e
+        let win = pageWindow page
+        SDL.destroyTexture $ windowTexture win
+        texture' <- Cairo.createCairoTexture (windowRenderer win) (fromIntegral <$> size)
+        let win' = win{ windowTexture=texture', windowViewport=(fromIntegral <$> size) }
+        -- TODO: optimize, don't do full layout again:
+        Just <$> layoutPage page{ pageWindow=win' }
+
+      SDL.KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
+        changePage $ \page -> do
+          -- print e
+          let focused = documentFocus $ pageDocument page
+          Just <$> dispatchEvent focused event page
+      SDL.KeyboardEvent e | SDL.keyboardEventKeyMotion e /= Released ->
+        return ()
+
+      SDL.TextInputEvent _ -> changePage $ \page -> do
+        let focused = documentFocus $ pageDocument page
+        Just <$> dispatchEvent focused event page
+
+      SDL.MouseWheelEvent e -> changePage $ \page -> do
+        let V2 _ dy = mouseWheelEventPos e
+        return $ Just $ vadoScroll (negate $ 10 * fromIntegral dy) page
+
+      SDL.MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released ->
+        changePage $ \page -> do
+          let P xy@(V2 xi yi) = mouseButtonEventPos e
+          putStrLn $ "clicked at " ++ show xy
+          case pageBoxes page of
+            Just boxes -> do
+              let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
+              let stack = P pagepos `findInBox` boxes
+              case boxNode <$> mbHead stack of
+                Just nid -> do
+                  putStrLn $ "MouseButtonEvent: dispatchEvent @" ++ show nid
+                  Just <$> dispatchEvent nid event page
+                Nothing ->
+                  return $ warning "click event without a box" Nothing
+            _ ->
+              return Nothing
+
+      _ ->
+        --liftIO $ print event
+        return ()
+
+  -- ResourceManager events
+  resman <- gets pageResMan
+  resEvents <- liftIO $ Resource.drainEvents resman
+
+  forM_ resEvents $ \(u, event) -> do
+    uri <- gets pageUrl
+    st <- gets pageState
+    resources <- gets (documentResourcesLoading . pageDocument)
+    case event of
+      Resource.EventStreamChunk _ -> return ()
+      _ -> liftIO $ putStrLn $ "[" ++ show st ++ "] " ++ show (u, event)
+    if u == uri then do
+      case (st, event) of
+        (_, Resource.EventConnectionError exc) | st `elem` [PageConnecting, PageStreaming] ->
+          changePage $ \page -> do
+            when (pageDebugNetwork page) $ print exc
+            let doc = vadoError $ T.pack $ show exc
+            return $ Just $ vadoPage doc page
+
+        (PageConnecting, Resource.EventStreamMetadata (req, _resp) _mbStream) ->
+          changePage $ \page -> do
+            when (pageDebugNetwork page) (print req) -- TODO: response too
+            let finalURI = HTTP.getUri req
+            return $ Just page
+              { pageState = PageStreaming
+              , pageDocument = emptyDocument{ documentLocation = finalURI }
+              , pageBoxes = Nothing
+              , pageWindow = (pageWindow page){ windowScroll = 0 }
+              }
+
+        (PageStreaming, Resource.EventStreamChunk (Resource.ChunkHtml update)) -> do
+          modifyPage $ \page -> do
+            Just <$> runPageDocument page (htmlDOMFromEvents update)
+
+          -- handle document resource requests:
+          runBrowserDocument $ do
+            resReqs <- gets (L.reverse . documentResourceRequests)
+            modify $ \doc -> doc{ documentResourceRequests = [] }
+            forM_ resReqs $ \(resuri, nid) -> do
+              liftIO $ putStrLn $ "eventloop: @" ++ show nid ++ " requests " ++ show resuri
+
+              wereLoading <- gets documentResourcesLoading
+              unless (resuri `M.member` wereLoading) $
+                liftIO $ Resource.requestGet resman resuri
+
+              let multimapAdd v = M.alter (\vs -> Just (v `S.insert` fromMaybe S.empty vs))
+              let nowLoading = multimapAdd nid resuri wereLoading
+              modify $ \doc -> doc{ documentResourcesLoading = nowLoading }
+
+        (PageStreaming, Resource.EventStreamClose) ->
+          changePage $ \page -> do
+            Just <$> layoutPage page{ pageState = PageReady }
+
+        _ ->
+          liftIO $ putStrLn $ "eventloop: invalid state " ++ show st ++ " for event " ++ show event
+        {-
+        (Resource.EventContentReady (_req, _resp) _content ->
+          -- TODO: check content-type, wrap standalone resource in html
+          -- TODO: construct the page, go to PageReady/PageWaitResources
+          error $ "TODO: eventloop: non-streaming page"
+        -}
+
+
+    else if u `M.member` resources then
+      {-
+      case (st, event) of
+        (_, Resource.EventConnectionError exc) | st /= PageConnecting ->
+          -- TODO: remove from documentResourcesLoading
+          undefined
+        (_, Resource.EventContentReady (_req, resp) content) ->
+          -- TODO: remove from documentResourcesLoading
+          -- TODO: decode the element to documentResources
+          let contentType = Resource.httpResponseContentType resp
+          -- TODO: notify the elements to relayout and redraw
+          undefined
+        _ ->
+        -}
+          liftIO $ putStrLn $ "eventloop: invalid state " ++ show st ++ " for event " ++ show event
+    else
+      return $ warning ("eventloop: unknown resource " ++ show u ++ " for event " ++ show event) ()
 
 --------------------------------------------------------------------------------
 -- UI: rendering and events
 
 data VadoWindow = VadoWindow
-  { vadoRenderer :: SDL.Renderer
-  , vadoTexture :: SDL.Texture
-  , vadoViewport :: V2 Double
-  , vadoScale :: V2 Double
+  { windowRenderer :: SDL.Renderer
+  , windowTexture :: SDL.Texture
+  , windowViewport :: V2 Double
+  , windowScroll :: Height
+  --, windowScale :: V2 Double
   }
 
+pageScroll :: Page -> Height
+pageScroll = windowScroll . pageWindow
+
 pageViewport :: Page -> V2 Double
-pageViewport = vadoViewport . pageWindow
+pageViewport = windowViewport . pageWindow
+
+vadoViewHeight :: Page -> Double
+vadoViewHeight page = h
+  where V2 _ h = pageViewport page
 
 defaultWindowSize :: Num n => V2 n
 defaultWindowSize = V2 800 600
+
+vadoScroll :: Height -> Page -> Page
+vadoScroll dy page = page{ pageWindow = (pageWindow page){ windowScroll = scroll } }
+  where
+    V2 _ pageH = maybe 0 boxDim $ pageBoxes page
+    scroll = max 0 $ min (pageScroll page + dy) (pageH - vadoViewHeight page)
 
 -- | Create window and texture
 vadoWindow :: IO VadoWindow
@@ -723,82 +1042,15 @@ vadoWindow = do
   renderer <- SDL.createRenderer window (-1) SDL.defaultRenderer
   Just (SDL.Rectangle _ viewport@(V2 w h)) <-
     SDL.get (SDL.rendererViewport renderer)
-  let scale = V2 1.3 1.3
-        --let (V2 w0 h0) = defaultWindowSize
-        --in V2 (fromIntegral w / w0) (fromIntegral h / h0)
   texture0 <- Cairo.createCairoTexture renderer viewport
   return $ VadoWindow
-    { vadoRenderer = renderer
-    , vadoViewport = V2 (fromIntegral w) (fromIntegral h)
-    , vadoScale = scale
-    , vadoTexture = texture0
+    { windowRenderer = renderer
+    , windowViewport = V2 (fromIntegral w) (fromIntegral h)
+    , windowTexture = texture0
+    , windowScroll = 0
     }
 
--- | Event loop.
-vadoEventLoop :: Page -> IO ()
-vadoEventLoop page = do
-  event <- waitEvent
-  case eventPayload event of
-    QuitEvent ->
-      return ()
-    WindowClosedEvent {} ->
-      return ()
-
-    WindowResizedEvent e -> do
-      let size = windowResizedEventSize e
-      let win = pageWindow page
-      SDL.destroyTexture $ vadoTexture win
-      texture' <- Cairo.createCairoTexture (vadoRenderer win) (fromIntegral <$> size)
-      let win' = win{ vadoTexture=texture', vadoViewport=(fromIntegral <$> size) }
-      -- TODO: optimize, don't do full layout again:
-      page' <- layoutPage page{ pageWindow=win' }
-      vadoRedrawEventLoop page'
-
-    MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released -> do
-      let P xy@(V2 xi yi) = mouseButtonEventPos e
-      putStrLn $ "clicked at " ++ show xy
-      page' <- case pageBoxes page of
-        Just boxes -> do
-          let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
-          let stack = P pagepos `findInBox` boxes
-          case boxNode <$> mbHead stack of
-            Just nid ->
-              dispatchEvent nid event $ warning ("MouseButtonEvent: dispatchEvent @" ++ show nid) page
-            Nothing ->
-              return $ warning "click event without a box" page
-        _ -> return page
-      vadoRedrawEventLoop page'
-
-    MouseWheelEvent e -> do
-      let V2 _ dy = mouseWheelEventPos e
-      vadoRedrawEventLoop $ vadoScroll (negate $ 10 * fromIntegral dy) page
-
-    --MouseMotionEvent _ ->
-    --  vadoEventLoop page
-
-    KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
-      let focused = documentFocus $ pageDocument page
-      in dispatchEvent focused event page >>= vadoRedrawEventLoop
-
-    TextInputEvent _ -> do
-      let focused = documentFocus $ pageDocument page
-      page' <- dispatchEvent focused event page
-      vadoRedrawEventLoop page'
-
-    _ -> do
-      vadoEventLoop page
-
-vadoRedrawEventLoop :: Page -> IO ()
-vadoRedrawEventLoop page = renderDOM page >> vadoEventLoop page
-
-vadoScroll :: Height -> Page -> Page
-vadoScroll dy page = page{ pageScroll = max 0 $ min (pageScroll page + dy) (pageH - vadoViewHeight page) }
-  where V2 _ pageH = maybe 0 boxDim $ pageBoxes page
-
-vadoViewHeight :: Page -> Double
-vadoViewHeight page = h
-  where V2 _ h = pageViewport page
-
+-- History
 historyRewind :: ([URI], [URI]) -> URI -> URI -> ([URI], [URI])
 historyRewind (back, forward) old new =
   case (back, forward) of
@@ -877,8 +1129,9 @@ clickLink _event nid page = do
   node <- inPageDocument page $ getElement nid
   case M.lookup "href" $ elementAttrs node of
     Just href -> do
-      layoutPage (vadoPage vadoWait page) >>= renderDOM
-      fetchURL (T.unpack href) page >>= layoutPage
+      case URI.parseURIReference $ T.unpack href of
+        Just uri -> navigatePage uri page
+        Nothing -> return page
     Nothing ->
       return page
 
@@ -952,7 +1205,7 @@ body_onKeyReleased :: EventHandler
 body_onKeyReleased event _nid page = do
   let SDL.KeyboardEvent e = SDL.eventPayload event
   let modifiers = SDL.keysymModifier $ SDL.keyboardEventKeysym e
-  -- putStrLn $ "body_onKeyReleased: " ++ show e
+  --putStrLn $ "body_onKeyReleased: " ++ show e
   case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
     SDL.KeycodeE | isKeyCtrlShiftPressed modifiers -> do
       return page{ pageDebugNetwork = not (pageDebugNetwork page) } -- toggle network debug output
@@ -963,7 +1216,7 @@ body_onKeyReleased event _nid page = do
       printHistory (pageHistory page) (pageUrl page) -- show History
       return page
     SDL.KeycodeHome | isKeyAltPressed modifiers ->
-      fetchURL "vado:home" page >>= layoutPage
+      navigatePage (fromJust $ URI.parseURI "vado:home") page
     SDL.KeycodeHome ->
       return $ vadoScroll (negate $ pageScroll page) page
     SDL.KeycodeI | isKeyCtrlShiftPressed modifiers -> do
@@ -974,7 +1227,7 @@ body_onKeyReleased event _nid page = do
       print (pageBoxes page) >> return page
     SDL.KeycodeLeft | isKeyAltPressed modifiers ->
       case pageHistory page of
-        (prevurl:_, _) -> fetchURL (show prevurl) page >>= layoutPage
+        (prevurl:_, _) -> navigatePage prevurl page
         _ -> return page
     SDL.KeycodePageDown -> do
       return $ vadoScroll (vadoViewHeight page) page
@@ -982,201 +1235,11 @@ body_onKeyReleased event _nid page = do
       return $ vadoScroll (negate $ vadoViewHeight page) page
     SDL.KeycodeRight | isKeyAltPressed modifiers ->
       case pageHistory page of
-        (_, nexturl:_) -> fetchURL (show nexturl) page >>= layoutPage
+        (_, nexturl:_) -> navigatePage nexturl page
         _ -> return page
     _ ->
       return page
 
---------------------------------------------------------------------------------
--- HTTP request, caches and local storage
-
-data HTTPResource
-  = ImageResource !(V2 Double) SDL.Texture
-
-fetchURL :: String -> Page -> IO Page
-fetchURL url page = do
-  -- drop page resources: nope, they are cached.
-  case url of
-    "vado:home" ->
-      return $ vadoPage vadoHome page
-    "vado:error" ->
-      errorPage "vado:error"
-    _ ->
-      fetchHTTP url page `Exc.catches`
-        [ Exc.Handler $ \(e :: HttpException) -> errorPage (show e)
-        , Exc.Handler $ \(e :: Exc.SomeException) -> errorPage ("SomeException: " ++ show e)
-        -- ^ "thanks" to TLS code.
-        ]
-  where
-    errorPage msg = return $ vadoPage (vadoError $ T.pack msg) page
-
-fetchHTTP :: String -> Page -> IO Page
-fetchHTTP url page = do
-  startT <- getCPUTime
-  let prevuri = pageUrl page
-  let absuri =
-        if URI.isAbsoluteURI url then fromJust $ URI.parseURI url
-        else maybe (error $ "invalid url: " ++ url) (`URI.relativeTo` prevuri) (URI.parseURIReference url)
-  request0 <- HTTP.parseRequest (show absuri)
-  let pageReq = request0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "Vado Browser") ] }
-  when (pageDebugNetwork page) $ print pageReq
-
-  httpman <- HTTP.newManager TLS.tlsManagerSettings
-  (body, headers, pageURI) <- HTTP.withResponseHistory pageReq httpman $ \respHistory -> do
-    let uri = HTTP.getUri $ HTTP.hrFinalRequest respHistory
-    let pageResp = HTTP.hrFinalResponse respHistory
-    let headers = HTTP.responseHeaders pageResp
-    body <- B.fromChunks <$> HTTP.brConsume (HTTP.responseBody pageResp)
-    return (body, headers, uri)
-
-  let history = historyRewind (pageHistory page) prevuri pageURI
-
-  let contentType = maybe "text/html" (T.toLower . T.decodeLatin1 . snd) $ L.find (\(name, _) -> name == "Content-Type") headers
-
-  if "text/html" `T.isPrefixOf` contentType then do
-    let document = HTML.parseLBS body
-    let root = XML.documentRoot document
-    -- TODO: html attributes, if any
-    -- TODO: move the structure fixup into htmlDOMFromXML
-    let htmlnode =
-          let topnodes = mapMaybe (\case XML.NodeElement el -> Just el; _ -> Nothing) $ XML.elementNodes root
-              headnode = fromMaybe (xmlElement "head" []) $ L.find (\el -> tagName el == "head") topnodes
-              bodynode = fromMaybe (xmlElement "body" $ XML.elementNodes root) $ L.find (\el -> tagName el == "body") topnodes
-          in xmlNode "html" [XML.NodeElement headnode, XML.NodeElement bodynode]
-
-    doc <- fromEmptyDocument $ htmlDOMFromXML htmlnode
-
-    let imageurls = mapMaybe (\nid -> M.lookup "src" $ elementAttrs (documentAllNodes doc IM.! nid)) $ IM.elems $ documentImages doc
-    resources <- forM (S.toList $ S.fromList imageurls) $ \imgurl ->
-        fetchResource page{pageUrl=pageURI} httpman imgurl `Exc.catches`
-          [ Exc.Handler $ \(e :: HttpException) -> return $ warning (Exc.displayException e) []
-          , Exc.Handler $ \(e :: SDL.SDLException) -> return $ warning (Exc.displayException e) []
-          -- ^ e.g. image decoding
-          , Exc.Handler $ \(e :: Exc.SomeException) -> return $ warning (Exc.displayException e) []
-          -- ^ "thanks" to TLS code.
-          ]
-    endT <- getCPUTime
-    let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
-    putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
-
-    return page
-      { pageUrl = pageURI
-      , pageDocument = doc
-      , pageResources = M.fromList (concat resources) `mappend` pageResources page
-      , pageScroll = 0
-      , pageHistory = history
-      }
-  else if "text/" `T.isPrefixOf` contentType then do
-    let respbody = T.decodeUtf8 $ B.toStrict body
-    doc <- fromEmptyDocument $ htmlDOMFromXML $
-      xmlNode "html"
-        [ xmlNode "head" []
-        , xmlNode "body" [ xmlNode "pre" [ XML.NodeContent respbody ] ]
-        ]
-    return page
-      { pageUrl = pageURI
-      , pageDocument = doc
-      , pageScroll = 0
-      , pageHistory = history
-      }
-  else if "image/" `T.isPrefixOf` contentType then do
-  {-
-    let body' = B.toStrict body
-    (img, resources) <- case Image.format body' of
-      Just _ -> do
-        bitmap <- Image.decode body'
-        V2 w h <- SDL.surfaceDimensions bitmap
-        let wh = V2 (fromIntegral w) (fromIntegral h)
-        let node = emptyNode{ domContent=Left (ImageContent (T.pack url) (Just wh)) }
-        texture <- SDL.createTextureFromSurface (vadoRenderer $ pageWindow page) bitmap
-        return (node, M.fromList [(T.pack url, ImageResource wh texture)])
-      _ ->
-        let node = makeTextNode (T.pack $ "Error[" ++ url ++ "]: Image format not supported")
-        in return (node, M.fromList [])
-        -}
-    -- TODO: insert img into resources
-    doc <- fromEmptyDocument $ htmlDOMFromXML $
-      xmlNode "html"
-        [ xmlNode "head" []
-        , xmlNode "body" [ xmlNode' "img" [("href", T.pack $ show pageURI)] [] ]
-        ]
-    return page
-      { pageUrl = pageURI
-      , pageDocument = doc
-      , pageResources = undefined
-      , pageScroll = 0
-      , pageHistory = history
-      }
-  else
-    error $ "TODO: Content-Type " ++ T.unpack contentType
-
-
-fetchResource :: Page -> HTTP.Manager -> Text -> IO [(Text, HTTPResource)]
-fetchResource Page{pageUrl=pageURI, pageResources=pageRes, pageWindow=pageWin} httpman imgurl = do
-  case M.lookup imgurl pageRes of
-    Just res -> return [(imgurl, res)]
-    Nothing -> fetch imgurl >>= maybe (return []) decode
-  where
-    fetch :: Text -> IO (Maybe Bs.ByteString)
-    fetch url | "data:" `T.isPrefixOf` url =
-      case Atto.parseOnly attoDataUrl url of
-        Right (_, bytes) -> return $ Just bytes
-        Left e -> return $ warning (show e) Nothing
-    fetch url =
-      case parseURIReference (T.unpack url) of
-        Nothing ->
-          return $ warning ("Could not parse URL: " ++ T.unpack url) Nothing
-        Just u -> do
-          req <- HTTP.parseUrlThrow (show (u `relativeTo` pageURI))
-          putStrLn $ concat
-            [ T.unpack $ T.decodeLatin1 $ HTTP.method req, " "
-            , if HTTP.secure req then "https://" else "http://"
-            , T.unpack $ T.decodeLatin1 $ HTTP.host req
-            , case (HTTP.secure req, HTTP.port req) of (True, 443) -> ""; (False, 80) -> ""; (_,p) -> ":" ++ show p
-            , T.unpack $ T.decodeLatin1 $ HTTP.path req
-            ]
-          resp <- HTTP.httpLbs req httpman
-          return (Just $ B.toStrict $ HTTP.responseBody resp)
-
-    decode :: Bs.ByteString -> IO [(Text, HTTPResource)]
-    decode content =
-      case Image.format content of
-        Just _ -> do
-          bitmap <- Image.decode content
-          V2 w h <- SDL.surfaceDimensions bitmap
-          let wh = V2 (fromIntegral w) (fromIntegral h)
-          texture <- SDL.createTextureFromSurface (vadoRenderer pageWin) bitmap
-          return [(imgurl, ImageResource wh texture)]
-        _ ->
-          return $ warning ("Image format not supported: " ++ T.unpack imgurl) []
-
-attoDataUrl :: Atto.Parser (Text, Bs.ByteString)
-attoDataUrl = do
-  _ <- Atto.string "data:"
-  (mty, msub, _mparams) <- Atto.option ("text", "plain", []) attoMimeType
-  -- TODO: use charset from _mparams?
-  isBase64 <- Atto.option False (Atto.string ";base64" *> pure True)
-  _ <- Atto.char ','
-  bytes <- (Bc.pack . T.unpack) <$> Atto.takeText
-  let dayta = (if isBase64 then B64.decodeLenient else urlDecode False) bytes
-  return (T.concat [mty, "/", msub], dayta)
-
-attoMimeType :: Atto.Parser (Text, Text, [(Text, Text)])
-attoMimeType = do
-    mtype <- token
-    _ <- Atto.char '/'
-    msubtype <- token
-    params <- Atto.many' (Atto.char ';' *> parameter)
-    return (mtype, msubtype, params)
-  where
-    tsspecials = "()<>@,;:\\\"/[]?="  -- see RFC 2045
-    token = T.pack <$> (Atto.many1 $ Atto.satisfy $ \c -> Atto.notInClass tsspecials c && not (C.isSpace c))
-    qstr = fail "TODO: quoted strings as mime/type;parameter='value'"
-    parameter = do
-      attr <- token
-      _ <- Atto.char '='
-      value <- token <|> qstr
-      return (T.toLower attr, value)
 
 --------------------------------------------------------------------------------
 -- Layout engine
@@ -1252,6 +1315,8 @@ newtype LayoutOver m a
 
 -- | Entry point for layout procedure
 layoutPage :: Page -> IO Page
+layoutPage page@Page{..} | documentBody pageDocument == noElement =
+  return $ warning ("layoutPage: no body") page
 layoutPage page@Page{..} = do
     let body = elementRef pageDocument (documentBody pageDocument)
     (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle body
@@ -1259,7 +1324,7 @@ layoutPage page@Page{..} = do
   where
     ctx = LayoutCtx { ltResources = pageResources }
     params = LayoutParams { ltWidth = w }
-    VadoWindow { vadoViewport = V2 w _, vadoTexture = texture } = pageWindow
+    VadoWindow { windowViewport = V2 w _, windowTexture = texture } = pageWindow
 
 
 elementToBoxes :: CanMeasureText m =>
@@ -1652,7 +1717,7 @@ renderDOM Page{ pageBoxes = Nothing } =
   return $ warning "renderDOM: page is not layed out yet" ()
 renderDOM page@Page{ pageBoxes = Just body } = do
   let minY = pageScroll page
-  let (texture, renderer) = let win = pageWindow page in (vadoTexture win, vadoRenderer win)
+  let (texture, renderer) = let win = pageWindow page in (windowTexture win, windowRenderer win)
 
   let (stpush, _) = boxStyling body
   let backgroundColor = case M.lookup CSSBackgroundColor stpush of
@@ -1663,7 +1728,7 @@ renderDOM page@Page{ pageBoxes = Just body } = do
     Canvas.background backgroundColor
     withStyling body (0, 0, noStyle) $ \st ->
       renderTree (pageDocument page) (minY, minY + vadoViewHeight page) (0, 0, st) body
-  SDL.copy (vadoRenderer $ pageWindow page) texture Nothing Nothing
+  SDL.copy (windowRenderer $ pageWindow page) texture Nothing Nothing
 
   forM_ replaced $ \(rect, content) -> do
     case content of
@@ -1675,7 +1740,7 @@ renderDOM page@Page{ pageBoxes = Just body } = do
             let pos = P $ V2 (cint x) (cint (y - minY))
             let dim = V2 (cint dx) (cint dy)
             let rect' = SDL.Rectangle pos dim
-            SDL.copy (vadoRenderer $ pageWindow page) imgtexture Nothing (Just rect')
+            SDL.copy (windowRenderer $ pageWindow page) imgtexture Nothing (Just rect')
           Nothing ->
             return $ warning ("renderDOM: no resource for <img src=" ++ show (T.unpack href) ++ ">") ()
       other ->
@@ -2435,15 +2500,17 @@ builtinHTMLStyleFor tag attrs = do
 -- | Built-in vado:pages
 
 vadoPage :: Document -> Page -> Page
-vadoPage doc page = (emptyPage $ pageWindow page)
-  { pageDocument = doc
-  , pageUrl = nullURI
+vadoPage doc page = page
+  { pageState = PageReady
+  , pageDocument = doc
+  , pageBoxes = Nothing
+  , pageWindow = (pageWindow page){ windowScroll = 0 }
   }
-
 
 vadoHome :: Document
 vadoHome =
   MId.runIdentity $ fromEmptyDocument $ do
+    modify $ \doc -> doc{ documentLocation = fromJust $ URI.parseURI "vado:home" }
     htmlDOMFromXML $ xmlHtml body
     Just nid <- getElementById "vado"
     addEventListener nid "keyup" url_onKeyReleased
@@ -2468,9 +2535,11 @@ vadoHome =
       case SDL.keysymKeycode keysym of
         SDL.KeycodeReturn -> do
           node <- inPageDocument page $ getElement nid
-          let Left (InputTextContent href) = elementContent node
+          let Left (InputTextContent address) = elementContent node
           layoutPage (vadoPage vadoWait page) >>= renderDOM
-          fetchURL (T.unpack href) page >>= layoutPage
+          let mbHref =  URI.parseURI $ T.unpack address
+          let href = fromMaybe (webSearch $ T.unpack address) mbHref
+          navigatePage href page
         _ -> return page
 
 

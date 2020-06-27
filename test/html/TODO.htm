@@ -34,16 +34,23 @@
 <li>[DONE: 2020/06/13] Refactor: DOM as an IntMap with integer "pointers"; page monad</li>
 <li>[DONE: 2020/06/14] UI: basic event dispatch for elements</li>
 <li>[DONE: 2020/06/20] UI: history, going back and forth</li>
+<li>[DONE: 2020/06/28] Network: parse a HTTP response as it comes, build DOM concurrently (conduits?)</li>
+<li>[DONE: 2020/06/28] Network: Resource Manager in a separate green thread</li>
+<li>[DONE: 2020/06/28] Network: fetching resources concurrently</li>
 <li>[WIP] Refactor: a proper CSS parser from <code>css-text</code></li>
 <li>[WIP] CSS, Layout: margins, borders and padding</li>
+<li>Refactor: split fetching data, decoding data and presenting content</li>
+<li>Layout: building render tree concurrently, update the screen with incomplete document</li>
+<li>Layout: incremental node changes instead of full page layouts</li>
+<li>Layout: use Pango to layout text and manage fonts</li>
+<li>Fonts: choose sensible default fonts depending on the platform</li>
+<li>Network: progressive image decoding</li>
 <li>CSS: some <code>&lt;body&gt;</code> padding</li>
 <li>CSS: parse <code>&lt;style&gt;</code> tags</li>
 <li>HTML, UI: &lt;ol&gt;, numbered lists</li>
 <li>UI: better text input widget</li>
 <li>UI: focus element on click, defocus other elements</li>
 <li>UI, HTML: walk focusable elements with <kbd>Tab</kbd> key, handling <code>tabindex</code></li>
-<li>Fonts: choose sensible default fonts depending on the platform</li>
-<li>Fonts: font/glyph cache, fallbacks for different writing systems.</li>
 <li>HTML: <code>&lt;details&gt;</code> tag</li>
 <li>CSS: CSS priority resolution and rule storage</li>
 <li>CSS: <code>line-height</code></li>
@@ -72,10 +79,6 @@
 <li>UI: <a href="vado:help">vado:help</a>, more discoverability</li>
 <li>UI: optimized resize</li>
 <li>Network: <code>file://</code> resource scheme</li>
-<li>Network: parse a HTTP response as it comes, build DOM and BoxTree concurrently (conduits?)</li>
-<li>Refactor: split fetching data, decoding data and presenting content; future: progressive encoding and presenting</li>
-<li>Network: a separate green thread</li>
-<li>Network: fetching resources concurrently</li>
 <li>Network: cookies</li>
 <li>Network: basic HTTP auth</li>
 </ul>
