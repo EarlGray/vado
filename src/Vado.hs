@@ -29,6 +29,7 @@ import           Data.Text (Text)
 import qualified Data.Text as T
 import           Foreign.C.Types (CInt)
 import           Linear.V2 (V2(..))
+import qualified Network.HTTP.Client as HTTP
 import           Network.URI as URI
 import qualified SDL
 import qualified SDL.Cairo as Cairo
@@ -92,20 +93,10 @@ data Page = Page
 
 -- | Set of states in the page state machine:
 data PageState
-  = PageWaitMetadata URI
-  -- ^ page at uri has been requested to load: awaiting headers or connection error
-  | PageHeadStreaming
-  -- ^ right after receiving first bytes until </head>
-  --   if there's no <head>, jump to PageBodyStreaming
-  | PageWaitHeadResources (S.Set URI)
-  -- ^ after </head>, there is a set of blocking CSS resources.
-  --   DOM tree is being built, but not layed out yet.
-  | PageBodyStreaming
-  -- ^ DOM tree is being built, layed out and rendered.
-  | PageWaitResources (S.Set URI)
-  -- ^ DOM tree is ready, but there are pending resource requests.
-  | PageReady
-  -- ^ DOM and resources are loaded.
+  = PageConnecting      -- page at uri: awaiting headers or connection error
+  | PageStreaming       -- streaming page and a set of resources
+  -- | PageWaitResources   -- DOM tree is ready, but there are pending resource requests.
+  | PageReady           -- DOM and resources are loaded.
   deriving (Eq, Show)
 
 newtype BrowserT m a = BrowserT { runBrowserT :: StateT Page m a }
@@ -117,13 +108,22 @@ withPage action = do
   page <- get
   liftIO $ action page
 
+modifyPage :: (Page -> IO (Maybe Page)) -> Browser ()
+modifyPage action = do
+  page0 <- get
+  mbPage <- liftIO $ action page0
+  whenJust mbPage put
+
 changePage :: (Page -> IO (Maybe Page)) -> Browser ()
 changePage action = do
   page0 <- get
   mbPage <- liftIO $ action page0
   whenJust mbPage $ \page -> do
-    liftIO $ renderDOM page
-    put page
+    page' <- case pageBoxes page of
+      Nothing -> liftIO $ layoutPage page
+      _ -> return page
+    liftIO $ renderDOM page'
+    put page'
 
 -- | This is a window to render on the screen.
 -- |   - contains a document
@@ -138,10 +138,12 @@ data Document = Document
   { documentAllNodes :: IM.IntMap Element
   , documentNewID :: ElementID
   , documentBuildState :: [ElementID]     -- current open elements during adding
-  , documentResources :: M.Map URI HTTPResource
-  , documentResourcesLoading :: S.Set URI
-  -- , documentResourceRequests :: [URI]
+
+  , documentLocation :: URI
   , documentXMLType :: Maybe XML.Doctype
+  , documentResources :: DOMResourceMap
+  , documentResourcesLoading :: M.Map URI (S.Set ElementID)   -- to remember what's in flight
+  , documentResourceRequests :: [(URI, ElementID)]  -- to queue requests from inside DocumentT
 
   , documentHead :: ElementID
   , documentBody :: ElementID
@@ -159,9 +161,11 @@ emptyDocument = Document
   { documentAllNodes = IM.fromList [(htmlElement, documentElement)]
   , documentNewID = htmlElement + 1
   , documentBuildState = [htmlElement]
+  , documentLocation = nullURI
   , documentXMLType = Nothing
   , documentResources = M.empty
-  , documentResourcesLoading = S.empty
+  , documentResourcesLoading = M.empty
+  , documentResourceRequests = []
   , documentHead = noElement
   , documentBody = noElement
   , documentFocus = noElement
@@ -277,6 +281,7 @@ domtreeAppendChild :: Monad m =>
                       -> DocumentT m ElementID
 domtreeAppendChild mbXML content = do
   opened <- gets documentBuildState
+  when (L.null opened) $ error "domtreeAppendChild: no opened elements"
   let pid = head opened
   parent <- getElement pid
   case elementContent parent of
@@ -344,8 +349,8 @@ domtreeStartElement (tag, attrs) = do
 
 domtreeEndElement :: Monad m => DocumentT m ElementID
 domtreeEndElement = do
-  (_:opened) <- gets documentBuildState
-  modify $ \doc -> doc{ documentBuildState = opened }
+  opened <- gets documentBuildState
+  modify $ \doc -> doc{ documentBuildState = tail opened }
   return $ fromMaybe noElement $ mbHead opened
 
 
@@ -445,6 +450,7 @@ emptyElement = Element
   , elementStyleAttr = noStyle
   }
 
+
 -- | Content of a leaf DOM node,
 -- i.e. what is to be drawn in this node.
 -- either a block or inline element, e.g. some text.
@@ -468,6 +474,15 @@ instance Show DOMContent where
   show (InputTextContent t) = "TextInputContent \"" ++ T.unpack t ++ "\""
 
 
+-- Map from a URI to the resource and the list of elements that use this resource
+type DOMResourceMap = M.Map URI (HTTPResource, S.Set ElementID)
+
+data HTTPResource
+  = ImageResource !(V2 Double) SDL.Texture
+
+instance Show HTTPResource where
+  show (ImageResource dim _) = show $ "ImageResource " ++ show dim
+
 --------------------------------------------------------------------------------
 -- | Normalize an XML tree of elements and text, possibly with
 -- attributes like style and event handlers.
@@ -484,7 +499,7 @@ htmlDOMFromXML = \case
         domStartHTMLElement tagattrs
         forM_ (XML.elementNodes el) $ \child ->
           htmlDOMFromXML child
-        domEndHTMLElement
+        domEndHTMLElement (tagName el)
 
   XML.NodeContent txt ->
     domAppendHTMLContent Nothing (TextContent txt)
@@ -497,14 +512,14 @@ htmlDOMFromEvents = \case
       modify $ \doc -> doc{ documentXMLType = Just $ XMLTy.Doctype doctype mbExtID }
     XMLTy.EventContent content -> do
       domAppendHTMLContent Nothing (TextContent $ xmlContent content)
-      --error $ "TODO: htmlDOMFromEvents $ EventContent " ++ T.unpack (xmlContent content)
     XMLTy.EventBeginElement name attrs0 -> do
       let tag = xmlTextName name
       let attrs = M.fromList $ map xmlAttr attrs0
       case htmlDOMContent (tag, attrs) of
         Just content -> domAppendHTMLContent (Just (tag, attrs)) content
         Nothing -> domStartHTMLElement (tag, attrs)
-      --error $ "TODO: htmlDOMFromEvents $ EventBeginElement " ++ T.unpack tag ++ " " ++ show attrs
+    XMLTy.EventEndElement name -> do
+      domEndHTMLElement (xmlTextName name)
     XMLTy.EventBeginDocument -> return ()
     XMLTy.EventEndDocument -> return ()    -- TODO: close all open tags
     XMLTy.EventEndDoctype -> return ()
@@ -523,6 +538,8 @@ htmlDOMContent :: TagAttrs -> Maybe DOMContent
 htmlDOMContent = \case
     ("hr", _) ->
       Just $ HorizLineContent
+    ("br", _) ->
+      Just $ NewlineContent
 
     ("img", attrs) -> do
       case M.lookup "src" attrs of
@@ -559,15 +576,20 @@ domAppendHTMLContent mbTagAttrs content = do
     nid <- domtreeAppendChild mbTagAttrs content
     domParseHTMLAttributes nid
 
-domEndHTMLElement :: Monad m => DocumentT m ()
-domEndHTMLElement = do
-  nid <- gets documentBuildState
-  node <- getElement (head nid)
+domEndHTMLElement :: Monad m => Text -> DocumentT m ()
+domEndHTMLElement name | name `elem` ["hr", "br", "img", "input"] =
+  return ()
+domEndHTMLElement name = do
+  opened <- gets documentBuildState
+  whenJust (mbHead opened) $ \nid -> do
+    node <- getElement nid
+    when (elementTag node /= name) $
+      error $ "domEndHTMLElement: " ++ show (elementTag node) ++ " /= " ++ show name
+    case elementTag node of
+      "title" -> return ()    -- TODO: add documentTitle
+      "style" -> return ()    -- TODO: parse it or request the resource
+      _ -> return ()
   void $ domtreeEndElement
-  case elementTag node of
-    "title" -> return ()    -- TODO: add documentTitle
-    "style" -> return ()    -- TODO: parse it or request the resource
-    _ -> return ()
 
 domParseHTMLAttributes :: Monad m => ElementID -> DocumentT m ()
 domParseHTMLAttributes nid = do
@@ -575,14 +597,19 @@ domParseHTMLAttributes nid = do
   let tag = elementTag node
   case elementTag node of
     "head" -> modify $ \doc ->
-       if documentHead doc == noElement
-       then doc{ documentHead = nid }
-       else warning "domParseHTMLAttributes: more than one <head>" doc
+        if documentHead doc == noElement
+        then doc{ documentHead = nid }
+        else warning "domParseHTMLAttributes: more than one <head>" doc
     "body" -> modify $ \doc ->
-       if documentBody doc == noElement
-       then doc{ documentBody = nid }
-       else warning "domParseHTMLAttributes: more than one <body>" doc
-    "img" -> modify $ \doc -> doc { documentImages = intmapAppend nid (documentImages doc) } -- TODO: request the resource
+        if documentBody doc == noElement
+        then doc{ documentBody = nid, documentFocus = nid }
+        else warning "domParseHTMLAttributes: more than one <body>" doc
+    "img" -> do
+        let src = M.lookup "src" $ elementAttrs node
+            mbResHref = (URI.parseURIReference . T.unpack) =<< src
+        whenJust mbResHref (domResourceFetch nid)
+        modify $ \doc ->
+          doc{ documentImages = intmapAppend nid (documentImages doc) }
     _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
@@ -596,6 +623,10 @@ domParseHTMLAttributes nid = do
   whenJust (M.lookup "autofocus" $ elementAttrs node) $ \_ ->
     modify $ \doc -> doc{ documentFocus = nid }
 
+domResourceFetch :: Monad m => ElementID -> URI -> DocumentT m ()
+domResourceFetch nid href = modify $ \doc ->
+  let resuri = href `URI.relativeTo` documentLocation doc
+  in doc{ documentResourceRequests = (resuri, nid) : documentResourceRequests doc }
 
 -- elementOwnStyle is useful for computing own style,
 -- Do not cascade it over a parent style, use cascadeStyle.
@@ -783,7 +814,7 @@ vadoMain = do
     , pageResMan = resman
     , pageUrl = fromJust $ URI.parseURI "vado:wait"
     , pageHistory = ([], [])
-    , pageDebugNetwork = True
+    , pageDebugNetwork = False
     , pageResources = M.empty
     , pageWindow = window
     }
@@ -792,15 +823,15 @@ vadoMain = do
   let address = fromMaybe "vado:home" $ listToMaybe args
   let url = fromMaybe (webSearch address) $ URI.parseURI address
   flip St.evalStateT page0 $ runBrowserT $ do
-    navigatePage url
+    changePage $ \page -> Just <$> navigatePage url page
     asyncEventLoop
 
 webSearch :: String -> URI
 webSearch s = fromJust $ URI.parseAbsoluteURI $ "https://google.com/search?q=" ++ es
   where es = URI.escapeURIString URI.isAllowedInURI s
 
-vadoNavigate :: URI -> Page -> IO Page
-vadoNavigate uri page0 | uriScheme uri == "vado:" = do
+navigatePage :: URI -> Page -> IO Page
+navigatePage uri page0 | uriScheme uri == "vado:" = do
   case uriPath uri of
     "home" -> do
       -- TODO: cancel all pending resource requests
@@ -808,24 +839,27 @@ vadoNavigate uri page0 | uriScheme uri == "vado:" = do
       return page{ pageState = PageReady }
     _ ->
       error $ "unknown address " ++ show uri
-vadoNavigate uri page = do
+navigatePage uri page = do
   let resman = pageResMan page
+  let fullURI = uri `URI.relativeTo` (documentLocation $ pageDocument page)
+  -- TODO: check if fullURI is canonicalized:
   liftIO $ do
-    Resource.requestGetMaybeStreaming resman uri ["text/html", "text"]
-    when (pageDebugNetwork page) $ putStrLn $ "vadoNavigate " ++ show uri
-  return $ page{ pageState = PageWaitMetadata uri }
+    Resource.requestGetMaybeStreaming resman fullURI ["text/html", "text"]
+    when (pageDebugNetwork page) $ putStrLn $ "navigatePage " ++ show fullURI
+  return $ page
+    { pageState = PageConnecting
+    , pageUrl = fullURI
+    , pageHistory = historyRewind (pageHistory page) (pageUrl page) fullURI
+    }
   -- TODO: loading UI indicator, e.g. refresh button -> stop button
 
-navigatePage :: URI -> Browser ()
-navigatePage uri = changePage $ \page -> Just <$> vadoNavigate uri page
-
 -- | Page event loop.
-
 fps :: CInt
 fps = 60
 
 asyncEventLoop :: Browser ()
 asyncEventLoop = forever $ do
+  -- UI events
   mbUIEvent <- liftIO $ SDL.waitEventTimeout (1000 `div` fps)
   whenJust mbUIEvent $ \event -> do
     case SDL.eventPayload event of
@@ -845,6 +879,7 @@ asyncEventLoop = forever $ do
 
       SDL.KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
         changePage $ \page -> do
+          -- print e
           let focused = documentFocus $ pageDocument page
           Just <$> dispatchEvent focused event page
       SDL.KeyboardEvent e | SDL.keyboardEventKeyMotion e /= Released ->
@@ -876,12 +911,89 @@ asyncEventLoop = forever $ do
               return Nothing
 
       _ ->
-        liftIO $ print event
+        --liftIO $ print event
+        return ()
 
+  -- ResourceManager events
   resman <- gets pageResMan
   resEvents <- liftIO $ Resource.drainEvents resman
-  forM_ resEvents $ \event -> do
-    liftIO $ print event
+
+  forM_ resEvents $ \(u, event) -> do
+    uri <- gets pageUrl
+    st <- gets pageState
+    resources <- gets (documentResourcesLoading . pageDocument)
+    case event of
+      Resource.EventStreamChunk _ -> return ()
+      _ -> liftIO $ putStrLn $ "[" ++ show st ++ "] " ++ show (u, event)
+    if u == uri then do
+      case (st, event) of
+        (_, Resource.EventConnectionError exc) | st `elem` [PageConnecting, PageStreaming] ->
+          changePage $ \page -> do
+            when (pageDebugNetwork page) $ print exc
+            let doc = vadoError $ T.pack $ show exc
+            return $ Just $ vadoPage doc page
+
+        (PageConnecting, Resource.EventStreamMetadata (req, _resp) _mbStream) ->
+          changePage $ \page -> do
+            when (pageDebugNetwork page) (print req) -- TODO: response too
+            let finalURI = HTTP.getUri req
+            return $ Just page
+              { pageState = PageStreaming
+              , pageDocument = emptyDocument{ documentLocation = finalURI }
+              , pageBoxes = Nothing
+              , pageWindow = (pageWindow page){ windowScroll = 0 }
+              }
+
+        (PageStreaming, Resource.EventStreamChunk (Resource.ChunkHtml update)) -> do
+          modifyPage $ \page -> do
+            Just <$> runPageDocument page (htmlDOMFromEvents update)
+
+          -- handle document resource requests:
+          runBrowserDocument $ do
+            resReqs <- gets (L.reverse . documentResourceRequests)
+            modify $ \doc -> doc{ documentResourceRequests = [] }
+            forM_ resReqs $ \(resuri, nid) -> do
+              liftIO $ putStrLn $ "eventloop: @" ++ show nid ++ " requests " ++ show resuri
+
+              wereLoading <- gets documentResourcesLoading
+              unless (resuri `M.member` wereLoading) $
+                liftIO $ Resource.requestGet resman resuri
+
+              let multimapAdd v = M.alter (\vs -> Just (v `S.insert` fromMaybe S.empty vs))
+              let nowLoading = multimapAdd nid resuri wereLoading
+              modify $ \doc -> doc{ documentResourcesLoading = nowLoading }
+
+        (PageStreaming, Resource.EventStreamClose) ->
+          changePage $ \page -> do
+            Just <$> layoutPage page{ pageState = PageReady }
+
+        _ ->
+          liftIO $ putStrLn $ "eventloop: invalid state " ++ show st ++ " for event " ++ show event
+        {-
+        (Resource.EventContentReady (_req, _resp) _content ->
+          -- TODO: check content-type, wrap standalone resource in html
+          -- TODO: construct the page, go to PageReady/PageWaitResources
+          error $ "TODO: eventloop: non-streaming page"
+        -}
+
+
+    else if u `M.member` resources then
+      {-
+      case (st, event) of
+        (_, Resource.EventConnectionError exc) | st /= PageConnecting ->
+          -- TODO: remove from documentResourcesLoading
+          undefined
+        (_, Resource.EventContentReady (_req, resp) content) ->
+          -- TODO: remove from documentResourcesLoading
+          -- TODO: decode the element to documentResources
+          let contentType = Resource.httpResponseContentType resp
+          -- TODO: notify the elements to relayout and redraw
+          undefined
+        _ ->
+        -}
+          liftIO $ putStrLn $ "eventloop: invalid state " ++ show st ++ " for event " ++ show event
+    else
+      return $ warning ("eventloop: unknown resource " ++ show u ++ " for event " ++ show event) ()
 
 --------------------------------------------------------------------------------
 -- UI: rendering and events
@@ -1017,8 +1129,8 @@ clickLink _event nid page = do
   node <- inPageDocument page $ getElement nid
   case M.lookup "href" $ elementAttrs node of
     Just href -> do
-      case URI.parseURI $ T.unpack href of
-        Just uri -> vadoNavigate uri page
+      case URI.parseURIReference $ T.unpack href of
+        Just uri -> navigatePage uri page
         Nothing -> return page
     Nothing ->
       return page
@@ -1093,7 +1205,7 @@ body_onKeyReleased :: EventHandler
 body_onKeyReleased event _nid page = do
   let SDL.KeyboardEvent e = SDL.eventPayload event
   let modifiers = SDL.keysymModifier $ SDL.keyboardEventKeysym e
-  -- putStrLn $ "body_onKeyReleased: " ++ show e
+  --putStrLn $ "body_onKeyReleased: " ++ show e
   case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
     SDL.KeycodeE | isKeyCtrlShiftPressed modifiers -> do
       return page{ pageDebugNetwork = not (pageDebugNetwork page) } -- toggle network debug output
@@ -1104,7 +1216,7 @@ body_onKeyReleased event _nid page = do
       printHistory (pageHistory page) (pageUrl page) -- show History
       return page
     SDL.KeycodeHome | isKeyAltPressed modifiers ->
-      vadoNavigate (fromJust $ URI.parseURI "vado:home") page
+      navigatePage (fromJust $ URI.parseURI "vado:home") page
     SDL.KeycodeHome ->
       return $ vadoScroll (negate $ pageScroll page) page
     SDL.KeycodeI | isKeyCtrlShiftPressed modifiers -> do
@@ -1115,7 +1227,7 @@ body_onKeyReleased event _nid page = do
       print (pageBoxes page) >> return page
     SDL.KeycodeLeft | isKeyAltPressed modifiers ->
       case pageHistory page of
-        (prevurl:_, _) -> vadoNavigate prevurl page
+        (prevurl:_, _) -> navigatePage prevurl page
         _ -> return page
     SDL.KeycodePageDown -> do
       return $ vadoScroll (vadoViewHeight page) page
@@ -1123,180 +1235,11 @@ body_onKeyReleased event _nid page = do
       return $ vadoScroll (negate $ vadoViewHeight page) page
     SDL.KeycodeRight | isKeyAltPressed modifiers ->
       case pageHistory page of
-        (_, nexturl:_) -> vadoNavigate nexturl page
+        (_, nexturl:_) -> navigatePage nexturl page
         _ -> return page
     _ ->
       return page
 
---------------------------------------------------------------------------------
--- HTTP request, caches and local storage
-
-data HTTPResource
-  = ImageResource !(V2 Double) SDL.Texture
-
-instance Show HTTPResource where
-  show (ImageResource dim _) = show $ "ImageResource " ++ show dim
-{-
-fetchURL :: String -> Page -> IO Page
-fetchURL url page = do
-  -- drop page resources: nope, they are cached.
-  case url of
-    "vado:home" ->
-      return $ vadoPage vadoHome page
-    "vado:error" ->
-      errorPage "vado:error"
-    _ ->
-      fetchHTTP url page `Exc.catches`
-        [ Exc.Handler $ \(e :: HttpException) -> errorPage (show e)
-        , Exc.Handler $ \(e :: Exc.SomeException) -> errorPage ("SomeException: " ++ show e)
-        -- ^ "thanks" to TLS code.
-        ]
-  where
-    errorPage msg = return $ vadoPage (vadoError $ T.pack msg) page
-
-fetchHTTP :: String -> Page -> IO Page
-fetchHTTP url page = do
-  startT <- getCPUTime
-  let prevuri = pageUrl page
-  let absuri =
-        if URI.isAbsoluteURI url then fromJust $ URI.parseURI url
-        else maybe (error $ "invalid url: " ++ url) (`URI.relativeTo` prevuri) (URI.parseURIReference url)
-  request0 <- HTTP.parseRequest (show absuri)
-  let pageReq = request0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "Vado Browser") ] }
-  when (pageDebugNetwork page) $ print pageReq
-
-  httpman <- HTTP.newManager TLS.tlsManagerSettings
-  (body, headers, pageURI) <- HTTP.withResponseHistory pageReq httpman $ \respHistory -> do
-    let uri = HTTP.getUri $ HTTP.hrFinalRequest respHistory
-    let pageResp = HTTP.hrFinalResponse respHistory
-    let headers = HTTP.responseHeaders pageResp
-    body <- B.fromChunks <$> HTTP.brConsume (HTTP.responseBody pageResp)
-    return (body, headers, uri)
-
-  let history = historyRewind (pageHistory page) prevuri pageURI
-
-  let contentType = fromMaybe "text/html" $ Resource.httpHeader headers "Content-Type"
-  -- let contentType = maybe "text/html" (T.toLower . T.decodeLatin1 . snd) $ L.find (\(name, _) -> name == "Content-Type") headers
-
-  if "text/html" `T.isPrefixOf` contentType then do
-    let document = HTML.parseLBS body
-    let root = XML.documentRoot document
-    -- TODO: html attributes, if any
-    -- TODO: move the structure fixup into htmlDOMFromXML
-    let htmlnode =
-          let topnodes = mapMaybe (\case XML.NodeElement el -> Just el; _ -> Nothing) $ XML.elementNodes root
-              headnode = fromMaybe (xmlElement "head" []) $ L.find (\el -> tagName el == "head") topnodes
-              bodynode = fromMaybe (xmlElement "body" $ XML.elementNodes root) $ L.find (\el -> tagName el == "body") topnodes
-          in xmlNode "html" [XML.NodeElement headnode, XML.NodeElement bodynode]
-
-    doc <- fromEmptyDocument $ htmlDOMFromXML htmlnode
-
-    let imageurls = mapMaybe (\nid -> M.lookup "src" $ elementAttrs (documentAllNodes doc IM.! nid)) $ IM.elems $ documentImages doc
-    resources <- forM (S.toList $ S.fromList imageurls) $ \imgurl ->
-        fetchResource page{pageUrl=pageURI} httpman imgurl `Exc.catches`
-          [ Exc.Handler $ \(e :: HttpException) -> return $ warning (Exc.displayException e) []
-          , Exc.Handler $ \(e :: SDL.SDLException) -> return $ warning (Exc.displayException e) []
-          -- ^ e.g. image decoding
-          , Exc.Handler $ \(e :: Exc.SomeException) -> return $ warning (Exc.displayException e) []
-          -- ^ "thanks" to TLS code.
-          ]
-    endT <- getCPUTime
-    let pageloadT = fromIntegral (endT - startT) / (10.0^(12 :: Integer) :: Double)
-    putStrLn $ printf "@@@ %s: loaded in %0.3f sec" (show pageURI) pageloadT
-
-    return page
-      { pageUrl = pageURI
-      , pageDocument = doc
-      , pageResources = M.fromList (concat resources) `mappend` pageResources page
-      , pageHistory = history
-      , pageWindow = (pageWindow page){ windowScroll = 0 }
-      }
-  else if "text/" `T.isPrefixOf` contentType then do
-    let respbody = T.decodeUtf8 $ B.toStrict body
-    doc <- fromEmptyDocument $ htmlDOMFromXML $
-      xmlNode "html"
-        [ xmlNode "head" []
-        , xmlNode "body" [ xmlNode "pre" [ XML.NodeContent respbody ] ]
-        ]
-    return page
-      { pageUrl = pageURI
-      , pageDocument = doc
-      , pageHistory = history
-      , pageWindow = (pageWindow page){ windowScroll = 0 }
-      }
-  else if "image/" `T.isPrefixOf` contentType then do
-  {-
-    let body' = B.toStrict body
-    (img, resources) <- case Image.format body' of
-      Just _ -> do
-        bitmap <- Image.decode body'
-        V2 w h <- SDL.surfaceDimensions bitmap
-        let wh = V2 (fromIntegral w) (fromIntegral h)
-        let node = emptyNode{ domContent=Left (ImageContent (T.pack url) (Just wh)) }
-        texture <- SDL.createTextureFromSurface (vadoRenderer $ pageWindow page) bitmap
-        return (node, M.fromList [(T.pack url, ImageResource wh texture)])
-      _ ->
-        let node = makeTextNode (T.pack $ "Error[" ++ url ++ "]: Image format not supported")
-        in return (node, M.fromList [])
-        -}
-    -- TODO: insert img into resources
-    doc <- fromEmptyDocument $ htmlDOMFromXML $
-      xmlNode "html"
-        [ xmlNode "head" []
-        , xmlNode "body" [ xmlNode' "img" [("href", T.pack $ show pageURI)] [] ]
-        ]
-    return page
-      { pageUrl = pageURI
-      , pageDocument = doc
-      , pageResources = undefined
-      , pageHistory = history
-      , pageWindow = (pageWindow page){ windowScroll = 0 }
-      }
-  else
-    error $ "TODO: Content-Type " ++ T.unpack contentType
-
-fetchResource :: Page -> HTTP.Manager -> Text -> IO [(Text, HTTPResource)]
-fetchResource Page{pageUrl=pageURI, pageResources=pageRes, pageWindow=pageWin} httpman imgurl = do
-  case M.lookup imgurl pageRes of
-    Just res -> return [(imgurl, res)]
-    Nothing -> fetch imgurl >>= maybe (return []) decode
-  where
-    fetch :: Text -> IO (Maybe Bs.ByteString)
-    fetch url | "data:" `T.isPrefixOf` url =
-      case Atto.parseOnly attoDataUrl url of
-        Right (_, bytes) -> return $ Just bytes
-        Left e -> return $ warning (show e) Nothing
-    fetch url =
-      case parseURIReference (T.unpack url) of
-        Nothing ->
-          return $ warning ("Could not parse URL: " ++ T.unpack url) Nothing
-        Just u -> do
-          req <- HTTP.parseUrlThrow (show (u `relativeTo` pageURI))
-          putStrLn $ concat
-            [ T.unpack $ T.decodeLatin1 $ HTTP.method req, " "
-            , if HTTP.secure req then "https://" else "http://"
-            , T.unpack $ T.decodeLatin1 $ HTTP.host req
-            , case (HTTP.secure req, HTTP.port req) of (True, 443) -> ""; (False, 80) -> ""; (_,p) -> ":" ++ show p
-            , T.unpack $ T.decodeLatin1 $ HTTP.path req
-            ]
-          resp <- HTTP.httpLbs req httpman
-          return (Just $ B.toStrict $ HTTP.responseBody resp)
-
-    decode :: Bs.ByteString -> IO [(Text, HTTPResource)]
-    decode content =
-      case Image.format content of
-        Just _ -> do
-          bitmap <- Image.decode content
-          V2 w h <- SDL.surfaceDimensions bitmap
-          let wh = V2 (fromIntegral w) (fromIntegral h)
-          texture <- SDL.createTextureFromSurface (windowRenderer pageWin) bitmap
-          return [(imgurl, ImageResource wh texture)]
-        _ ->
-          return $ warning ("Image format not supported: " ++ T.unpack imgurl) []
--}
-
-{- TODO: move to Vado.Resource
--}
 
 --------------------------------------------------------------------------------
 -- Layout engine
@@ -1372,6 +1315,8 @@ newtype LayoutOver m a
 
 -- | Entry point for layout procedure
 layoutPage :: Page -> IO Page
+layoutPage page@Page{..} | documentBody pageDocument == noElement =
+  return $ warning ("layoutPage: no body") page
 layoutPage page@Page{..} = do
     let body = elementRef pageDocument (documentBody pageDocument)
     (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle body
@@ -2559,11 +2504,13 @@ vadoPage doc page = page
   { pageState = PageReady
   , pageDocument = doc
   , pageBoxes = Nothing
+  , pageWindow = (pageWindow page){ windowScroll = 0 }
   }
 
 vadoHome :: Document
 vadoHome =
   MId.runIdentity $ fromEmptyDocument $ do
+    modify $ \doc -> doc{ documentLocation = fromJust $ URI.parseURI "vado:home" }
     htmlDOMFromXML $ xmlHtml body
     Just nid <- getElementById "vado"
     addEventListener nid "keyup" url_onKeyReleased
@@ -2590,9 +2537,9 @@ vadoHome =
           node <- inPageDocument page $ getElement nid
           let Left (InputTextContent address) = elementContent node
           layoutPage (vadoPage vadoWait page) >>= renderDOM
-          let mbHref =  URI.parseAbsoluteURI $ T.unpack address
+          let mbHref =  URI.parseURI $ T.unpack address
           let href = fromMaybe (webSearch $ T.unpack address) mbHref
-          vadoNavigate href page
+          navigatePage href page
         _ -> return page
 
 

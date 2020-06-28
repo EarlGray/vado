@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -50,6 +51,10 @@ send chan message = atomically $ Ch.writeTMChan chan message
 httpHeader :: [HTTP.Header] -> HTTP.HeaderName -> Maybe Text
 httpHeader headers which = (T.toLower . T.decodeLatin1) <$> L.lookup which headers
 
+httpResponseContentType :: HTTP.Response HTTP.BodyReader -> Text
+httpResponseContentType resp =
+  fromMaybe "application/octet-stream" $ httpHeader (HTTP.responseHeaders resp) "content-type"
+
 -- | Resource Manager: public interface
 -- | It exposes non-blocking operations that put requests into a queue.
 -- | Results are obtained from Resource.waitEvent or Resource.drainEvents.
@@ -90,26 +95,32 @@ requestCancel Manager{..} uri = manReqChan `send` Cancel uri
 -- | Resource Manager events
 type Event = (URI, EventKind)
 data EventKind
-  = ResError Exc.SomeException
+  = EventConnectionError Exc.SomeException
   -- ^ could not connect
-  | ResMetadata (HTTP.Request, HTTP.Response HTTP.BodyReader) (Maybe Text)
+  | EventStreamMetadata (HTTP.Request, HTTP.Response HTTP.BodyReader) (Maybe Text)
   -- ^              final request and response;     maybe mime-type for streaming
-  | ResChunk Chunk
+  | EventStreamChunk Chunk
   -- ^ next chunk of a streamed resource
-  | ResClose
+  | EventStreamClose
   -- ^ no more chunks of a streamed resource
-  | ResReady Content
-  -- ^ body of the resource
+  | EventContentReady (HTTP.Request, HTTP.Response HTTP.BodyReader) Content
+  -- ^ content of the resource for non-streaming responses
+
+data Chunk
+  = ChunkHtml XML.Event
+  | ChunkText Text
+  | ChunkBytes Bs.ByteString
+  deriving (Eq, Show)
 
 data Content
   = ContentBytes Bs.ByteString
   | ContentXML XML.Document
-  deriving (Show, Eq)
+  deriving (Eq)
 
 instance Show EventKind where
-  show (ResError exc) = "ResError " ++ show exc
-  show (ResMetadata (req, resp) mbStreamType) = unlines $
-      ["ResMetadata " ++ maybe "" T.unpack mbStreamType
+  show (EventConnectionError exc) = "EventConnectionError " ++ show exc
+  show (EventStreamMetadata (req, resp) mbStreamType) = unlines $
+      ["EventStreamMetadata " ++ maybe "" T.unpack mbStreamType
       , "> " ++ show (HTTP.method req) ++ " " ++ show (HTTP.path req) ++ " " ++ show ver
       ]
       ++ (map (\(name, value) -> "> " ++ show name ++ ": " ++ show value) reqh)
@@ -120,15 +131,27 @@ instance Show EventKind where
       reqh = HTTP.requestHeaders req
       status = HTTP.responseStatus resp
       resph = HTTP.responseHeaders resp
-  show (ResChunk chunk) = "ResChunk " ++ show chunk
-  show (ResClose) = "ResClose"
-  show (ResReady content) = "ResReady " ++ show content
+  show (EventStreamChunk chunk) = "EventStreamChunk " ++ show chunk
+  show (EventStreamClose) = "EventStreamClose"
+  show (EventContentReady (req, resp) content) = unlines $
+      ["EventContentReady " ++ show content
+      , "> " ++ show (HTTP.method req) ++ " " ++ show (HTTP.path req) ++ " " ++ show ver
+      ]
+      ++ (map (\(name, value) -> "> " ++ show name ++ ": " ++ show value) reqh)
+      ++ ["< " ++ show (HTTP.statusCode status) ++ " " ++ show (HTTP.statusMessage status)]
+      ++ (map (\(name, value) -> "< " ++ show name ++ ": " ++ show value) resph)
+    where
+      ver = HTTP.requestVersion req
+      reqh = HTTP.requestHeaders req
+      status = HTTP.responseStatus resp
+      resph = HTTP.responseHeaders resp
 
-data Chunk
-  = ChunkHtml XML.Event
-  | ChunkText Text
-  | ChunkBytes Bs.ByteString
-  deriving (Eq, Show)
+instance Show Content where
+  show = \case
+    ContentXML _ ->
+      "Resource.ContentXML "
+    ContentBytes bs ->
+      "Resource.ContentBytes <" ++ show (Bs.length bs) ++ " bytes>"
 
 waitEvent :: Manager -> IO Event
 waitEvent resman = do
@@ -178,7 +201,6 @@ eventloop inch outch state = do
       tid <- CC.forkIO $ runStreaming mimetypes inch outch (manHTTPManager state) uri
       eventloop inch outch $ state{ manThreadByURI = M.insert uri tid $ manThreadByURI state }
     Done uri -> do
-      outch `send` (uri, ResClose)
       eventloop inch outch $ state{ manThreadByURI = M.delete uri $ manThreadByURI state }
     Cancel uri -> do
       forM_ (M.lookup uri $ manThreadByURI state) $ \tid ->
@@ -193,15 +215,16 @@ runStreaming mimetypes = runHttp maybeStreamBody
       let contentType = fromMaybe "application/octet-stream" $ httpHeader headers "content-type"
       if "text/html" `T.isPrefixOf` contentType && "text/html" `L.elem` mimetypes
       then runResourceT $ do
-        liftIO $ outch `send` (uri, ResMetadata (req, resp) (Just "text/html"))
+        liftIO $ outch `send` (uri, EventStreamMetadata (req, resp) (Just "text/html"))
         let body = HTTP.responseBody resp
         let consumeHttp _ = runResourceT $ do
               chunk <- liftIO $ HTTP.brRead body
               return $ if Bs.null chunk then Nothing else Just (chunk, ())
         runConduit $ CL.unfoldM consumeHttp ()
                   .| HTML.eventConduit
-                  .| CL.map (\chunk -> (uri, ResChunk (ChunkHtml chunk)))
+                  .| CL.map (\chunk -> (uri, EventStreamChunk (ChunkHtml chunk)))
                   .| Ch.sinkTMChan outch
+        liftIO $ outch `send` (uri, EventStreamClose)
       else
         bodyAsBytestring outch uri (req, resp)
 
@@ -210,7 +233,7 @@ type BodyHandler = Chan Event -> URI -> (HTTP.Request, HTTP.Response HTTP.BodyRe
 runHttp :: BodyHandler -> Chan Request -> Chan Event -> HTTP.Manager -> URI -> IO ()
 runHttp onBody inch outch httpman uri = do
     doHttp outch httpman uri onBody
-        `Exc.catch` \(e :: Exc.SomeException) -> outch `send` (uri, ResError e)
+        `Exc.catch` \(e :: Exc.SomeException) -> outch `send` (uri, EventConnectionError e)
     inch `send` Done uri
 
 doHttp :: Chan Event -> HTTP.Manager -> URI -> BodyHandler -> IO ()
@@ -225,9 +248,8 @@ doHttp outch httpman uri onBody = do
 
 bodyAsBytestring :: BodyHandler
 bodyAsBytestring outch uri (req, resp) = do
-  outch `send` (uri, ResMetadata (req, resp) Nothing)
   bs <- Bs.concat <$> HTTP.brConsume (HTTP.responseBody resp)
-  outch `send` (uri, ResReady $ ContentBytes bs)
+  outch `send` (uri, EventContentReady (req, resp) (ContentBytes bs))
 
 -- | data: urls helpers
 attoDataUrl :: Atto.Parser (Text, Bs.ByteString)
@@ -267,7 +289,7 @@ test address = do
   runResourceT $ do
     let sink (u, r) = do
           case r of
-            ResChunk (ChunkHtml (XML.EventBeginElement name attrs)) | name == "img" -> do
+            EventStreamChunk (ChunkHtml (XML.EventBeginElement name attrs)) | name == "img" -> do
               let Just ((XML.ContentText href):_) = L.lookup "src" attrs
               putStrLn $ "@@@ image: src=" ++ show href
               let Just rel = URI.parseURIReference $ T.unpack href
