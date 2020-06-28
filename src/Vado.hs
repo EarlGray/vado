@@ -8,17 +8,14 @@
 module Vado where
 
 import           Control.Applicative
-import qualified Control.Exception as Exc   -- TODO: safe-exceptions?
 import           Control.Monad
 import qualified Control.Monad.Identity as MId
 import           Control.Monad.RWS.Strict as RWS
 import           Control.Monad.State (StateT(..))
 import qualified Control.Monad.State as St
 import qualified Data.Attoparsec.Text as Atto
-import qualified Data.ByteString.Lazy as B
-import qualified Data.ByteString as Bs
-import qualified Data.ByteString.Base64 as B64
-import qualified Data.ByteString.Char8 as Bc
+--import qualified Data.ByteString.Lazy as B
+--import qualified Data.ByteString as Bs
 import qualified Data.Char as C
 import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
@@ -30,13 +27,8 @@ import           Data.Word (Word8)
 import           Data.Either (partitionEithers)
 import           Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
+import           Foreign.C.Types (CInt)
 import           Linear.V2 (V2(..))
-import qualified Network.HTTP.Client as HTTP
-import           Network.HTTP.Client.Internal (HttpException)
-import qualified Network.HTTP.Client.TLS as TLS
-import           Network.HTTP.Types.URI (urlDecode)
-import qualified Network.HTTP.Types.Header as HTTP
 import           Network.URI as URI
 import qualified SDL
 import qualified SDL.Cairo as Cairo
@@ -44,11 +36,9 @@ import qualified SDL.Cairo.Canvas as Canvas
 import           SDL.Event as SDL
 import qualified SDL.Image as Image
 import           SDL.Vect
-import           System.CPUTime (getCPUTime)
+--import           System.CPUTime (getCPUTime)
 import qualified System.Environment as Env
 import           System.Exit (exitSuccess)
-import qualified Text.HTML.DOM as HTML
-import           Text.Printf (printf)
 import           Text.Read (readMaybe)
 import qualified Text.XML as XML
 import qualified Data.XML.Types as XMLTy
@@ -121,6 +111,19 @@ data PageState
 newtype BrowserT m a = BrowserT { runBrowserT :: StateT Page m a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadState Page)
 type Browser a = BrowserT IO a
+
+withPage :: (Page -> IO a) -> Browser a
+withPage action = do
+  page <- get
+  liftIO $ action page
+
+changePage :: (Page -> IO (Maybe Page)) -> Browser ()
+changePage action = do
+  page0 <- get
+  mbPage <- liftIO $ action page0
+  whenJust mbPage $ \page -> do
+    liftIO $ renderDOM page
+    put page
 
 -- | This is a window to render on the screen.
 -- |   - contains a document
@@ -788,147 +791,97 @@ vadoMain = do
 
   let address = fromMaybe "vado:home" $ listToMaybe args
   let url = fromMaybe (webSearch address) $ URI.parseURI address
-  St.evalStateT (runBrowserT $ vadoNavigate url) page0
+  flip St.evalStateT page0 $ runBrowserT $ do
+    navigatePage url
+    asyncEventLoop
 
 webSearch :: String -> URI
 webSearch s = fromJust $ URI.parseAbsoluteURI $ "https://google.com/search?q=" ++ es
   where es = URI.escapeURIString URI.isAllowedInURI s
 
-vadoNavigate :: URI -> Browser ()
-vadoNavigate uri | uriScheme uri == "vado:" = do
+vadoNavigate :: URI -> Page -> IO Page
+vadoNavigate uri page0 | uriScheme uri == "vado:" = do
   case uriPath uri of
     "home" -> do
-      modify $ vadoPage vadoHome
-      page <- get
-      page1 <- liftIO $ do
-        page1 <- layoutPage page
-        renderDOM page1
-        return page1
-      put page1
-      eventloopReady
-    _ -> error $ "unknown address " ++ show uri
-
-vadoNavigate uri = do
-  resman <- gets pageResMan
-  debug <- gets pageDebugNetwork
+      -- TODO: cancel all pending resource requests
+      page <- layoutPage $ vadoPage vadoHome page0
+      return page{ pageState = PageReady }
+    _ ->
+      error $ "unknown address " ++ show uri
+vadoNavigate uri page = do
+  let resman = pageResMan page
   liftIO $ do
     Resource.requestGetMaybeStreaming resman uri ["text/html", "text"]
-    when debug $ putStrLn $ "vadoNavigate " ++ show uri
-  modify $ \page -> page{ pageState = PageWaitMetadata uri }
+    when (pageDebugNetwork page) $ putStrLn $ "vadoNavigate " ++ show uri
+  return $ page{ pageState = PageWaitMetadata uri }
   -- TODO: loading UI indicator, e.g. refresh button -> stop button
-  eventloopWaitMetadata
 
-{-
-  page1 <- fetchURL url page0
-
-  page <- layoutPage page1
-  vadoRedrawEventLoop page
--}
+navigatePage :: URI -> Browser ()
+navigatePage uri = changePage $ \page -> Just <$> vadoNavigate uri page
 
 -- | Page event loop.
 
-eventloopWaitMetadata :: Browser ()
-eventloopWaitMetadata = do
-  resman <- gets pageResMan
-  (uri, event) <- liftIO $ Resource.waitEvent resman
-  debug <- gets pageDebugNetwork
+fps :: CInt
+fps = 60
 
-  s <- gets pageState
-  if s /= PageWaitMetadata uri then do
-    liftIO $ putStrLn $ "eventloopWaitMetadata: unexpected uri: " ++ show (uri, event)
-    eventloopWaitMetadata
-  else
-    case event of
-      Resource.ResMetadata _ mbStream -> do
-        when debug $ liftIO $ print event
-        case mbStream of
-          Just "text/html" -> do
-            modify $ \page -> page
-                { pageState = PageHeadStreaming
-                , pageDocument = emptyDocument
-                , pageUrl = uri           -- TODO: UI indication that pageUrl has changed
-                , pageHistory = historyRewind (pageHistory page) (pageUrl page) uri
-                }
-            eventloopHeadStreaming
-          Just mime ->
-            error $ "TODO: eventloopWaitMetadata: streaming unknown type " ++ T.unpack mime
-          Nothing -> undefined
-      Resource.ResError exc ->
-        error $ "TODO: eventloopWaitMetadata: ResError " ++ show exc
-      _ -> undefined
+asyncEventLoop :: Browser ()
+asyncEventLoop = forever $ do
+  mbUIEvent <- liftIO $ SDL.waitEventTimeout (1000 `div` fps)
+  whenJust mbUIEvent $ \event -> do
+    case SDL.eventPayload event of
+      SDL.QuitEvent ->
+        liftIO $ exitSuccess
+      SDL.MouseMotionEvent _ ->
+        return ()
 
-eventloopHeadStreaming :: Browser ()
-eventloopHeadStreaming = do
-  resman <- gets pageResMan
-  (uri, event) <- liftIO $ Resource.waitEvent resman
-  --debug <- gets pageDebugNetwork
-
-  u <- gets pageUrl
-  case event of
-    Resource.ResChunk (Resource.ChunkHtml evXml) | u == uri -> do
-      runBrowserDocument $ htmlDOMFromEvents evXml
-      -- TODO: handle documentResourceRequests
-      case evXml of
-        XMLTy.EventEndElement name | name == "head" ->
-          error $ "TODO: eventloopHeadStreaming: </head>"
-      eventloopHeadStreaming
-    other ->
-      error $ "TODO: eventloopHeadStreaming: " ++ show (uri, other)
-
-eventloopReady :: Browser ()
-eventloopReady = do
-  page <- get
-  page' <- liftIO $ do
-    event <- SDL.waitEvent
-    case eventPayload event of
-      QuitEvent ->
-        exitSuccess
-      WindowClosedEvent {} ->
-        exitSuccess
-
-      WindowResizedEvent e -> do
+      SDL.WindowResizedEvent e -> changePage $ \page -> do
         let size = windowResizedEventSize e
         let win = pageWindow page
         SDL.destroyTexture $ windowTexture win
         texture' <- Cairo.createCairoTexture (windowRenderer win) (fromIntegral <$> size)
         let win' = win{ windowTexture=texture', windowViewport=(fromIntegral <$> size) }
         -- TODO: optimize, don't do full layout again:
-        layoutPage page{ pageWindow=win' }
+        Just <$> layoutPage page{ pageWindow=win' }
 
-      MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released -> do
-        let P xy@(V2 xi yi) = mouseButtonEventPos e
-        putStrLn $ "clicked at " ++ show xy
-        case pageBoxes page of
-          Just boxes -> do
-            let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
-            let stack = P pagepos `findInBox` boxes
-            case boxNode <$> mbHead stack of
-              Just nid ->
-                dispatchEvent nid event $ warning ("MouseButtonEvent: dispatchEvent @" ++ show nid) page
-              Nothing ->
-                return $ warning "click event without a box" page
-          _ -> return page
+      SDL.KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
+        changePage $ \page -> do
+          let focused = documentFocus $ pageDocument page
+          Just <$> dispatchEvent focused event page
+      SDL.KeyboardEvent e | SDL.keyboardEventKeyMotion e /= Released ->
+        return ()
 
-      MouseWheelEvent e -> do
+      SDL.TextInputEvent _ -> changePage $ \page -> do
+        let focused = documentFocus $ pageDocument page
+        Just <$> dispatchEvent focused event page
+
+      SDL.MouseWheelEvent e -> changePage $ \page -> do
         let V2 _ dy = mouseWheelEventPos e
-        return $ vadoScroll (negate $ 10 * fromIntegral dy) page
+        return $ Just $ vadoScroll (negate $ 10 * fromIntegral dy) page
 
-      --MouseMotionEvent _ ->
-      --  vadoEventLoop page
+      SDL.MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released ->
+        changePage $ \page -> do
+          let P xy@(V2 xi yi) = mouseButtonEventPos e
+          putStrLn $ "clicked at " ++ show xy
+          case pageBoxes page of
+            Just boxes -> do
+              let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
+              let stack = P pagepos `findInBox` boxes
+              case boxNode <$> mbHead stack of
+                Just nid -> do
+                  putStrLn $ "MouseButtonEvent: dispatchEvent @" ++ show nid
+                  Just <$> dispatchEvent nid event page
+                Nothing ->
+                  return $ warning "click event without a box" Nothing
+            _ ->
+              return Nothing
 
-      KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
-        let focused = documentFocus $ pageDocument page
-        in dispatchEvent focused event page
+      _ ->
+        liftIO $ print event
 
-      TextInputEvent _ -> do
-        let focused = documentFocus $ pageDocument page
-        dispatchEvent focused event page
-
-      _ -> do
-        return page
-  put page'
-  liftIO $ renderDOM page'
-  eventloopReady
+  resman <- gets pageResMan
+  resEvents <- liftIO $ Resource.drainEvents resman
+  forM_ resEvents $ \event -> do
+    liftIO $ print event
 
 --------------------------------------------------------------------------------
 -- UI: rendering and events
@@ -984,64 +937,6 @@ vadoWindow = do
     , windowTexture = texture0
     , windowScroll = 0
     }
-
--- | Event loop.
-vadoEventLoop :: Page -> IO ()
-vadoEventLoop page = do
-  event <- SDL.waitEvent
-  case eventPayload event of
-    QuitEvent ->
-      return ()
-    WindowClosedEvent {} ->
-      return ()
-
-    WindowResizedEvent e -> do
-      let size = windowResizedEventSize e
-      let win = pageWindow page
-      SDL.destroyTexture $ windowTexture win
-      texture' <- Cairo.createCairoTexture (windowRenderer win) (fromIntegral <$> size)
-      let win' = win{ windowTexture=texture', windowViewport=(fromIntegral <$> size) }
-      -- TODO: optimize, don't do full layout again:
-      page' <- layoutPage page{ pageWindow=win' }
-      vadoRedrawEventLoop page'
-
-    MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released -> do
-      let P xy@(V2 xi yi) = mouseButtonEventPos e
-      putStrLn $ "clicked at " ++ show xy
-      page' <- case pageBoxes page of
-        Just boxes -> do
-          let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
-          let stack = P pagepos `findInBox` boxes
-          case boxNode <$> mbHead stack of
-            Just nid ->
-              dispatchEvent nid event $ warning ("MouseButtonEvent: dispatchEvent @" ++ show nid) page
-            Nothing ->
-              return $ warning "click event without a box" page
-        _ -> return page
-      vadoRedrawEventLoop page'
-
-    MouseWheelEvent e -> do
-      let V2 _ dy = mouseWheelEventPos e
-      vadoRedrawEventLoop $ vadoScroll (negate $ 10 * fromIntegral dy) page
-
-    --MouseMotionEvent _ ->
-    --  vadoEventLoop page
-
-    KeyboardEvent e | SDL.keyboardEventKeyMotion e == Released ->
-      let focused = documentFocus $ pageDocument page
-      in dispatchEvent focused event page >>= vadoRedrawEventLoop
-
-    TextInputEvent _ -> do
-      let focused = documentFocus $ pageDocument page
-      page' <- dispatchEvent focused event page
-      vadoRedrawEventLoop page'
-
-    _ -> do
-      vadoEventLoop page
-
-vadoRedrawEventLoop :: Page -> IO ()
-vadoRedrawEventLoop page = renderDOM page >> vadoEventLoop page
-
 
 -- History
 historyRewind :: ([URI], [URI]) -> URI -> URI -> ([URI], [URI])
@@ -1122,8 +1017,9 @@ clickLink _event nid page = do
   node <- inPageDocument page $ getElement nid
   case M.lookup "href" $ elementAttrs node of
     Just href -> do
-      layoutPage (vadoPage vadoWait page) >>= renderDOM
-      fetchURL (T.unpack href) page >>= layoutPage
+      case URI.parseURI $ T.unpack href of
+        Just uri -> vadoNavigate uri page
+        Nothing -> return page
     Nothing ->
       return page
 
@@ -1208,7 +1104,7 @@ body_onKeyReleased event _nid page = do
       printHistory (pageHistory page) (pageUrl page) -- show History
       return page
     SDL.KeycodeHome | isKeyAltPressed modifiers ->
-      fetchURL "vado:home" page >>= layoutPage
+      vadoNavigate (fromJust $ URI.parseURI "vado:home") page
     SDL.KeycodeHome ->
       return $ vadoScroll (negate $ pageScroll page) page
     SDL.KeycodeI | isKeyCtrlShiftPressed modifiers -> do
@@ -1219,7 +1115,7 @@ body_onKeyReleased event _nid page = do
       print (pageBoxes page) >> return page
     SDL.KeycodeLeft | isKeyAltPressed modifiers ->
       case pageHistory page of
-        (prevurl:_, _) -> fetchURL (show prevurl) page >>= layoutPage
+        (prevurl:_, _) -> vadoNavigate prevurl page
         _ -> return page
     SDL.KeycodePageDown -> do
       return $ vadoScroll (vadoViewHeight page) page
@@ -1227,7 +1123,7 @@ body_onKeyReleased event _nid page = do
       return $ vadoScroll (negate $ vadoViewHeight page) page
     SDL.KeycodeRight | isKeyAltPressed modifiers ->
       case pageHistory page of
-        (_, nexturl:_) -> fetchURL (show nexturl) page >>= layoutPage
+        (_, nexturl:_) -> vadoNavigate nexturl page
         _ -> return page
     _ ->
       return page
@@ -1240,7 +1136,7 @@ data HTTPResource
 
 instance Show HTTPResource where
   show (ImageResource dim _) = show $ "ImageResource " ++ show dim
-
+{-
 fetchURL :: String -> Page -> IO Page
 fetchURL url page = do
   -- drop page resources: nope, they are cached.
@@ -1359,7 +1255,6 @@ fetchHTTP url page = do
   else
     error $ "TODO: Content-Type " ++ T.unpack contentType
 
-
 fetchResource :: Page -> HTTP.Manager -> Text -> IO [(Text, HTTPResource)]
 fetchResource Page{pageUrl=pageURI, pageResources=pageRes, pageWindow=pageWin} httpman imgurl = do
   case M.lookup imgurl pageRes of
@@ -1398,34 +1293,10 @@ fetchResource Page{pageUrl=pageURI, pageResources=pageRes, pageWindow=pageWin} h
           return [(imgurl, ImageResource wh texture)]
         _ ->
           return $ warning ("Image format not supported: " ++ T.unpack imgurl) []
+-}
 
-attoDataUrl :: Atto.Parser (Text, Bs.ByteString)
-attoDataUrl = do
-  _ <- Atto.string "data:"
-  (mty, msub, _mparams) <- Atto.option ("text", "plain", []) attoMimeType
-  -- TODO: use charset from _mparams?
-  isBase64 <- Atto.option False (Atto.string ";base64" *> pure True)
-  _ <- Atto.char ','
-  bytes <- (Bc.pack . T.unpack) <$> Atto.takeText
-  let dayta = (if isBase64 then B64.decodeLenient else urlDecode False) bytes
-  return (T.concat [mty, "/", msub], dayta)
-
-attoMimeType :: Atto.Parser (Text, Text, [(Text, Text)])
-attoMimeType = do
-    mtype <- token
-    _ <- Atto.char '/'
-    msubtype <- token
-    params <- Atto.many' (Atto.char ';' *> parameter)
-    return (mtype, msubtype, params)
-  where
-    tsspecials = "()<>@,;:\\\"/[]?="  -- see RFC 2045
-    token = T.pack <$> (Atto.many1 $ Atto.satisfy $ \c -> Atto.notInClass tsspecials c && not (C.isSpace c))
-    qstr = fail "TODO: quoted strings as mime/type;parameter='value'"
-    parameter = do
-      attr <- token
-      _ <- Atto.char '='
-      value <- token <|> qstr
-      return (T.toLower attr, value)
+{- TODO: move to Vado.Resource
+-}
 
 --------------------------------------------------------------------------------
 -- Layout engine
@@ -2717,9 +2588,11 @@ vadoHome =
       case SDL.keysymKeycode keysym of
         SDL.KeycodeReturn -> do
           node <- inPageDocument page $ getElement nid
-          let Left (InputTextContent href) = elementContent node
+          let Left (InputTextContent address) = elementContent node
           layoutPage (vadoPage vadoWait page) >>= renderDOM
-          fetchURL (T.unpack href) page >>= layoutPage
+          let mbHref =  URI.parseAbsoluteURI $ T.unpack address
+          let href = fromMaybe (webSearch $ T.unpack address) mbHref
+          vadoNavigate href page
         _ -> return page
 
 

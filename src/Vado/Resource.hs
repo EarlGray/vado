@@ -4,12 +4,16 @@
 
 module Vado.Resource where
 
+import           Control.Applicative hiding (empty)
 import qualified Control.Exception as Exc   -- TODO: safe-exceptions?
 import           Control.Monad (forM_)
 import           Control.Monad.IO.Class (liftIO)
 import           Control.Monad.Trans.Resource (runResourceT)
 
 import qualified Data.ByteString as Bs
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Char8 as Bc
+import qualified Data.Char as C
 import qualified Data.List as L
 import qualified Data.Map.Strict as M
 import           Data.Maybe
@@ -18,6 +22,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import           Network.URI as URI
 
+import qualified Data.Attoparsec.Text as Atto
 
 import           Data.Conduit (runConduit, (.|))
 import qualified Data.Conduit.List as CL
@@ -30,6 +35,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as TLS
 import qualified Network.HTTP.Types.Header as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
+import           Network.HTTP.Types.URI (urlDecode)
 
 import qualified Data.XML.Types as XML
 import qualified Text.HTML.DOM as HTML
@@ -223,6 +229,34 @@ bodyAsBytestring outch uri (req, resp) = do
   bs <- Bs.concat <$> HTTP.brConsume (HTTP.responseBody resp)
   outch `send` (uri, ResReady $ ContentBytes bs)
 
+-- | data: urls helpers
+attoDataUrl :: Atto.Parser (Text, Bs.ByteString)
+attoDataUrl = do
+  _ <- Atto.string "data:"
+  (mty, msub, _mparams) <- Atto.option ("text", "plain", []) attoMimeType
+  -- TODO: use charset from _mparams?
+  isBase64 <- Atto.option False (Atto.string ";base64" *> pure True)
+  _ <- Atto.char ','
+  bytes <- (Bc.pack . T.unpack) <$> Atto.takeText
+  let dayta = (if isBase64 then B64.decodeLenient else urlDecode False) bytes
+  return (T.concat [mty, "/", msub], dayta)
+
+attoMimeType :: Atto.Parser (Text, Text, [(Text, Text)])
+attoMimeType = do
+    mtype <- token
+    _ <- Atto.char '/'
+    msubtype <- token
+    params <- Atto.many' (Atto.char ';' *> parameter)
+    return (mtype, msubtype, params)
+  where
+    tsspecials = "()<>@,;:\\\"/[]?="  -- see RFC 2045
+    token = T.pack <$> (Atto.many1 $ Atto.satisfy $ \c -> Atto.notInClass tsspecials c && not (C.isSpace c))
+    qstr = fail "TODO: quoted strings as mime/type;parameter='value'"
+    parameter = do
+      attr <- token
+      _ <- Atto.char '='
+      value <- token <|> qstr
+      return (T.toLower attr, value)
 
 -- | Quick test: e.g. `test "http://localhost:8000/acid0.html"`
 test :: Text -> IO ()
