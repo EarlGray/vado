@@ -14,8 +14,6 @@ import           Control.Monad.RWS.Strict as RWS
 import           Control.Monad.State (StateT(..))
 import qualified Control.Monad.State as St
 import qualified Data.Attoparsec.Text as Atto
---import qualified Data.ByteString.Lazy as B
---import qualified Data.ByteString as Bs
 import qualified Data.Char as C
 import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
@@ -82,12 +80,11 @@ data Page = Page
   , pageBoxes :: Maybe BoxTree
   -- ^ Rendering tree
 
-  , pageResMan :: Resource.Manager
   , pageUrl :: URI
   , pageHistory :: ([URI], [URI])   -- back, forward
   , pageDebugNetwork :: Bool
-  , pageResources :: M.Map Text HTTPResource  -- TODO: use URI
 
+  , pageResMan :: Resource.Manager
   , pageWindow :: VadoWindow
   }
 
@@ -95,12 +92,11 @@ data Page = Page
 data PageState
   = PageConnecting      -- page at uri: awaiting headers or connection error
   | PageStreaming       -- streaming page and a set of resources
-  -- | PageWaitResources   -- DOM tree is ready, but there are pending resource requests.
   | PageReady           -- DOM and resources are loaded.
   deriving (Eq, Show)
 
 newtype BrowserT m a = BrowserT { runBrowserT :: StateT Page m a }
-  deriving (Functor, Applicative, Monad, MonadIO, MonadState Page)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadState Page, MonadTrans)
 type Browser a = BrowserT IO a
 
 withPage :: (Page -> IO a) -> Browser a
@@ -190,6 +186,7 @@ instance HasDebugView Document where
       , "documentBody = @" ++ show (documentBody doc)
       , "documentNewID = @" ++ show (documentNewID doc)
       , "documentFocus = @" ++ show (documentFocus doc)
+      , "documentResources = " ++ show (documentResources doc)
       ] ++ shownode (elementRef doc htmlElement)
     where
       shownode :: ElementRef -> [String]
@@ -220,19 +217,32 @@ inPageDocument :: Monad m => Page -> DocumentT m a -> m a
 inPageDocument page f = inDocument (pageDocument page) f
 
 -- | Run an action on DocumentT, return a changed document.
-runDocument :: Monad m => Document -> DocumentT m a -> m Document
+runDocument :: Monad m => Document -> DocumentT m () -> m Document
 runDocument doc f = St.execStateT f doc
 
-runPageDocument :: Monad m => Page -> DocumentT m a -> m Page
+runPageDocument :: Monad m => Page -> DocumentT m () -> m Page
 runPageDocument page f = do
   doc' <- runDocument (pageDocument page) f
   return page{ pageDocument = doc' }
 
-runBrowserDocument :: DocumentT IO a -> Browser ()
+inBrowserDocument :: Monad m => DocumentT m a -> BrowserT m a
+inBrowserDocument f = do
+  doc <- gets pageDocument
+  lift $ inDocument doc f
+
+runBrowserDocument :: Monad m => DocumentT m () -> BrowserT m ()
 runBrowserDocument f = BrowserT $ do
   doc <- gets pageDocument
-  doc' <- liftIO $ runDocument doc f
+  doc' <- lift $ runDocument doc f
   modify $ \page -> page{ pageDocument = doc' }
+
+logDebug :: String -> Browser ()
+logDebug msg = do
+  debug <- gets pageDebugNetwork
+  when debug $ liftIO $ putStrLn msg
+
+logWarn :: MonadIO m => String -> m ()
+logWarn msg = liftIO $ putStrLn msg
 
 takeNewID :: Monad m => DocumentT m ElementID
 takeNewID = do
@@ -273,7 +283,7 @@ modifyElement nid f = alterNode nid (fmap f)
 
 -- | domtree low-level functions: Building document DOM tree
 
-fromEmptyDocument :: Monad m => DocumentT m a -> m Document
+fromEmptyDocument :: Monad m => DocumentT m () -> m Document
 fromEmptyDocument f = runDocument emptyDocument f
 
 domtreeAppendChild :: Monad m =>
@@ -357,10 +367,6 @@ domtreeEndElement = do
 -- | Traversing document DOM tree
 --domtreeTraverse :: (Traversable t, Applicative f) => (ElementRef -> f b) -> Document -> f (t b)
 --domtreeTraverse = undefined
-
--- | Request a redraw for a node
-documentRedraw :: Monad m => ElementID -> DocumentT m ()
-documentRedraw _nid = return $ warning "TODO: documentRedraw" ()
 
 addEventListener :: Monad m => ElementID -> Text -> EventHandler -> DocumentT m ()
 addEventListener nid eventname handler = do
@@ -459,7 +465,7 @@ data DOMContent
   -- ^ A text node
   | NewlineContent
   -- ^ Force newline here, usually corresponds to <br>
-  | ImageContent !Text (Maybe (V2 Double))
+  | ImageContent URI (Maybe (V2 Double))
   -- ^           ^href
   | HorizLineContent
   -- ^ <hr>
@@ -470,7 +476,7 @@ instance Show DOMContent where
   show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
   show NewlineContent = "NewlineContent"
   show HorizLineContent = "HorizLineContent"
-  show (ImageContent href wh) = "ImageContent " ++ T.unpack href ++ " (" ++ show wh ++ ")"
+  show (ImageContent href wh) = "ImageContent " ++ show href ++ " (" ++ show wh ++ ")"
   show (InputTextContent t) = "TextInputContent \"" ++ T.unpack t ++ "\""
 
 
@@ -489,10 +495,11 @@ instance Show HTTPResource where
 
 htmlDOMFromXML :: Monad m => XML.Node -> DocumentT m ()
 htmlDOMFromXML = \case
-  XML.NodeElement el ->
+  XML.NodeElement el -> do
+    doc <- get
     let attrs = M.mapKeys xmlTextName (XML.elementAttributes el)
-        tagattrs = (tagName el, attrs)
-    in case htmlDOMContent tagattrs of
+    let tagattrs = (tagName el, attrs)
+    case htmlDOMContent doc tagattrs of
       Just content ->
         domAppendHTMLContent (Just tagattrs) content
       _ -> do
@@ -515,7 +522,8 @@ htmlDOMFromEvents = \case
     XMLTy.EventBeginElement name attrs0 -> do
       let tag = xmlTextName name
       let attrs = M.fromList $ map xmlAttr attrs0
-      case htmlDOMContent (tag, attrs) of
+      doc <- get
+      case htmlDOMContent doc (tag, attrs) of
         Just content -> domAppendHTMLContent (Just (tag, attrs)) content
         Nothing -> domStartHTMLElement (tag, attrs)
     XMLTy.EventEndElement name -> do
@@ -534,23 +542,24 @@ htmlDOMFromEvents = \case
     xmlAttr (k, vs) = (xmlTextName k, xmlContent $ last vs)
 
 -- decide if this HTML tag is a piece of content or a container:
-htmlDOMContent :: TagAttrs -> Maybe DOMContent
-htmlDOMContent = \case
+htmlDOMContent :: Document -> TagAttrs -> Maybe DOMContent
+htmlDOMContent doc = \case
     ("hr", _) ->
       Just $ HorizLineContent
     ("br", _) ->
       Just $ NewlineContent
 
     ("img", attrs) -> do
-      case M.lookup "src" attrs of
+      let alt = TextContent $ fromMaybe "<img>" $ M.lookup "alt" attrs
+      Just $ case M.lookup "src" attrs of
+        -- Just href | "data:" `T.isPrefixOf` href -> undefined
         Just href ->
-          let width = mbReadText =<< M.lookup "width" attrs
-              height = mbReadText =<< M.lookup "height" attrs
-              wh = liftM2 V2 width height
-          in Just $ ImageContent href wh
+          let wh = liftA2 V2 (decodeAttr "width" attrs) (decodeAttr "height" attrs)
+          in case URI.parseURIReference (T.unpack href) of
+            Just u -> ImageContent (u `URI.relativeTo` documentLocation doc) wh
+            Nothing -> warning ("htmlDOMContent: failed to parse img src=" ++ T.unpack href) alt
         _ ->
-          let alt = fromMaybe "<img>" $ M.lookup "alt" attrs
-          in Just $ TextContent alt
+          alt
 
     ("input", attrs) ->
       let value = fromMaybe "" $ M.lookup "value" attrs
@@ -584,7 +593,8 @@ domEndHTMLElement name = do
   whenJust (mbHead opened) $ \nid -> do
     node <- getElement nid
     when (elementTag node /= name) $
-      error $ "domEndHTMLElement: " ++ show (elementTag node) ++ " /= " ++ show name
+      error $ "domEndHTMLElement: " ++ show (elementTag node) ++" /= " ++ show name++
+              ", opened=" ++ show opened
     case elementTag node of
       "title" -> return ()    -- TODO: add documentTitle
       "style" -> return ()    -- TODO: parse it or request the resource
@@ -623,10 +633,15 @@ domParseHTMLAttributes nid = do
   whenJust (M.lookup "autofocus" $ elementAttrs node) $ \_ ->
     modify $ \doc -> doc{ documentFocus = nid }
 
+-- | Having an effect inside DocumentT m (): just queue them for the wrapper to handle.
 domResourceFetch :: Monad m => ElementID -> URI -> DocumentT m ()
 domResourceFetch nid href = modify $ \doc ->
   let resuri = href `URI.relativeTo` documentLocation doc
   in doc{ documentResourceRequests = (resuri, nid) : documentResourceRequests doc }
+
+-- | Request a redraw for a node
+documentRedraw :: Monad m => ElementID -> DocumentT m ()
+documentRedraw _nid = return $ warning "TODO: documentRedraw" ()
 
 -- elementOwnStyle is useful for computing own style,
 -- Do not cascade it over a parent style, use cascadeStyle.
@@ -637,9 +652,8 @@ elementOwnStyle elt = elementStyleAttr el `overriding` elementStyleHTML el
 --------------------------------------------------------------------------------
 -- XML Utilities
 
-lookupXMLAttribute :: Text -> XML.Element -> Maybe Text
-lookupXMLAttribute attr node = M.lookup xmlattr (XML.elementAttributes node)
-  where xmlattr = XML.Name attr Nothing Nothing
+decodeAttr :: Read a => Text -> (M.Map Text Text) -> Maybe a
+decodeAttr attr attrs = mbReadText =<< M.lookup attr attrs
 
 tagName :: XML.Element -> Text
 tagName = xmlTextName . XML.elementName
@@ -740,7 +754,7 @@ instance Show BoxContent where
 -- | What to draw inside a box
 data InlineContent
   = TextBox !Text !BaselineY
-  | ImageBox (V2 Double) Text
+  | ImageBox (V2 Double) URI
   -- ^  an image of size (V2 Double) and source.
   | InputTextBox (V2 Double) OffsetX BaselineY ElementID
   -- ^ a text input with some text at OffsetX
@@ -749,7 +763,7 @@ instance Show InlineContent where
   show (TextBox t baseline) =
     "TextBox " ++ show t ++ " (baseline " ++ show baseline ++ ")"
   show (ImageBox (V2 w h) href) =
-    concat ["ImageBox ", show w, "x", show h, " " ++ T.unpack href]
+    concat ["ImageBox ", show w, "x", show h, " " ++ show href]
   show (InputTextBox (V2 w h) _textX _baseline nid) =
     concat ["TextInputContent ", show w, "x", show h, ": @", show nid]
 
@@ -812,10 +826,9 @@ vadoMain = do
     , pageDocument = emptyDocument
     , pageBoxes = Nothing
     , pageResMan = resman
-    , pageUrl = fromJust $ URI.parseURI "vado:wait"
+    , pageUrl = fromJust $ URI.parseURI "vado:home"
     , pageHistory = ([], [])
     , pageDebugNetwork = False
-    , pageResources = M.empty
     , pageWindow = window
     }
   renderDOM page0
@@ -861,12 +874,32 @@ asyncEventLoop :: Browser ()
 asyncEventLoop = forever $ do
   -- UI events
   mbUIEvent <- liftIO $ SDL.waitEventTimeout (1000 `div` fps)
-  whenJust mbUIEvent $ \event -> do
+  whenJust mbUIEvent $ \event ->
+    handleUIEvent event
+
+  -- ResourceManager events
+  resman <- gets pageResMan
+  resEvents <- liftIO $ Resource.drainEvents resman
+  forM_ resEvents $ \(u, event) -> do
+    uri <- gets pageUrl
+    st <- gets pageState
+    loading <- gets (documentResourcesLoading . pageDocument)
+    case event of
+      Resource.EventStreamChunk _ -> return ()
+      _ -> logDebug $ "[" ++ show st ++ "] " ++ show (u, event)
+
+    if u == uri then
+      handlePageStreaming st event
+    else if u `M.member` loading then
+      handleResourceEvent st u event
+    else
+      logWarn $ "eventloop: unknown resource " ++ show u ++ " for event " ++ show event
+
+handleUIEvent :: SDL.Event -> Browser ()
+handleUIEvent event =
     case SDL.eventPayload event of
       SDL.QuitEvent ->
         liftIO $ exitSuccess
-      SDL.MouseMotionEvent _ ->
-        return ()
 
       SDL.WindowResizedEvent e -> changePage $ \page -> do
         let size = windowResizedEventSize e
@@ -882,8 +915,6 @@ asyncEventLoop = forever $ do
           -- print e
           let focused = documentFocus $ pageDocument page
           Just <$> dispatchEvent focused event page
-      SDL.KeyboardEvent e | SDL.keyboardEventKeyMotion e /= Released ->
-        return ()
 
       SDL.TextInputEvent _ -> changePage $ \page -> do
         let focused = documentFocus $ pageDocument page
@@ -895,8 +926,7 @@ asyncEventLoop = forever $ do
 
       SDL.MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released ->
         changePage $ \page -> do
-          let P xy@(V2 xi yi) = mouseButtonEventPos e
-          putStrLn $ "clicked at " ++ show xy
+          let P (V2 xi yi) = mouseButtonEventPos e
           case pageBoxes page of
             Just boxes -> do
               let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
@@ -910,90 +940,128 @@ asyncEventLoop = forever $ do
             _ ->
               return Nothing
 
-      _ ->
-        --liftIO $ print event
-        return ()
+      SDL.KeyboardEvent _ -> return ()
+      SDL.MouseMotionEvent _ -> return ()
+      _ -> return () --liftIO $ print event
 
-  -- ResourceManager events
-  resman <- gets pageResMan
-  resEvents <- liftIO $ Resource.drainEvents resman
+handlePageStreaming :: PageState -> Resource.EventKind -> Browser ()
+handlePageStreaming st event = do
+  debug <- gets pageDebugNetwork
+  case (st, event) of
+    (_, Resource.EventConnectionError exc) | st `elem` [PageConnecting, PageStreaming] ->
+      changePage $ \page -> do
+        when (pageDebugNetwork page) $ print exc
+        let doc = vadoError $ T.pack $ show exc
+        return $ Just $ vadoPage doc page
 
-  forM_ resEvents $ \(u, event) -> do
-    uri <- gets pageUrl
-    st <- gets pageState
-    resources <- gets (documentResourcesLoading . pageDocument)
-    case event of
-      Resource.EventStreamChunk _ -> return ()
-      _ -> liftIO $ putStrLn $ "[" ++ show st ++ "] " ++ show (u, event)
-    if u == uri then do
-      case (st, event) of
-        (_, Resource.EventConnectionError exc) | st `elem` [PageConnecting, PageStreaming] ->
-          changePage $ \page -> do
-            when (pageDebugNetwork page) $ print exc
-            let doc = vadoError $ T.pack $ show exc
-            return $ Just $ vadoPage doc page
+    (PageConnecting, Resource.EventStreamMetadata (req, _resp) _mbStream) ->
+      changePage $ \page -> do
+        when (pageDebugNetwork page) (print req) -- TODO: response too
+        let finalURI = HTTP.getUri req
+        return $ Just page
+          { pageState = PageStreaming
+          , pageDocument = emptyDocument{ documentLocation = finalURI }
+          , pageBoxes = Nothing
+          , pageWindow = (pageWindow page){ windowScroll = 0 }
+          }
 
-        (PageConnecting, Resource.EventStreamMetadata (req, _resp) _mbStream) ->
-          changePage $ \page -> do
-            when (pageDebugNetwork page) (print req) -- TODO: response too
-            let finalURI = HTTP.getUri req
-            return $ Just page
-              { pageState = PageStreaming
-              , pageDocument = emptyDocument{ documentLocation = finalURI }
-              , pageBoxes = Nothing
-              , pageWindow = (pageWindow page){ windowScroll = 0 }
-              }
+    (PageStreaming, Resource.EventStreamChunk (Resource.ChunkHtml update)) -> do
+      resman <- gets pageResMan
+      runBrowserDocument $ do
+        -- grow the DOM tree:
+        htmlDOMFromEvents update
 
-        (PageStreaming, Resource.EventStreamChunk (Resource.ChunkHtml update)) -> do
-          modifyPage $ \page -> do
-            Just <$> runPageDocument page (htmlDOMFromEvents update)
+        -- make document resource requests:
+        resReqs <- gets (L.reverse . documentResourceRequests)
+        modify $ \doc -> doc{ documentResourceRequests = [] }
+        resources <- gets documentResources
+        forM_ resReqs $ \(resuri, nid) -> do
+          when debug $ logWarn $ "eventloop: @" ++ show nid ++ " requests " ++ show resuri
 
-          -- handle document resource requests:
-          runBrowserDocument $ do
-            resReqs <- gets (L.reverse . documentResourceRequests)
-            modify $ \doc -> doc{ documentResourceRequests = [] }
-            forM_ resReqs $ \(resuri, nid) -> do
-              liftIO $ putStrLn $ "eventloop: @" ++ show nid ++ " requests " ++ show resuri
+          wereLoading <- gets documentResourcesLoading
+          unless (resuri `M.member` wereLoading || resuri `M.member` resources) $
+            liftIO $ Resource.requestGet resman resuri
 
-              wereLoading <- gets documentResourcesLoading
-              unless (resuri `M.member` wereLoading) $
-                liftIO $ Resource.requestGet resman resuri
+          let multimapAdd v = M.alter (\vs -> Just (v `S.insert` fromMaybe S.empty vs))
+          let nowLoading = multimapAdd nid resuri wereLoading
+          modify $ \doc -> doc{ documentResourcesLoading = nowLoading }
 
-              let multimapAdd v = M.alter (\vs -> Just (v `S.insert` fromMaybe S.empty vs))
-              let nowLoading = multimapAdd nid resuri wereLoading
-              modify $ \doc -> doc{ documentResourcesLoading = nowLoading }
+    (PageStreaming, Resource.EventStreamClose) ->
+      changePage $ \page -> do
+        Just <$> layoutPage page{ pageState = PageReady }
 
-        (PageStreaming, Resource.EventStreamClose) ->
-          changePage $ \page -> do
-            Just <$> layoutPage page{ pageState = PageReady }
+    _ ->
+      logWarn $ "eventloop: invalid state " ++ show st ++ " for event " ++ show event
+    {-
+    (Resource.EventContentReady (_req, _resp) _content ->
+      -- TODO: check content-type, wrap standalone resource in html
+      -- TODO: construct the page, go to PageReady/PageWaitResources
+      error $ "TODO: eventloop: non-streaming page"
+    -}
 
-        _ ->
-          liftIO $ putStrLn $ "eventloop: invalid state " ++ show st ++ " for event " ++ show event
-        {-
-        (Resource.EventContentReady (_req, _resp) _content ->
-          -- TODO: check content-type, wrap standalone resource in html
-          -- TODO: construct the page, go to PageReady/PageWaitResources
-          error $ "TODO: eventloop: non-streaming page"
-        -}
+handleResourceEvent :: PageState -> URI -> Resource.EventKind -> Browser ()
+handleResourceEvent st uri event =
+  case (st, event) of
+    (_, Resource.EventContentReady (_req, resp) content) -> do
+      wereLoading <- gets (documentResourcesLoading . pageDocument)
+      let nodes = wereLoading M.! uri
+      runBrowserDocument $ do
+        loading <- gets (M.delete uri . documentResourcesLoading)
+        when (M.null loading) $ liftIO $ putStrLn $ "All resources are ready"
+        modify $ \doc -> doc{ documentResourcesLoading = loading }
 
+      let contentType = Resource.httpResponseContentType resp
+      logDebug $ "OK: "++show uri++" ("++T.unpack contentType++") loaded: " ++
+                 show (HTTP.responseStatus resp)
 
-    else if u `M.member` resources then
-      {-
-      case (st, event) of
-        (_, Resource.EventConnectionError exc) | st /= PageConnecting ->
-          -- TODO: remove from documentResourcesLoading
-          undefined
-        (_, Resource.EventContentReady (_req, resp) content) ->
-          -- TODO: remove from documentResourcesLoading
-          -- TODO: decode the element to documentResources
-          let contentType = Resource.httpResponseContentType resp
-          -- TODO: notify the elements to relayout and redraw
-          undefined
-        _ ->
-        -}
-          liftIO $ putStrLn $ "eventloop: invalid state " ++ show st ++ " for event " ++ show event
+      mbRes <- decodeResourceContent contentType content
+      case mbRes of
+        Left oops -> logWarn $ "ERROR: <"++show uri++">: " ++ oops
+        Right res -> do
+          runBrowserDocument $ modify $ \doc ->
+            doc{ documentResources = M.insert uri (res, nodes) (documentResources doc) }
+
+          -- TODO: replace with re-layout requests when incremental layout is ready.
+          -- Are there <img>s without specified width= and height= that need relayout?
+          needsLayout <- inBrowserDocument $ do
+            doc <- get
+            let maybeWH nid =
+                  let attrs = elementAttrs $ elementDeref $ elementRef doc nid
+                      mbW = decodeAttr "width" attrs :: Maybe Double
+                      mbH = decodeAttr "height" attrs :: Maybe Double
+                  in liftA2 V2 mbW mbH
+            return $ any isNothing $ map maybeWH $ S.toList nodes
+          if needsLayout then do
+            logDebug $ "Relayout caused by " ++ show uri
+            changePage $ \p -> Just <$> layoutPage p
+          else modifyPage (\p -> (renderDOM p >> return Nothing))
+
+    (_, Resource.EventConnectionError exc) | st /= PageConnecting -> do
+      logDebug $ "ERROR: "++show uri++" : " ++ show exc
+      runBrowserDocument $ do
+        loading <- gets (M.delete uri . documentResourcesLoading)
+        when (M.null loading) $ liftIO $ putStrLn $ "All resources are ready"
+        modify $ \doc -> doc{ documentResourcesLoading = loading }
+
+    _ ->
+      logWarn $ "eventloop: invalid state " ++ show st ++ " for event " ++ show event
+
+decodeResourceContent :: Text -> Resource.Content -> Browser (Either String HTTPResource)
+decodeResourceContent contentType = \case
+  Resource.ContentBytes bs | T.isPrefixOf "image/" contentType ->
+    if isJust (Image.format bs) then do
+      renderer <- gets (windowRenderer . pageWindow)
+      (texture, wh) <- liftIO $ do
+        bitmap <- Image.decode bs
+        texture <- SDL.createTextureFromSurface renderer bitmap
+        V2 w h <- SDL.surfaceDimensions bitmap
+        return (texture, V2 (fromIntegral w) (fromIntegral h))
+      return $ Right (ImageResource wh texture)
     else
-      return $ warning ("eventloop: unknown resource " ++ show u ++ " for event " ++ show event) ()
+      return $ Left ("decodeResourceContent: an unknown image format " ++ T.unpack contentType)
+
+  _content ->
+    return $ Left ("decodeResourceContent: unknown Content-Type=" ++ T.unpack contentType)
 
 --------------------------------------------------------------------------------
 -- UI: rendering and events
@@ -1208,7 +1276,9 @@ body_onKeyReleased event _nid page = do
   --putStrLn $ "body_onKeyReleased: " ++ show e
   case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
     SDL.KeycodeE | isKeyCtrlShiftPressed modifiers -> do
-      return page{ pageDebugNetwork = not (pageDebugNetwork page) } -- toggle network debug output
+      let debug = not $ pageDebugNetwork page
+      putStrLn $ "Setting pageDebugNetwork to " ++ show debug
+      return page{ pageDebugNetwork = debug }
     SDL.KeycodeEnd ->
       let pageH = maybe 0 boxHeight $ pageBoxes page
       in return $ vadoScroll pageH page
@@ -1300,7 +1370,7 @@ data LineState = LS
 
 -- | A global layout context for a page
 data LayoutCtx = LayoutCtx
-  { ltResources :: M.Map Text HTTPResource
+  { ltResources :: DOMResourceMap
   }
 
 -- | The layout monad
@@ -1317,14 +1387,14 @@ newtype LayoutOver m a
 layoutPage :: Page -> IO Page
 layoutPage page@Page{..} | documentBody pageDocument == noElement =
   return $ warning ("layoutPage: no body") page
-layoutPage page@Page{..} = do
-    let body = elementRef pageDocument (documentBody pageDocument)
+layoutPage page = do
+    let doc = pageDocument page
+    let ctx = LayoutCtx { ltResources = documentResources doc }
+    let VadoWindow { windowViewport = V2 w _, windowTexture = texture } = pageWindow page
+    let params = LayoutParams { ltWidth = w }
+    let body = elementRef doc (documentBody doc)
     (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle body
     return page{ pageBoxes=Just boxes }
-  where
-    ctx = LayoutCtx { ltResources = pageResources }
-    params = LayoutParams { ltWidth = w }
-    VadoWindow { windowViewport = V2 w _, windowTexture = texture } = pageWindow
 
 
 elementToBoxes :: CanMeasureText m =>
@@ -1412,7 +1482,7 @@ layoutElement elt = do
       (Left (ImageContent href mbSize), _) -> do
         -- TODO: block <img>
         resources <- gets (ltResources . ltCtx)
-        let mbResSize = (\(ImageResource wh _) -> wh) <$> M.lookup href resources
+        let mbResSize = (\(ImageResource wh _, _) -> wh) <$> M.lookup href resources
         case mbSize <|> mbResSize of
           Just wh -> do
             let baseline = imgBaseline wh elt
@@ -1715,9 +1785,9 @@ chunksFromTokens whitespace ts = chunksFromTokens (warning msg $ CSS_Keyword "no
 renderDOM :: Page -> IO ()
 renderDOM Page{ pageBoxes = Nothing } =
   return $ warning "renderDOM: page is not layed out yet" ()
-renderDOM page@Page{ pageBoxes = Just body } = do
+renderDOM page@Page{ pageBoxes = Just body, pageDocument = doc, pageWindow = win } = do
   let minY = pageScroll page
-  let (texture, renderer) = let win = pageWindow page in (windowTexture win, windowRenderer win)
+  let (texture, renderer) = (windowTexture win, windowRenderer win)
 
   let (stpush, _) = boxStyling body
   let backgroundColor = case M.lookup CSSBackgroundColor stpush of
@@ -1727,24 +1797,27 @@ renderDOM page@Page{ pageBoxes = Just body } = do
   replaced <- Canvas.withCanvas texture $ do
     Canvas.background backgroundColor
     withStyling body (0, 0, noStyle) $ \st ->
-      renderTree (pageDocument page) (minY, minY + vadoViewHeight page) (0, 0, st) body
-  SDL.copy (windowRenderer $ pageWindow page) texture Nothing Nothing
+      renderTree doc (minY, minY + vadoViewHeight page) (0, 0, st) body
+  SDL.copy renderer texture Nothing Nothing
 
   forM_ replaced $ \(rect, content) -> do
     case content of
       ImageBox _ href ->
-        case M.lookup href (pageResources page) of
-          Just (ImageResource _ imgtexture) -> do
+        case M.lookup href (documentResources doc) of
+          Just (ImageResource _ imgtexture, _) -> do
             let cint x = fromIntegral (round x :: Int)
             let SDL.Rectangle (P (V2 x y)) (V2 dx dy) = rect
             let pos = P $ V2 (cint x) (cint (y - minY))
             let dim = V2 (cint dx) (cint dy)
             let rect' = SDL.Rectangle pos dim
-            SDL.copy (windowRenderer $ pageWindow page) imgtexture Nothing (Just rect')
-          Nothing ->
-            return $ warning ("renderDOM: no resource for <img src=" ++ show (T.unpack href) ++ ">") ()
+            SDL.copy renderer imgtexture Nothing (Just rect')
+
+          _ | href `M.member` documentResourcesLoading doc ->
+            return ()     -- Still loading
+          _ ->
+            logWarn $ "renderDOM: no resource for <img src=" ++ show href ++ ">"
       other ->
-        return $ warning ("renderDOM: unexpected replaced element: " ++ show other) ()
+        logWarn $ "renderDOM: unexpected replaced element: " ++ show other
 
   SDL.present renderer
 
