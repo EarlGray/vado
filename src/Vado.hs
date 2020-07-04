@@ -100,9 +100,7 @@ newtype BrowserT m a = BrowserT { runBrowserT :: StateT Page m a }
 type Browser a = BrowserT IO a
 
 withPage :: (Page -> IO a) -> Browser a
-withPage action = do
-  page <- get
-  liftIO $ action page
+withPage action = get >>= (liftIO . action)
 
 modifyPage :: (Page -> IO (Maybe Page)) -> Browser ()
 modifyPage action = do
@@ -287,12 +285,9 @@ fromEmptyDocument :: Monad m => DocumentT m () -> m Document
 fromEmptyDocument f = runDocument emptyDocument f
 
 domtreeAppendChild :: Monad m =>
-                      Maybe (Text, M.Map Text Text) -> DOMContent
+                      ElementID -> Maybe (Text, M.Map Text Text) -> DOMContent
                       -> DocumentT m ElementID
-domtreeAppendChild mbXML content = do
-  opened <- gets documentBuildState
-  when (L.null opened) $ error "domtreeAppendChild: no opened elements"
-  let pid = head opened
+domtreeAppendChild pid mbXML content = do
   parent <- getElement pid
   case elementContent parent of
     Right fid -> do
@@ -466,11 +461,12 @@ data DOMContent
   | NewlineContent
   -- ^ Force newline here, usually corresponds to <br>
   | ImageContent URI (Maybe (V2 Double))
-  -- ^           ^href
+  -- ^           ^href      ^ given dimensions
   | HorizLineContent
   -- ^ <hr>
   | InputTextContent !Text
   -- ^ <input type="text">
+  deriving (Eq)
 
 instance Show DOMContent where
   show (TextContent txt) = T.unpack $ T.concat ["TextContent \"", txt, "\""]
@@ -496,17 +492,11 @@ instance Show HTTPResource where
 htmlDOMFromXML :: Monad m => XML.Node -> DocumentT m ()
 htmlDOMFromXML = \case
   XML.NodeElement el -> do
-    doc <- get
     let attrs = M.mapKeys xmlTextName (XML.elementAttributes el)
-    let tagattrs = (tagName el, attrs)
-    case htmlDOMContent doc tagattrs of
-      Just content ->
-        domAppendHTMLContent (Just tagattrs) content
-      _ -> do
-        domStartHTMLElement tagattrs
-        forM_ (XML.elementNodes el) $ \child ->
-          htmlDOMFromXML child
-        domEndHTMLElement (tagName el)
+    domStartHTMLElement (tagName el, attrs)
+    forM_ (XML.elementNodes el) $ \child ->
+      htmlDOMFromXML child
+    domEndHTMLElement (tagName el)
 
   XML.NodeContent txt ->
     domAppendHTMLContent Nothing (TextContent txt)
@@ -519,14 +509,11 @@ htmlDOMFromEvents = \case
       modify $ \doc -> doc{ documentXMLType = Just $ XMLTy.Doctype doctype mbExtID }
     XMLTy.EventContent content -> do
       domAppendHTMLContent Nothing (TextContent $ xmlContent content)
-    XMLTy.EventBeginElement name attrs0 -> do
+    XMLTy.EventBeginElement name attrs0 ->
       let tag = xmlTextName name
-      let attrs = M.fromList $ map xmlAttr attrs0
-      doc <- get
-      case htmlDOMContent doc (tag, attrs) of
-        Just content -> domAppendHTMLContent (Just (tag, attrs)) content
-        Nothing -> domStartHTMLElement (tag, attrs)
-    XMLTy.EventEndElement name -> do
+          attrs = M.fromList $ map xmlAttr attrs0
+      in domStartHTMLElement (tag, attrs)
+    XMLTy.EventEndElement name ->
       domEndHTMLElement (xmlTextName name)
     XMLTy.EventBeginDocument -> return ()
     XMLTy.EventEndDocument -> return ()    -- TODO: close all open tags
@@ -541,39 +528,6 @@ htmlDOMFromEvents = \case
     xmlAttr (k, []) = (xmlTextName k, "")
     xmlAttr (k, vs) = (xmlTextName k, xmlContent $ last vs)
 
--- decide if this HTML tag is a piece of content or a container:
-htmlDOMContent :: Document -> TagAttrs -> Maybe DOMContent
-htmlDOMContent doc = \case
-    ("hr", _) ->
-      Just $ HorizLineContent
-    ("br", _) ->
-      Just $ NewlineContent
-
-    ("img", attrs) -> do
-      let alt = TextContent $ fromMaybe "<img>" $ M.lookup "alt" attrs
-      Just $ case M.lookup "src" attrs of
-        -- Just href | "data:" `T.isPrefixOf` href -> undefined
-        Just href ->
-          let wh = liftA2 V2 (decodeAttr "width" attrs) (decodeAttr "height" attrs)
-          in case URI.parseURIReference (T.unpack href) of
-            Just u -> ImageContent (u `URI.relativeTo` documentLocation doc) wh
-            Nothing -> warning ("htmlDOMContent: failed to parse img src=" ++ T.unpack href) alt
-        _ ->
-          alt
-
-    ("input", attrs) ->
-      let value = fromMaybe "" $ M.lookup "value" attrs
-      in Just $ case M.lookup "type" attrs  of
-          Nothing -> InputTextContent value
-          Just "text" -> InputTextContent value
-          Just "password" -> InputTextContent value    -- TODO: a password input
-          Just "button" -> TextContent value
-          Just "checkbox" -> TextContent $ maybe "\x2610" (\_ -> "\x2611") $ M.lookup "checked" attrs
-          Just "submit" -> TextContent $ fromMaybe "submit" $ M.lookup "value" attrs
-          Just "hidden" -> TextContent ""
-          inpty -> warning ("Unknown input type: " ++ show inpty) $ TextContent ""
-
-    _ -> Nothing
 
 domStartHTMLElement :: Monad m => TagAttrs -> DocumentT m ()
 domStartHTMLElement tagattrs = do
@@ -582,12 +536,13 @@ domStartHTMLElement tagattrs = do
 
 domAppendHTMLContent :: Monad m => Maybe TagAttrs -> DOMContent -> DocumentT m ()
 domAppendHTMLContent mbTagAttrs content = do
-    nid <- domtreeAppendChild mbTagAttrs content
-    domParseHTMLAttributes nid
+  opened <- gets documentBuildState
+  when (L.null opened) $ error "domAppendHTMLContent: no opened elements"
+  let pid = head opened
+  nid <- domtreeAppendChild pid mbTagAttrs content
+  domParseHTMLAttributes nid
 
 domEndHTMLElement :: Monad m => Text -> DocumentT m ()
-domEndHTMLElement name | name `elem` ["hr", "br", "img", "input"] =
-  return ()
 domEndHTMLElement name = do
   opened <- gets documentBuildState
   whenJust (mbHead opened) $ \nid -> do
@@ -595,10 +550,48 @@ domEndHTMLElement name = do
     when (elementTag node /= name) $
       error $ "domEndHTMLElement: " ++ show (elementTag node) ++" /= " ++ show name++
               ", opened=" ++ show opened
+    let attrs = elementAttrs node
+    -- hr, br and such are not containers, change their content if needed:
+    let fixupContent nid' content = modifyElement nid' $ \node' ->
+          if elementContent node' == Right noElement
+          then node' { elementContent = Left content }
+          else error $ "fixupContent: expected an empty container in " ++ show node'
     case elementTag node of
       "title" -> return ()    -- TODO: add documentTitle
       "style" -> return ()    -- TODO: parse it or request the resource
+
+      "hr" -> fixupContent nid HorizLineContent
+      "br" -> fixupContent nid NewlineContent
+
+      "input" ->
+        let value = fromMaybe "" $ M.lookup "value" attrs
+        in fixupContent nid $ case M.lookup "type" attrs  of
+            Nothing -> InputTextContent value
+            Just "text" -> InputTextContent value
+            Just "password" -> InputTextContent value    -- TODO: a password input
+            Just "button" -> TextContent value
+            Just "checkbox" -> TextContent $ maybe "\x2610" (\_ -> "\x2611") $ M.lookup "checked" attrs
+            Just "submit" -> TextContent $ fromMaybe "submit" $ M.lookup "value" attrs
+            Just "hidden" -> TextContent ""
+            inpty -> warning ("Unknown input type: " ++ show inpty) $ TextContent ""
+
+      "img" -> do
+        let alt = TextContent $ fromMaybe "<img>" $ M.lookup "alt" attrs
+        let wh = liftA2 V2 (decodeAttr "width" attrs) (decodeAttr "height" attrs)
+        docuri <- gets documentLocation
+        fixupContent nid $ case M.lookup "src" attrs of
+          --Just href | "data:" `T.isPrefixOf` href ->
+          --  case Resource.decodeDataURL href of
+          --    Left e -> warning ("failed to parse data uri: " ++ show e) Nothing
+          --    Right content -> Just $ ImageContent (Left content) wh
+          Just href ->
+            case URI.parseURIReference (T.unpack href) of
+              Just u -> let resuri = u `URI.relativeTo` docuri in ImageContent resuri wh
+              Nothing -> warning ("failed to parse img src=" ++ T.unpack href) alt
+          _ -> alt
+
       _ -> return ()
+
   void $ domtreeEndElement
 
 domParseHTMLAttributes :: Monad m => ElementID -> DocumentT m ()
@@ -1034,7 +1027,7 @@ handleResourceEvent st uri event =
           if needsLayout then do
             logDebug $ "Relayout caused by " ++ show uri
             changePage $ \p -> Just <$> layoutPage p
-          else modifyPage (\p -> (renderDOM p >> return Nothing))
+          else withPage renderDOM
 
     (_, Resource.EventConnectionError exc) | st /= PageConnecting -> do
       logDebug $ "ERROR: "++show uri++" : " ++ show exc
@@ -2607,9 +2600,12 @@ vadoHome =
       let keysym = SDL.keyboardEventKeysym e
       case SDL.keysymKeycode keysym of
         SDL.KeycodeReturn -> do
+          -- get the address
           node <- inPageDocument page $ getElement nid
           let Left (InputTextContent address) = elementContent node
+          -- set up the waiting page
           layoutPage (vadoPage vadoWait page) >>= renderDOM
+          -- decide where to go
           let mbHref =  URI.parseURI $ T.unpack address
           let href = fromMaybe (webSearch $ T.unpack address) mbHref
           navigatePage href page
