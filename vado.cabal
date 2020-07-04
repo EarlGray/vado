@@ -16,7 +16,9 @@ library
   hs-source-dirs:      src
   exposed-modules:
       Vado
+      Vado.CSS
       Vado.Resource
+      Vado.Types
   other-modules:       Paths_vado
   ghc-options:         -Wall
   default-language:    Haskell2010
@@ -26,6 +28,7 @@ library
                      , bytestring
                      , cairo
                      , containers
+                     , css-text
                      , html-conduit
                      , http-client
                      , http-client-tls

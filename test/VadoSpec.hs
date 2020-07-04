@@ -4,6 +4,7 @@ module VadoSpec (spec) where
 
 import Test.Hspec
 import Vado
+import Vado.CSS
 
 
 spec :: Spec
