@@ -143,9 +143,9 @@ data Document = Document
   , documentBody :: ElementID
   , documentFocus :: ElementID      -- the keyboard focus
   , documentImages :: IM.IntMap ElementID
+  , documentTitle :: Text
   -- , documentContentType :: ContentType
   -- , documentMeta :: M.Map Text Text
-  -- , documentTitle :: Text
   -- , documentElementsByClass :: M.Map Text [ElementID]
   -- , documentElementById :: M.Map Text ElementID
   } deriving (Show)
@@ -162,6 +162,7 @@ emptyDocument = Document
   , documentResourceRequests = []
   , documentHead = noElement
   , documentBody = noElement
+  , documentTitle = ""
   , documentFocus = noElement
   , documentImages = IM.empty
   }
@@ -182,6 +183,7 @@ instance HasDebugView Document where
   showdbg doc = unlines $
       [ "documentHead = @" ++ show (documentHead doc)
       , "documentBody = @" ++ show (documentBody doc)
+      , "documentTitle = " ++ T.unpack (documentTitle doc)
       , "documentNewID = @" ++ show (documentNewID doc)
       , "documentFocus = @" ++ show (documentFocus doc)
       , "documentResources = " ++ show (documentResources doc)
@@ -557,7 +559,15 @@ domEndHTMLElement name = do
           then node' { elementContent = Left content }
           else error $ "fixupContent: expected an empty container in " ++ show node'
     case elementTag node of
-      "title" -> return ()    -- TODO: add documentTitle
+      "title" -> do
+        let Right fid = elementContent node
+        tnode <- getElement fid
+        case elementContent tnode of
+          Left (TextContent title) ->
+            modify $ \doc -> doc{ documentTitle = title }
+          other ->
+            return $ warning ("domEndHTMLElement @"++show nid++": expected text in <title>"++
+                              ", found " ++ show other) ()
       "style" -> return ()    -- TODO: parse it or request the resource
 
       "hr" -> fixupContent nid HorizLineContent
