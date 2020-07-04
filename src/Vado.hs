@@ -483,7 +483,7 @@ data HTTPResource
   = ImageResource !(V2 Double) SDL.Texture
 
 instance Show HTTPResource where
-  show (ImageResource dim _) = show $ "ImageResource " ++ show dim
+  show (ImageResource dim _) = "ImageResource " ++ show dim
 
 --------------------------------------------------------------------------------
 -- | Normalize an XML tree of elements and text, possibly with
@@ -576,19 +576,28 @@ domEndHTMLElement name = do
             inpty -> warning ("Unknown input type: " ++ show inpty) $ TextContent ""
 
       "img" -> do
+        -- TODO: fix separate TextContent/ImageContent for displaying `alt`
         let alt = TextContent $ fromMaybe "<img>" $ M.lookup "alt" attrs
         let wh = liftA2 V2 (decodeAttr "width" attrs) (decodeAttr "height" attrs)
         docuri <- gets documentLocation
         fixupContent nid $ case M.lookup "src" attrs of
-          --Just href | "data:" `T.isPrefixOf` href ->
-          --  case Resource.decodeDataURL href of
-          --    Left e -> warning ("failed to parse data uri: " ++ show e) Nothing
-          --    Right content -> Just $ ImageContent (Left content) wh
+          Just href | "data:" `T.isPrefixOf` href ->
+            -- A hack: pass "blob:data@12" to domResourceFetch
+            -- and let handlePageStreaming in `Browser` to actually decode it.
+            let Just bloburi = URI.parseURI ("blob:data@" ++ show nid)
+            in ImageContent bloburi wh
           Just href ->
             case URI.parseURIReference (T.unpack href) of
               Just u -> let resuri = u `URI.relativeTo` docuri in ImageContent resuri wh
               Nothing -> warning ("failed to parse img src=" ++ T.unpack href) alt
           _ -> alt
+
+        modify $ \doc -> doc{ documentImages = intmapAppend nid (documentImages doc) }
+
+        node' <- getElement nid
+        case elementContent node' of
+          Left (ImageContent resuri _) -> domResourceFetch nid resuri
+          _ -> return ()
 
       _ -> return ()
 
@@ -598,6 +607,7 @@ domParseHTMLAttributes :: Monad m => ElementID -> DocumentT m ()
 domParseHTMLAttributes nid = do
   node <- getElement nid
   let tag = elementTag node
+  -- This can't be moved to domEndHTMLElement: children of <body> might need to know about it:
   case elementTag node of
     "head" -> modify $ \doc ->
         if documentHead doc == noElement
@@ -607,12 +617,6 @@ domParseHTMLAttributes nid = do
         if documentBody doc == noElement
         then doc{ documentBody = nid, documentFocus = nid }
         else warning "domParseHTMLAttributes: more than one <body>" doc
-    "img" -> do
-        let src = M.lookup "src" $ elementAttrs node
-            mbResHref = (URI.parseURIReference . T.unpack) =<< src
-        whenJust mbResHref (domResourceFetch nid)
-        modify $ \doc ->
-          doc{ documentImages = intmapAppend nid (documentImages doc) }
     _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
@@ -842,7 +846,10 @@ navigatePage uri page0 | uriScheme uri == "vado:" = do
     "home" -> do
       -- TODO: cancel all pending resource requests
       page <- layoutPage $ vadoPage vadoHome page0
-      return page{ pageState = PageReady }
+      return page
+        { pageState = PageReady
+        , pageHistory = historyRewind (pageHistory page) (pageUrl page) uri
+        }
     _ ->
       error $ "unknown address " ++ show uri
 navigatePage uri page = do
@@ -959,25 +966,21 @@ handlePageStreaming st event = do
           }
 
     (PageStreaming, Resource.EventStreamChunk (Resource.ChunkHtml update)) -> do
+      -- grow the DOM tree:
+      runBrowserDocument $ htmlDOMFromEvents update
+
       resman <- gets pageResMan
-      runBrowserDocument $ do
-        -- grow the DOM tree:
-        htmlDOMFromEvents update
-
-        -- make document resource requests:
-        resReqs <- gets (L.reverse . documentResourceRequests)
-        modify $ \doc -> doc{ documentResourceRequests = [] }
-        resources <- gets documentResources
-        forM_ resReqs $ \(resuri, nid) -> do
+      resReqs <- drainDocumentRequests
+      forM_ resReqs $ \(resuri, nid) -> do
+        if URI.uriScheme resuri /= "blob:" then do
           when debug $ logWarn $ "eventloop: @" ++ show nid ++ " requests " ++ show resuri
-
-          wereLoading <- gets documentResourcesLoading
-          unless (resuri `M.member` wereLoading || resuri `M.member` resources) $
-            liftIO $ Resource.requestGet resman resuri
-
-          let multimapAdd v = M.alter (\vs -> Just (v `S.insert` fromMaybe S.empty vs))
-          let nowLoading = multimapAdd nid resuri wereLoading
-          modify $ \doc -> doc{ documentResourcesLoading = nowLoading }
+          runBrowserDocument $ documentMakeRequest resman resuri nid
+        else do
+          -- assumption: the only source of blobs are <img src="data:...">
+          node <- inBrowserDocument $ getElement nid
+          case M.lookup "src" $ elementAttrs node of
+            Just dataurl -> decodeResourceDataUrl nid resuri dataurl
+            _ -> return $ warning ("no src in @" ++ show nid) ()
 
     (PageStreaming, Resource.EventStreamClose) ->
       changePage $ \page -> do
@@ -991,6 +994,37 @@ handlePageStreaming st event = do
       -- TODO: construct the page, go to PageReady/PageWaitResources
       error $ "TODO: eventloop: non-streaming page"
     -}
+  where
+    documentMakeRequest :: Resource.Manager -> URI -> ElementID -> DocumentT IO ()
+    documentMakeRequest resman resuri nid = do
+      resources <- gets documentResources
+      wereLoading <- gets documentResourcesLoading
+      unless (resuri `M.member` wereLoading || resuri `M.member` resources) $
+        liftIO $ Resource.requestGet resman resuri
+
+      let multimapAdd v = M.alter (\vs -> Just (v `S.insert` fromMaybe S.empty vs))
+      let nowLoading = multimapAdd nid resuri wereLoading
+      modify $ \doc -> doc{ documentResourcesLoading = nowLoading }
+
+    drainDocumentRequests = do
+      resReqs <- inBrowserDocument $ gets (L.reverse . documentResourceRequests)
+      runBrowserDocument $ modify $ \doc -> doc{ documentResourceRequests = [] }
+      return resReqs
+
+    decodeResourceDataUrl nid resuri href = do
+      case Resource.decodeDataURL href of
+        Left e ->
+          return $ warning ("failed to decode data url in @" ++ show nid ++ ": " ++ e) ()
+        Right (conttype, content) -> do
+          eiRes <- decodeResourceContent conttype content
+          case eiRes of
+            Left e ->
+              return $ warning ("failed to decode resource in src=data: of @"++show nid ++ ": "++ e) ()
+            Right res ->
+              runBrowserDocument $ modify $ \doc -> do
+                let resources0 = documentResources doc
+                let resources = M.insert resuri (res, S.singleton nid) resources0
+                doc{ documentResources = resources }
 
 handleResourceEvent :: PageState -> URI -> Resource.EventKind -> Browser ()
 handleResourceEvent st uri event =
