@@ -252,6 +252,10 @@ bodyAsBytestring outch uri (req, resp) = do
   outch `send` (uri, EventContentReady (req, resp) (ContentBytes bs))
 
 -- | data: urls helpers
+decodeDataURL :: Text -> Either String (Text, Content)
+decodeDataURL datauri =
+  (\(conttype, bs) -> (conttype, ContentBytes bs)) <$> Atto.parseOnly attoDataUrl datauri
+
 attoDataUrl :: Atto.Parser (Text, Bs.ByteString)
 attoDataUrl = do
   _ <- Atto.string "data:"
