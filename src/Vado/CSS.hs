@@ -9,7 +9,7 @@ import qualified Data.Char as C
 import           Data.Either (partitionEithers)
 import qualified Data.List as L
 import qualified Data.Map as M
-import           Data.Maybe (fromMaybe, mapMaybe)
+import           Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import           Data.Text (Text)
 import qualified Data.Text as T
 import           Data.Word (Word8)
@@ -70,8 +70,10 @@ instance HasDebugView Style where
 instance Show Style where
   show = showdbg
 
+{-
 instance Read Style where
   readsPrec _ s = [(cssFarcer s, "")]
+  -}
 
 -- | Add CSS properties to existing properties, including own properties
 -- Shadow previous values if they exist.
@@ -263,7 +265,7 @@ instance HasDebugView CSSOwnProperty where
       Nothing -> concat ["TODO:showdbg(", show prop, ")"]
 
 --------------------------------------------------------------------------------
--- CSS stylesheets, rule matching and rule chains
+-- CSS stylesheets, selectors, rule matching and rule chains
 
 data Stylesheet = Stylesheet
   { stylesheetAuthor :: Style
@@ -295,6 +297,29 @@ data CSSRules = CSSRules
   }
 -}
 
+data Selector
+  = SelAny                      -- `*` or empty
+  | SelTag Text                 -- `div`
+  | SelHasAttr Text             -- `[disabled]`
+  | SelAttrEq Text Text         -- `[foo=bar]`
+  | SelAttrWord Text Text       -- `[class~="small"]`
+  | SelAttrPre Text Text        -- `[lang|="en"]`
+  | SelClass Text           -- `.small`
+  | SelId Text                  -- `#main`
+  | SelDescends Selector Selector
+  -- ^ e.g. `.hey ul li`: SelDescends (SelTag "li") (SelDescends (SelTag "ul") (SelClass "small"))
+  | SelChild Selector Selector
+  -- ^ e.g. `.blabla > .but`: SelChild (SelClass "but") (SelClass "blabla")
+  | SelPseudo Text     -- `button:focus`: SelPseudo (SelTag "a") "focus"
+  -- SelPseudoLang Selector Text   -- `div:lang(fr)`
+  | SelSiblings Selector Selector
+  -- ^ `img + .caption` is SelSiblings (SelClass "caption") (SelTag "img")
+  | SelAnd [Selector]
+  deriving (Show, Eq)
+  -- TODO: https://drafts.csswg.org/selectors-3/
+
+-- instance Show Selector  -- TODO
+
 --------------------------------------------------------------------------------
 -- CSS parsers and printers
 
@@ -308,11 +333,12 @@ cssFarcer s = css $ mapMaybe parseProp $ T.splitOn ";" (T.pack s)
       (key, val) -> Just (T.strip key, T.strip $ T.tail val)
 
 -- | A more mature CSS parser
-type SelText = Text
 type AtText = Text
+type SelText = Text
+type ImportantStyle = Style
 
 -- TODO: @-blocks and AtText
-cssParser :: Text -> [(SelText, Style, Style)]
+cssParser :: Text -> [(SelText, ImportantStyle, Style)]
 cssParser t = either (\e -> warning e []) (map conv) $ CSSP.parseBlocks t
   where
     conv (sel, block) =
@@ -449,30 +475,20 @@ cssparseValue = valp <* Atto.endOfInput
       case vals of
         [val] -> return val
         _ -> return $ CSS_Seq vals
-    strp = do
-      void $ Atto.char '"'
-      cs <- Atto.many' (Atto.notChar '"' <|> (Atto.char '\\' *> Atto.anyChar))
-      void $ Atto.char '"'
-      return $ T.pack cs
-    cssparseIdentifier = do
-      start <- ((\c -> [c]) <$> Atto.satisfy (\c -> C.isAlpha c || c == '_')) <|> do
-        c1 <- Atto.char '-'
-        c2 <- Atto.satisfy (\c -> C.isAlpha c || c == '_')
-        return [c1, c2]
-      rest <- Atto.takeWhile (\c -> C.isAlphaNum c || c == '_' || c == '-')
-      return (CSS_Keyword $ T.toLower $ T.concat [ T.pack start, rest ])
-    cssparseString = CSS_String <$> strp
+
+    cssparseIdentifier = (CSS_Keyword . T.toLower) <$> csspIdent
+    cssparseString = CSS_String <$> csspString
     cssparseLength = do
       num <- Atto.double
-      Atto.choice [
-          CSS_Px num <$ Atto.string "px"
+      Atto.choice
+        [ CSS_Px num <$ Atto.string "px"
         , CSS_Em num <$ Atto.string "em"
         , CSS_Pt num <$ Atto.string "pt"
         , CSS_Percent num <$ Atto.string "%"
         ]
     cssparseNum = CSS_Num <$> Atto.double
     cssparseUrl = do
-      let urlp = (strp <|> Atto.takeWhile (/= ')'))
+      let urlp = (csspString <|> Atto.takeWhile (/= ')'))
       url <- Atto.string "url(" *> Atto.skipSpace *> urlp <* Atto.skipSpace <* Atto.char ')'
       return $ CSS_Url url
 
@@ -495,6 +511,74 @@ cssparseValue = valp <* Atto.endOfInput
         _ -> fail $ "cannot read color: rgb(" ++ show nums ++ ")"
     cssparseColor = colorhashp <|> rgbp
 
+csspString :: Atto.Parser Text
+csspString = csspStr '"' <|> csspStr '\''
+  where
+    csspStr qc = do
+      void $ Atto.char qc
+      cs <- Atto.many' ((Atto.char '\\' *> Atto.anyChar) <|> Atto.notChar qc)
+      void $ Atto.char qc
+      return $ T.pack cs
+
+csspIdent :: Atto.Parser Text
+csspIdent = do
+  start <- ((\c -> [c]) <$> Atto.satisfy (\c -> C.isAlpha c || c == '_')) <|> do
+    c1 <- Atto.char '-'
+    c2 <- Atto.satisfy (\c -> C.isAlpha c || c == '_')
+    return [c1, c2]
+  rest <- Atto.takeWhile (\c -> C.isAlphaNum c || c == '_' || c == '-')
+  return $ T.concat [ T.pack start, rest ]
+
+cssparseSelector :: Atto.Parser [Selector]
+cssparseSelector =
+    Atto.sepBy1 (Atto.skipSpace *> selpComplex id <* Atto.skipSpace) (Atto.char ',')
+  where
+    selpComplex cont = do
+      s <- selp
+      Atto.skipSpace
+      mc <- Atto.peekChar
+      case mc of
+        Just '>' ->
+          (Atto.char '>' >> Atto.skipSpace) *> selpComplex (\t -> SelChild t (cont s))
+        Just '+' ->
+          (Atto.char '+' >> Atto.skipSpace )*> selpComplex (\t -> SelSiblings t (cont s))
+        Just c | c `L.elem` ("*:#._[" :: String) || C.isAlphaNum c ->
+          selpComplex (\t -> SelDescends t (cont s))
+        Just c | c `L.elem` ("{," :: String) -> return $ cont s
+        Just c -> return $ warning ("selpComplex: unknown char " ++ [c]) $ cont s
+        _ -> return $ cont s
+
+    selp = do
+      tag <- (Just <$> Atto.try (selpTag <|> selpAny)) <|> pure Nothing
+      rest <- Atto.many' (selpId <|> selpClass <|> selpAttr <|> selpPseudo)
+      case maybeToList tag ++ rest of
+        [] -> fail "empty selector"
+        [s] -> return s
+        other -> return $ SelAnd other
+    selpAny = Atto.char '*' *> pure SelAny
+    selpTag = (SelTag . T.pack) <$> Atto.many1 (Atto.letter <|> Atto.digit)
+    selpClass = SelClass <$> (Atto.char '.' *> csspIdent)
+    selpPseudo =  -- TODO: parenthesis
+      (SelPseudo . T.pack) <$> (Atto.char ':' *> Atto.many1 (Atto.letter <|> Atto.char '-'))
+    selpId = SelId <$> (Atto.char '#' *> csspIdent)
+    selpAttr = do
+      void $ Atto.char '['
+      attr <- csspString <|> csspIdent
+      c <- Atto.anyChar
+      if c == ']'
+      then return $ SelHasAttr attr
+      else do
+        op <- case c of
+          '=' -> pure (SelAttrEq attr)
+          '~' -> Atto.char '=' *> pure (SelAttrWord attr)
+          '|' -> Atto.char '=' *> pure (SelAttrPre attr)
+          _ -> fail "selpAttr"
+        val <- csspString <|> csspIdent
+        void $ Atto.char ']'
+        return $ op val
+
+cssSelectors:: Text -> Either String [Selector]
+cssSelectors = Atto.parseOnly (cssparseSelector <* Atto.endOfInput)
 
 -- | TODO: cursors bitmap collection
 -- https://developer.mozilla.org/en-US/docs/Web/CSS/cursor
@@ -523,7 +607,7 @@ cssLength = \case
 uiFont :: Style
 uiFont = css
   [ ("font-family", "sans")   -- TODO: take sans font from settings
-  , ("font-size", "1rem")  -- TODO: use rem
+  , ("font-size", "1em")  -- TODO: use rem
   , ("font-style", "normal")
   , ("font-weight", "normal")
   ]

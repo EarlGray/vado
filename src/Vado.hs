@@ -630,16 +630,21 @@ domParseHTMLAttributes nid = do
     _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
-  let styleAttr = M.lookup "style" $ elementAttrs node
-  let htmlStyle = builtinHTMLStyleFor tag (elementAttrs node)
-  let st = Stylesheet
-        { stylesheetBrowser = fromMaybe noStyle htmlStyle
-        , stylesheetAuthor = maybe noStyle (cssFarcer . T.unpack) $ styleAttr
-        }
+  let htmlStyle = fromMaybe noStyle $ builtinHTMLStyleFor tag (elementAttrs node)
+  let mbStyleAttr = fmap (\t -> T.concat ["{", t, "}"]) $ M.lookup "style" $ elementAttrs node
+  let (attrImpStyle, attrStyle) = case cssParser <$> mbStyleAttr of
+       Just [(_, impstyle, style)] -> (impstyle, style)
+       Just _ ->
+         let msg ="domParseHTMLAttributes@"++show nid++": failed to parse: "++show mbStyleAttr
+         in warning msg (noStyle, noStyle)
+       Nothing -> (noStyle, noStyle)
   setElement nid $ node
-      { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
-      , elementStylesheet = st
-      }
+    { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
+    , elementStylesheet = Stylesheet
+        { stylesheetAuthor = htmlStyle
+        , stylesheetBrowser = attrStyle
+        }
+    }
   whenJust (M.lookup "autofocus" $ elementAttrs node) $ \_ ->
     modify $ \doc -> doc{ documentFocus = nid }
 
