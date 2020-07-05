@@ -9,7 +9,7 @@ import qualified Data.Char as C
 import           Data.Either (partitionEithers)
 import qualified Data.List as L
 import qualified Data.Map as M
-import           Data.Maybe (fromMaybe, mapMaybe, maybeToList)
+import           Data.Maybe (fromMaybe, maybeToList)
 import           Data.Text (Text)
 import qualified Data.Text as T
 import           Data.Word (Word8)
@@ -323,16 +323,6 @@ data Selector
 --------------------------------------------------------------------------------
 -- CSS parsers and printers
 
--- TODO: use css-text here
--- | A farcical CSS parser
-cssFarcer :: String -> Style
-cssFarcer s = css $ mapMaybe parseProp $ T.splitOn ";" (T.pack s)
-  where
-    parseProp p = case T.break (== ':') p of
-      (_, "") -> Nothing
-      (key, val) -> Just (T.strip key, T.strip $ T.tail val)
-
--- | A more mature CSS parser
 type AtText = Text
 type SelText = Text
 type ImportantStyle = Style
