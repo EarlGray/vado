@@ -35,8 +35,6 @@ import           SDL.Vect
 --import           System.CPUTime (getCPUTime)
 import qualified System.Environment as Env
 import           System.Exit (exitSuccess)
-import qualified Text.CSS.Parse as CSSP
---import qualified Text.CSS.Render as CSSP
 import           Text.Read (readMaybe)
 import qualified Text.XML as XML
 import qualified Data.XML.Types as XMLTy
@@ -137,6 +135,7 @@ data Document = Document
   , documentFocus :: ElementID      -- the keyboard focus
   , documentImages :: IM.IntMap ElementID
   , documentTitle :: Text
+  -- , documentStyles :: CSSRuleStorage
   -- , documentContentType :: ContentType
   -- , documentMeta :: M.Map Text Text
   -- , documentElementsByClass :: M.Map Text [ElementID]
@@ -564,14 +563,9 @@ domEndHTMLElement name = do
         let Right fid = elementContent node
         tnode <- getElement fid
         case elementContent tnode of
-          Left (TextContent t) ->
-            -- now it's time to parse CSS
-            case CSSP.parseNestedBlocks t of
-              Left e ->
-                return $ warning ("domEndHTMLElement: parsing @"++show nid++
-                         " CSS style failed: " ++ e) ()
-              Right _blocks ->
-                return $ warning ("TODO: domEndHTMLElement: CSS parsing in <style>") ()
+          Left (TextContent _) ->
+            -- TODO: parse, add to documentStyles, make "@import" requests.
+            return ()
           other ->
             return $ warning ("domEndHTMLElement @"++show nid++": expected text in <style>"++
                               ", found " ++ show other) ()

@@ -15,6 +15,7 @@ import qualified Data.Text as T
 import           Data.Word (Word8)
 
 import qualified Data.Attoparsec.Text as Atto
+import qualified Text.CSS.Parse as CSSP
 
 import           Vado.Types
 
@@ -46,16 +47,18 @@ instance HasDebugView CSSValue where
   showdbg other = "TODO:showdbg(" ++ show other ++ ")"
 
 
--- | Style for an element, consists of own and inheritable properties.
--- Must be complete (e.g. not just style diff)
--- No types for now, just stringly-typed prototypes.
+-- | A CSS declaration block.
 data Style = Style
   { styleOwn :: M.Map CSSOwnProperty CSSValue
   , styleInherit :: M.Map CSSProperty CSSValue
   }
+  deriving (Eq)
 
 noStyle :: Style
 noStyle = Style { styleOwn = M.empty, styleInherit = M.empty }
+
+instance Semigroup Style where (<>) = overriding
+instance Monoid Style where mempty = noStyle
 
 instance HasDebugView Style where
   showdbg Style{..} = L.intercalate "; " (ownprops ++ inheritprops)
@@ -73,9 +76,9 @@ instance Read Style where
 -- | Add CSS properties to existing properties, including own properties
 -- Shadow previous values if they exist.
 overriding :: Style -> Style -> Style
-overriding newprops base = Style
-    { styleInherit = styleInherit newprops `M.union` styleInherit base
-    , styleOwn = styleOwn newprops `M.union` styleOwn base
+overriding new old = Style
+    { styleInherit = styleInherit new `M.union` styleInherit old
+    , styleOwn = styleOwn new `M.union` styleOwn old
     }
 
 -- | Given a node and a parent style, compute cascaded node style
@@ -275,11 +278,28 @@ stylesheetValue :: IsCSSProperty prop => Stylesheet -> prop -> CSSValue
 stylesheetValue Stylesheet{..} prop =
   fromMaybe (stylesheetBrowser `cssValue` prop) (stylesheetAuthor `cssValueMaybe` prop)
 
+
+data CSSOrigin
+  = OriginBrowser
+  | OriginUser
+  | OriginAuthor
+  | OriginImportantAuthor
+  | OriginImportantUser
+  deriving (Eq, Ord, Enum)
+
+type RuleID = Int
+
+{-
+data CSSRules = CSSRules
+  { cssrulesStorage :: IM.IntMap Style
+  }
+-}
+
 --------------------------------------------------------------------------------
 -- CSS parsers and printers
 
 -- TODO: use css-text here
--- a farcical CSS parser:
+-- | A farcical CSS parser
 cssFarcer :: String -> Style
 cssFarcer s = css $ mapMaybe parseProp $ T.splitOn ";" (T.pack s)
   where
@@ -287,6 +307,17 @@ cssFarcer s = css $ mapMaybe parseProp $ T.splitOn ";" (T.pack s)
       (_, "") -> Nothing
       (key, val) -> Just (T.strip key, T.strip $ T.tail val)
 
+-- | A more mature CSS parser
+type SelText = Text
+type AtText = Text
+
+-- TODO: @-blocks and AtText
+cssParser :: Text -> [(SelText, Style, Style)]
+cssParser t = either (\e -> warning e []) (map conv) $ CSSP.parseBlocks t
+  where
+    conv (sel, block) =
+      let (important, props) = L.partition (\(_, v) -> "!important" `T.isSuffixOf` T.strip v) block
+      in (sel, css $ map (\(k, v) -> (k, T.replace "!important" "" v)) important, css props)
 
 -- | Read and split properties into own and inheritable
 -- Warn about unknown properties and values, ignore them.
