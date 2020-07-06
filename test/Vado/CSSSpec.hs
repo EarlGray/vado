@@ -76,6 +76,10 @@ spec = do
 
   describe "cssParser" $ do
     let testee = cssParser
+    it "case-insensitive" $
+      testee "*{COLOR: RED !IMPORTANT}" `shouldBe`
+        [([], SelAny, style [] [(CSSColor, CSS_RGB 255 0 0)], noStyle)]
+    -- syntax
     it "empty selector block" $
       testee "*{font-size:85%}" `shouldBe`
         [([], SelAny, noStyle, style [] [(CSSFontSize, CSS_Percent 85)])]
@@ -109,7 +113,7 @@ spec = do
         , (["@media print"], SelTag "b", noStyle, style [] [(CSSColor, CSS_RGB 0 0 0)])
         ]
     it "@media: nested" $ do
-      let text = T.pack [r|
+      let _text = T.pack [r|
         @media print {
           a {color: black !important}
           @media(max-size: 800px) {

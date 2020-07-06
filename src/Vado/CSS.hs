@@ -339,8 +339,10 @@ cssParser t =
       CSSP.NestedBlock at blocks ->
         L.concatMap (flatten (at:ats)) blocks
       CSSP.LeafBlock (seltext, block) ->
-        let (decls1, decls) = L.partition (\(_, v) -> "!important" `T.isSuffixOf` T.strip v) block
-            style1 = css $ map (\(k, v) -> (k, T.replace "!important" "" v)) decls1
+        let isImportant (_, v) = "!important" `T.isSuffixOf` T.toLower (T.stripEnd v)
+            dropImportant = T.init . T.dropWhileEnd (/= '!')
+            (decls1, decls) = L.partition isImportant $ map (\(k, v) -> (T.toLower k, v)) block
+            style1 = css $ map (\(k, v) -> (k, dropImportant v)) decls1
             style = css decls
             sels = either (\e -> warning e []) id $ cssSelectors seltext :: [Selector]
         in map (\s -> (reverse ats, s, style1, style)) sels
