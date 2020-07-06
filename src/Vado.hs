@@ -310,18 +310,12 @@ domtreeAppendChild pid mbXML content = do
     _ ->
       return $ warning ("not an insertable element: " ++ show parent) noElement
 
-domtreeStartElement :: Monad m => (Text, M.Map Text Text) -> DocumentT m ElementID
-domtreeStartElement (tag, attrs) = do
-  opened <- gets documentBuildState
-  let pid = if null opened then noElement else head opened
-
+domtreeStartElement :: Monad m
+                    => ElementID -> Element
+                    -> DocumentT m ElementID
+domtreeStartElement pid node0 = do
   nid <- takeNewID
-  let node = emptyElement
-       { elementParent = pid
-       , elementContent = Right noElement
-       , elementTag = tag
-       , elementAttrs = attrs
-       }
+  let node = node0{ elementParent = pid, elementContent = Right noElement }
 
   if pid == noElement then do
     setElement nid $
@@ -343,7 +337,6 @@ domtreeStartElement (tag, attrs) = do
       setElement nid $
         node{ elementSiblings = ElementSiblings{ prevSibling = lid, nextSibling = fid } }
 
-  modify $ \doc -> doc{ documentBuildState = (nid:opened) }
   return nid
 
 domtreeEndElement :: Monad m => DocumentT m ElementID
@@ -521,9 +514,15 @@ htmlDOMFromEvents = \case
 
 
 domStartHTMLElement :: Monad m => TagAttrs -> DocumentT m ()
-domStartHTMLElement tagattrs = do
-    nid <- domtreeStartElement tagattrs
-    domParseHTMLAttributes nid
+domStartHTMLElement (tag, attrs) = do
+  opened <- gets documentBuildState
+  let pid = if null opened then noElement else head opened
+
+  let node = emptyElement { elementTag = tag, elementAttrs = attrs }
+  nid <- domtreeStartElement pid node
+  modify $ \doc -> doc{ documentBuildState = (nid:opened) }
+
+  domParseHTMLAttributes nid
 
 domAppendHTMLContent :: Monad m => Maybe TagAttrs -> DOMContent -> DocumentT m ()
 domAppendHTMLContent mbTagAttrs content = do
@@ -641,8 +640,8 @@ domParseHTMLAttributes nid = do
   setElement nid $ node
     { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
     , elementStylesheet = Stylesheet
-        { stylesheetAuthor = htmlStyle
-        , stylesheetBrowser = attrStyle
+        { stylesheetAuthor = attrStyle
+        , stylesheetBrowser = htmlStyle
         }
     }
   whenJust (M.lookup "autofocus" $ elementAttrs node) $ \_ ->
@@ -1917,7 +1916,7 @@ withStyling BoxTree{boxDim=V2 w h, boxStyling=(stpush, stpop)} (x, y, st0) actio
   where
     applyStyling :: Style -> StyleDiff -> Canvas.Canvas ()
     applyStyling st diff = do
-      when (any (`M.member` diff) [CSSFontSize, CSSFontFamily, CSSFontSize, CSSFontWeight]) $
+      when (any (`M.member` diff) [CSSFontFamily, CSSFontSize, CSSFontStyle, CSSFontWeight]) $
         Canvas.textFont $ styleFont st
       forM_ (M.toList diff) $ \case
         (CSSColor, CSS_RGB r g b) ->

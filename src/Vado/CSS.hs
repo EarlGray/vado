@@ -70,11 +70,6 @@ instance HasDebugView Style where
 instance Show Style where
   show = showdbg
 
-{-
-instance Read Style where
-  readsPrec _ s = [(cssFarcer s, "")]
-  -}
-
 -- | Add CSS properties to existing properties, including own properties
 -- Shadow previous values if they exist.
 overriding :: Style -> Style -> Style
@@ -165,7 +160,7 @@ class IsCSSProperty prop where
 
 -- | Inheritable properites:
 data CSSProperty
-  = CSSBackgroundColor
+  = CSSBackgroundColor   -- TODO: it's CSSOwnProperty
   | CSSColor
   | CSSFontFamily
   | CSSFontSize
