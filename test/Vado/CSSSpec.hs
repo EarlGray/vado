@@ -6,6 +6,8 @@ module Vado.CSSSpec (spec) where
 import qualified Data.Map as M
 
 import           Test.Hspec
+import qualified Data.Text as T
+import           Text.RawString.QQ
 
 import           Vado.CSS
 
@@ -73,26 +75,51 @@ spec = do
 
 
   describe "cssParser" $ do
+    let testee = cssParser
     it "empty selector block" $
-      cssParser "{font-size:85%}" `shouldBe`
-        [("", noStyle, style [] [(CSSFontSize, CSS_Percent 85)])]
+      testee "*{font-size:85%}" `shouldBe`
+        [([], SelAny, noStyle, style [] [(CSSFontSize, CSS_Percent 85)])]
     it "a single block" $
-      cssParser "div{color:red}"
-        `shouldBe` [("div", noStyle, style [] [(CSSColor, CSS_RGB 255 0 0)])]
+      testee "div{color:red}" `shouldBe`
+        [([], SelTag "div", noStyle, style [] [(CSSColor, CSS_RGB 255 0 0)])]
     it "a single block with semicolon" $
-      cssParser "div{color:red;}"
-        `shouldBe` [("div", noStyle, style [] [(CSSColor, CSS_RGB 255 0 0)])]
+      testee "div{color:red;}" `shouldBe`
+        [([], SelTag "div", noStyle, style [] [(CSSColor, CSS_RGB 255 0 0)])]
     it "understands !important" $
-      cssParser ".small{font-size:85% !important}"
-        `shouldBe` [(".small", style [] [(CSSFontSize, CSS_Percent 85)], noStyle)]
+      testee ".small{font-size:85% !important}" `shouldBe`
+        [([], SelClass "small", style [] [(CSSFontSize, CSS_Percent 85)], noStyle)]
     it "two properties block" $
-      cssParser "quack{display: inline; color: green}" `shouldBe`
-        [("quack", noStyle, style
+      testee "quack{display: inline; color: green}" `shouldBe`
+        [([], SelTag "quack", noStyle, style
            [(CSSDisplay, CSS_Keyword "inline")]
            [(CSSColor, CSS_RGB 0 128 0)])
         ]
     it "two blocks" $
-      cssParser ".small{font-size:85% !important}quack{color: green}" `shouldBe`
-        [ (".small", style [] [(CSSFontSize, CSS_Percent 85)], noStyle)
-        , ("quack", noStyle, style [] [(CSSColor, CSS_RGB 0 128 0)])
+      testee ".small{font-size:85% !important}quack{color: green}" `shouldBe`
+        [ ([], SelClass "small", style [] [(CSSFontSize, CSS_Percent 85)], noStyle)
+        , ([], SelTag "quack", noStyle, style [] [(CSSColor, CSS_RGB 0 128 0)])
         ]
+
+    it "@media" $
+      testee "@media print {a{color:black}}" `shouldBe`
+        [(["@media print"], SelTag "a", noStyle, style [] [(CSSColor, CSS_RGB 0 0 0)])]
+    it "@media: group selectors" $
+      testee "@media print {a,b{color:black}}" `shouldBe`
+        [ (["@media print"], SelTag "a", noStyle, style [] [(CSSColor, CSS_RGB 0 0 0)])
+        , (["@media print"], SelTag "b", noStyle, style [] [(CSSColor, CSS_RGB 0 0 0)])
+        ]
+    it "@media: nested" $ do
+      let text = T.pack [r|
+        @media print {
+          a {color: black !important}
+          @media(max-size: 800px) {
+            img { display: block }
+          }
+        }
+      |]
+      pendingWith "Text.CSS.Parse.parseNestedBlocks parses the query as a LeafBlock!"
+      --testee text `shouldBe`
+      --  [ (["@media print"], SelTag "a", style [] [(CSSColor, CSS_RGB 0 0 0)], noStyle)
+      --  , (["@media print", "@media(max-size: 800px)"],
+      --      SelTag "img", noStyle, style [(CSSDisplay, CSS_Keyword "block")] [])
+      --  ]

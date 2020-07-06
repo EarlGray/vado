@@ -631,9 +631,9 @@ domParseHTMLAttributes nid = do
   -- TODO: parse class set
   -- TODO: parse id and add globally
   let htmlStyle = fromMaybe noStyle $ builtinHTMLStyleFor tag (elementAttrs node)
-  let mbStyleAttr = fmap (\t -> T.concat ["{", t, "}"]) $ M.lookup "style" $ elementAttrs node
+  let mbStyleAttr = fmap (\t -> T.concat ["*{", t, "}"]) $ M.lookup "style" $ elementAttrs node
   let (attrImpStyle, attrStyle) = case cssParser <$> mbStyleAttr of
-       Just [(_, impstyle, style)] -> (impstyle, style)
+       Just [(_, _, impstyle, style)] -> (impstyle, style)
        Just _ ->
          let msg ="domParseHTMLAttributes@"++show nid++": failed to parse: "++show mbStyleAttr
          in warning msg (noStyle, noStyle)

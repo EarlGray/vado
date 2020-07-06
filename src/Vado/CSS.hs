@@ -6,7 +6,7 @@ module Vado.CSS where
 import           Control.Applicative
 import           Control.Monad (void)
 import qualified Data.Char as C
-import           Data.Either (partitionEithers)
+import qualified Data.Either as Ei
 import qualified Data.List as L
 import qualified Data.Map as M
 import           Data.Maybe (fromMaybe, maybeToList)
@@ -327,13 +327,24 @@ type AtText = Text
 type SelText = Text
 type ImportantStyle = Style
 
--- TODO: @-blocks and AtText
-cssParser :: Text -> [(SelText, ImportantStyle, Style)]
-cssParser t = either (\e -> warning e []) (map conv) $ CSSP.parseBlocks t
+-- | Takes a CSS document and parses it.
+-- Flattens nested @-clauses.
+-- Groups of selectors are decomposed into multiple blocks with the same body.
+cssParser :: Text -> [([AtText], Selector, ImportantStyle, Style)]
+cssParser t =
+    either (\e -> warning e []) (L.concatMap (flatten [])) $ CSSP.parseNestedBlocks t
   where
-    conv (sel, block) =
-      let (important, props) = L.partition (\(_, v) -> "!important" `T.isSuffixOf` T.strip v) block
-      in (sel, css $ map (\(k, v) -> (k, T.replace "!important" "" v)) important, css props)
+    flatten :: [AtText] -> CSSP.NestedBlock -> [([AtText], Selector, ImportantStyle, Style)]
+    flatten ats = \case
+      CSSP.NestedBlock at blocks ->
+        L.concatMap (flatten (at:ats)) blocks
+      CSSP.LeafBlock (seltext, block) ->
+        let (decls1, decls) = L.partition (\(_, v) -> "!important" `T.isSuffixOf` T.strip v) block
+            style1 = css $ map (\(k, v) -> (k, T.replace "!important" "" v)) decls1
+            style = css decls
+            sels = either (\e -> warning e []) id $ cssSelectors seltext :: [Selector]
+        in map (\s -> (reverse ats, s, style1, style)) sels
+
 
 -- | Read and split properties into own and inheritable
 -- Warn about unknown properties and values, ignore them.
@@ -345,7 +356,7 @@ css properties = Style
     , styleInherit = M.fromList inherit
     }
   where
-    (own, inherit) = partitionEithers $ map desugarValues $ concatMap readProperty properties
+    (own, inherit) = Ei.partitionEithers $ map desugarValues $ concatMap readProperty properties
 
     readProperty :: (Text, Text) -> [OwnOrInheritable]
     readProperty (name, textval) =
