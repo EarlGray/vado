@@ -129,13 +129,13 @@ data Document = Document
   , documentResources :: DOMResourceMap
   , documentResourcesLoading :: M.Map URI (S.Set ElementID)   -- to remember what's in flight
   , documentResourceRequests :: [(URI, ElementID)]  -- to queue requests from inside DocumentT
+  -- , documentStyles :: CSSRules
 
   , documentHead :: ElementID
   , documentBody :: ElementID
   , documentFocus :: ElementID      -- the keyboard focus
   , documentImages :: IM.IntMap ElementID
   , documentTitle :: Text
-  -- , documentStyles :: CSSRuleStorage
   -- , documentContentType :: ContentType
   -- , documentMeta :: M.Map Text Text
   -- , documentElementsByClass :: M.Map Text [ElementID]
@@ -1341,6 +1341,8 @@ body_onKeyReleased event _nid page = do
       return $ vadoScroll (vadoViewHeight page) page
     SDL.KeycodePageUp -> do
       return $ vadoScroll (negate $ vadoViewHeight page) page
+    SDL.KeycodeQ | modifiers == noKeyModifiers ->
+      exitSuccess
     SDL.KeycodeRight | isKeyAltPressed modifiers ->
       case pageHistory page of
         (_, nexturl:_) -> navigatePage nexturl page

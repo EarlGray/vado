@@ -127,12 +127,18 @@ spec = do
     it ".class" $ cssSelectors ".small" `shouldBe` Right [SelClass "small"]
     it "#my-id1" $ cssSelectors "#my-id1" `shouldBe` Right [SelId "my-id1"]
     --it "#id with nonalphanum" $ cssSelectors "#id_\\#\\:\\." `shouldBe` Right [SelId "id_#:."]
+    it ":active" $
+      cssSelectors ":active" `shouldBe`
+        Right [SelPseudo "active"]
     it ":first-line" $
       cssSelectors ":first-line" `shouldBe`
-        Right [SelPseudo "first-line"]
+        Right [SelPseudoElem "first-line"]
+    it "::first-line" $     -- CSS 3 selectors
+      cssSelectors "::first-line" `shouldBe`
+        Right [SelPseudoElem "first-line"]
     it "p:first-line" $
       cssSelectors "p:first-line" `shouldBe`
-        Right [SelAnd [SelTag "p", SelPseudo "first-line"]]
+        Right [SelAnd [SelTag "p", SelPseudoElem "first-line"]]
     it "[attr]" $
       cssSelectors "[data-attr]" `shouldBe` Right [SelHasAttr "data-attr"]
     it "[attr=value]" $
@@ -173,6 +179,26 @@ spec = do
       cssSelectors "..whut" `shouldBe` Left "Failed reading: empty selector"
     it "should fail: `body, `" $
       cssSelectors "body, " `shouldBe` Left "endOfInput"
+
+  describe "selectorSpecificity" $ do
+    let testee = selectorSpecificity
+    it "*" $ testee SelAny `shouldBe` (0, 0, 0)
+    it "li" $ testee (SelTag "li") `shouldBe` (0, 0, 1)
+    it "ul li" $
+      testee (SelDescends (SelTag "li") (SelTag "ul")) `shouldBe` (0, 0, 2)
+    it "ul ol+li" $
+      testee (SelSiblings (SelTag "li") (SelDescends (SelTag "ol") (SelTag "ul")))
+        `shouldBe` (0, 0, 3)
+    it "h1 + *[rel=up]" $
+      testee (SelSiblings (SelAnd [SelAny, SelAttrEq "rel" "up"]) (SelTag "h1"))
+        `shouldBe` (0, 1, 1)
+    it "li.red.level" $
+      testee (SelAnd [SelTag "li", SelClass "red", SelClass "level"])
+        `shouldBe` (0, 2, 1)
+    it "#x334y" $
+      testee (SelId "x344y") `shouldBe` (1, 0, 0)
+    --it "#s12:not(foo)" $
+    --  testee (SelAnd [SelId "s12", SelNot "foo"]) `shouldBe` (1, 0, 1)
 
 
   describe "cssParser" $ do

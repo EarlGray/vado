@@ -4,12 +4,15 @@
 module Vado.CSS where
 
 import           Control.Applicative
-import           Control.Monad (void)
+import           Control.Monad (void, forM_)
+import qualified Control.Monad.State as St
 import qualified Data.Char as C
 import qualified Data.Either as Ei
+import qualified Data.IntMap as IM
 import qualified Data.List as L
 import qualified Data.Map as M
 import           Data.Maybe (fromMaybe, maybeToList)
+import qualified Data.Set as S
 import           Data.Text (Text)
 import qualified Data.Text as T
 import           Data.Word (Word8)
@@ -284,14 +287,6 @@ data CSSOrigin
   | OriginImportantUser
   deriving (Eq, Ord, Enum)
 
-type RuleID = Int
-
-{-
-data CSSRules = CSSRules
-  { cssrulesStorage :: IM.IntMap Style
-  }
--}
-
 data Selector
   = SelAny                      -- `*` or empty
   | SelTag Text                 -- `div`
@@ -305,15 +300,86 @@ data Selector
   -- ^ e.g. `.hey ul li`: SelDescends (SelTag "li") (SelDescends (SelTag "ul") (SelClass "small"))
   | SelChild Selector Selector
   -- ^ e.g. `.blabla > .but`: SelChild (SelClass "but") (SelClass "blabla")
+  | SelPseudoElem Text
   | SelPseudo Text     -- `button:focus`: SelPseudo (SelTag "a") "focus"
   -- SelPseudoLang Selector Text   -- `div:lang(fr)`
   | SelSiblings Selector Selector
   -- ^ `img + .caption` is SelSiblings (SelClass "caption") (SelTag "img")
   | SelAnd [Selector]
   deriving (Show, Eq)
-  -- TODO: https://drafts.csswg.org/selectors-3/
+  -- TODO: https://drafts.csswg.org/selectors-3/: important things like :not(), etc.
 
 -- instance Show Selector  -- TODO
+
+type IdNum = Int
+type AttrNum = Int
+type TagNum = Int
+type FromStyle = Bool
+type Specificity = (IdNum, AttrNum, TagNum)
+type FullSpecificity = (CSSOrigin, FromStyle, IdNum, AttrNum, TagNum, RuleID)
+
+selectorSpecificity :: Selector -> Specificity
+selectorSpecificity = \case
+    SelAny -> (0, 0, 0)
+    SelTag _ -> (0, 0, 1)
+    SelPseudoElem _ -> (0, 0, 1)
+    SelPseudo _ -> (0, 1, 0)
+    SelClass _ -> (0, 1, 0)
+    SelHasAttr _ -> (0, 1, 0)
+    SelAttrEq _ _ -> (0, 1, 0)
+    SelAttrWord _ _ -> (0, 1, 0)
+    SelAttrPre _ _ -> (0, 1, 0)
+    SelId _ -> (1, 0, 0)
+    SelSiblings s1 s2 -> addSpecty (selectorSpecificity s1) (selectorSpecificity s2)
+    SelChild s1 s2 -> addSpecty (selectorSpecificity s1) (selectorSpecificity s2)
+    SelDescends s1 s2 -> addSpecty (selectorSpecificity s1) (selectorSpecificity s2)
+    SelAnd [] -> (0, 0, 0)
+    SelAnd (s:ss) -> addSpecty (selectorSpecificity s) (selectorSpecificity $ SelAnd ss)
+  where
+    addSpecty (a1, b1, c1) (a2, b2, c2) = (a1+a2, b1+b2, c1+c2)
+
+
+-- | The CSS rules storage
+
+type RuleID = Int
+
+data CSSRules = CSSRules
+  { cssRulesStorage :: IM.IntMap {-RuleID-} ([AtText], Selector, Style)
+  , cssRulesSpecificity :: IM.IntMap Specificity
+  }
+
+cssAddRules :: [([AtText], Selector, Style)] -> CSSOrigin -> CSSRules -> CSSRules
+cssAddRules rs origin rules0 = flip St.execState rules0 $
+    forM_ rs $ \r@(ats, sel, st) -> do
+      ruls <- St.gets cssRulesStorage
+      let rid = if IM.null ruls then 1 else 1 + fst (IM.findMax ruls)
+
+      -- TODO: compute the indexes for each rule, add to indexes
+      let (ids, attrs, classes, pseudos) = selectorParts sel
+
+      let specty = selectorSpecificity sel
+      St.modify $ \rules -> rules
+        { cssRulesStorage = IM.insert rid r $ cssRulesStorage rules
+        , cssRulesSpecificity = IM.insert rid specty $ cssRulesSpecificity rules
+        }
+  where
+    selectorParts :: Selector -> ([Text], [Text], [Text], [Text])
+    selectorParts = \case
+      SelAny -> mempty
+      SelTag t -> ([], [], [], [t])
+      SelPseudoElem p -> ([], [], [], ["::" <> p])
+      SelPseudo p -> ([], [], [], [":" <> p])
+      SelClass clss -> ([], [], [clss], [])
+      SelHasAttr attr -> ([], [attr], [], [])
+      SelAttrEq attr _ -> ([], [attr], [], [])
+      SelAttrWord attr _ -> ([], [attr], [], [])
+      SelAttrPre attr _ -> ([], [attr], [], [])
+      SelId id_ -> ([id_], [], [], [])
+      SelSiblings s _ -> selectorParts s
+      SelChild s _ -> selectorParts s
+      SelDescends s _ -> selectorParts s
+      SelAnd [] -> mempty
+      SelAnd (s:ss) -> selectorParts s <> selectorParts (SelAnd ss)
 
 --------------------------------------------------------------------------------
 -- CSS parsers and printers
@@ -321,6 +387,10 @@ data Selector
 type AtText = Text
 type SelText = Text
 type ImportantStyle = Style
+
+-- TODO: cssParser should separate ImportantStyle and Style into separate lists
+-- TODO: weed out obviously unnecessary @media and other @-rules (e.g. `@media print`)
+-- TDDO: compress (["@media screen"], selector, impstyle, style) into ([], ...)
 
 -- | Takes a CSS document and parses it.
 -- Flattens nested @-clauses.
@@ -548,7 +618,7 @@ cssparseSelector =
 
     selp = do
       tag <- (Just <$> Atto.try (selpTag <|> selpAny)) <|> pure Nothing
-      rest <- Atto.many' (selpId <|> selpClass <|> selpAttr <|> selpPseudo)
+      rest <- Atto.many' (selpId <|> selpClass <|> selpAttr <|> selpPseudoElem <|> selpPseudo)
       case maybeToList tag ++ rest of
         [] -> fail "empty selector"
         [s] -> return s
@@ -556,8 +626,17 @@ cssparseSelector =
     selpAny = Atto.char '*' *> pure SelAny
     selpTag = (SelTag . T.pack) <$> Atto.many1 (Atto.letter <|> Atto.digit)
     selpClass = SelClass <$> (Atto.char '.' *> csspIdent)
+    -- TODO: parenthesis in pseudoclasses
+    selpPseudoElem =
+      (SelPseudoElem . T.pack) <$> (Atto.string "::" *> Atto.many1 (Atto.letter <|> Atto.char '-'))
     selpPseudo =  -- TODO: parenthesis
-      (SelPseudo . T.pack) <$> (Atto.char ':' *> Atto.many1 (Atto.letter <|> Atto.char '-'))
+      -- https://developer.mozilla.org/en-US/docs/Web/CSS/Pseudo-elements#Index_of_standard_pseudo-elements
+      let pseudoChoice p =
+            if p `S.member` S.fromList ["after", "before", "first-letter", "first-line",
+                        "grammar-error", "marker", "placeholder", "selection", "spelling-error"]
+            then SelPseudoElem p
+            else SelPseudo p
+      in (pseudoChoice . T.pack) <$> (Atto.char ':' *> Atto.many1 (Atto.letter <|> Atto.char '-'))
     selpId = SelId <$> (Atto.char '#' *> csspIdent)
     selpAttr = do
       void $ Atto.char '['
