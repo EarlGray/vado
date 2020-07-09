@@ -37,17 +37,23 @@
 <li>[DONE: 2020/06/28] Network: parse a HTTP response as it comes, build DOM concurrently (conduits?)</li>
 <li>[DONE: 2020/06/28] Network: Resource Manager in a separate green thread</li>
 <li>[DONE: 2020/06/28] Network: fetching resources concurrently</li>
-<li>[WIP] Refactor: a proper CSS parser from <code>css-text</code></li>
+<li>[DONE: 2020/07/05] Refactor: a proper CSS parser from <code>css-text</code></li>
+<li>[WIP] CSS: CSS priority resolution and rule storage</li>
 <li>[WIP] CSS, Layout: margins, borders and padding</li>
 <li>CSS: parse <code>&lt;style&gt;</code> tags</li>
-<li>Refactor: split fetching data, decoding data and presenting content</li>
+<li>CSS: load external stylesheets</li>
 <li>HTML bug: fix no<code>&lt;body&gt;</code></li>
+<li>Refactor: BoxTree :: IntMap Box</li>
 <li>Layout: building render tree concurrently, update the screen with incomplete document</li>
 <li>Layout: incremental node changes instead of full page layouts</li>
 <li>Layout: use Pango to layout text and manage fonts</li>
+<li>Layout, CSS: <code>position: static|relative|absolute|fixed</code></li>
+<li>Layout: tests</li>
 <li>Fonts: choose sensible default fonts depending on the platform</li>
-<li>Network: progressive image decoding</li>
-<li>CSS: some <code>&lt;body&gt;</code> padding</li>
+<li>UI: make defaultFont* values run-time defined;
+    make the default font size smaller/bigger on <kbd>Ctrl+-</kbd>/<kbd>Ctrl+=</kbd>
+</li>
+<li>Misc: command-line options (e.g. default fonts)</li>
 <li>HTML, UI: &lt;ol&gt;, numbered lists</li>
 <li>UI: better text input widget</li>
 <li>UI: focus element on click, defocus other elements</li>
@@ -55,15 +61,10 @@
 <li>UI, HTML: walk focusable elements with <kbd>Tab</kbd> key, handling <code>tabindex</code></li>
 <li>HTML: same-page links (<code>&lt;a href="#id"&gt;</code>)</li>
 <li>HTML: <code>&lt;details&gt;</code> tag</li>
-<li>CSS: CSS priority resolution and rule storage</li>
 <li>CSS: <code>line-height</code></li>
-<li>Refactor: TileIndex from BoxTree, findBox using TileIndex; rendering using TileIndex too?</li>
-<li>Misc: command-line options (e.g. default fonts)</li>
 <li>Misc: profiling, CPU and memory optimization</li>
 <li>Misc: persistent settings and cache (SQLite?)</li>
 <li>HTML: support for non-UTF encodings (e.g. piping through iconv?)</li>
-<li>Layout, CSS: <code>position: static|relative|absolute|fixed</code></li>
-<li>Layout: tests</li>
 <li>Forms:
   <ul>
     <li>UI: <code>&lt;input type="submit"&gt;</code> event: emit and handle</li>
@@ -74,9 +75,6 @@
 <li>UI, CSS: buttons</li>
 <li>UI: optimized scroll (skiplist of subboxes in large boxes?) - blit copy + TileIndex</li>
 <li>UI: custom cursors; CSS: <code>cursor</code></li>
-<li>UI: make defaultFont* values run-time defined;
-    make the default font size smaller/bigger on <kbd>Ctrl+-</kbd>/<kbd>Ctrl+=</kbd>
-</li>
 <li>UI: scaling, zooming</li>
 <li>UI: a browser bar with back/forward/refresh buttons + address bar</li>
 <li>UI: <a href="vado:help">vado:help</a>, more discoverability</li>
@@ -84,6 +82,7 @@
 <li>Network: <code>file://</code> resource scheme</li>
 <li>Network: cookies</li>
 <li>Network: basic HTTP auth</li>
+<li>Network: progressive image decoding</li>
 </ul>
 </body>
 </html>

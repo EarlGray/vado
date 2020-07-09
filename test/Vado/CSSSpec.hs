@@ -205,39 +205,38 @@ spec = do
     let testee = cssParser
     it "case-insensitive" $
       testee "*{COLOR: RED !IMPORTANT}" `shouldBe`
-        [([], SelAny, style [] [(CSSColor, CSS_RGB 255 0 0)], noStyle)]
+        [([], SelAny, True, style [] [(CSSColor, CSS_RGB 255 0 0)])]
     -- syntax
     it "empty selector block" $
-      testee "*{}" `shouldBe`
-        [([], SelAny, noStyle, style [] [])]
+      testee "*{}" `shouldBe` []
     it "a single block" $
       testee "div{color:red}" `shouldBe`
-        [([], SelTag "div", noStyle, style [] [(CSSColor, CSS_RGB 255 0 0)])]
+        [([], SelTag "div", False, style [] [(CSSColor, CSS_RGB 255 0 0)])]
     it "a single block with semicolon" $
       testee "div{color:red;}" `shouldBe`
-        [([], SelTag "div", noStyle, style [] [(CSSColor, CSS_RGB 255 0 0)])]
+        [([], SelTag "div", False, style [] [(CSSColor, CSS_RGB 255 0 0)])]
     it "understands !important" $
       testee ".small{font-size:85% !important}" `shouldBe`
-        [([], SelClass "small", style [] [(CSSFontSize, CSS_Percent 85)], noStyle)]
+        [([], SelClass "small", True, style [] [(CSSFontSize, CSS_Percent 85)])]
     it "two properties block" $
       testee "quack{display: inline; color: green}" `shouldBe`
-        [([], SelTag "quack", noStyle, style
+        [([], SelTag "quack", False, style
            [(CSSDisplay, CSS_Keyword "inline")]
            [(CSSColor, CSS_RGB 0 128 0)])
         ]
     it "two blocks" $
       testee ".small{font-size:85% !important}quack{color: green}" `shouldBe`
-        [ ([], SelClass "small", style [] [(CSSFontSize, CSS_Percent 85)], noStyle)
-        , ([], SelTag "quack", noStyle, style [] [(CSSColor, CSS_RGB 0 128 0)])
+        [ ([], SelClass "small", True, style [] [(CSSFontSize, CSS_Percent 85)])
+        , ([], SelTag "quack", False, style [] [(CSSColor, CSS_RGB 0 128 0)])
         ]
 
     it "@media" $
       testee "@media print {a{color:black}}" `shouldBe`
-        [(["@media print"], SelTag "a", noStyle, style [] [(CSSColor, CSS_RGB 0 0 0)])]
+        [(["@media print"], SelTag "a", False, style [] [(CSSColor, CSS_RGB 0 0 0)])]
     it "@media: group selectors" $
       testee "@media print {a,b{color:black}}" `shouldBe`
-        [ (["@media print"], SelTag "a", noStyle, style [] [(CSSColor, CSS_RGB 0 0 0)])
-        , (["@media print"], SelTag "b", noStyle, style [] [(CSSColor, CSS_RGB 0 0 0)])
+        [ (["@media print"], SelTag "a", False, style [] [(CSSColor, CSS_RGB 0 0 0)])
+        , (["@media print"], SelTag "b", False, style [] [(CSSColor, CSS_RGB 0 0 0)])
         ]
     it "@media: nested" $ do
       let _text = T.pack [r|
@@ -258,7 +257,7 @@ spec = do
     -- error handling
     it "ignores unknown properties" $
       testee "h1 { color: red; rotation: 70minutes }" `shouldBe`
-        [([], SelTag "h1", noStyle, style [] [(CSSColor, CSS_RGB 255 0 0)])]
+        [([], SelTag "h1", False, style [] [(CSSColor, CSS_RGB 255 0 0)])]
     it "ignores malformed declarations" $
       --testee "p { color: green; color } a {}" `shouldBe` [([], SelTag "a", noStyle, noStyle)]
       pendingWith "css-text is wrong"

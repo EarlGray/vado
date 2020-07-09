@@ -69,6 +69,7 @@ data Page = Page
   { pageState :: PageState
   , pageDocument :: Document
   , pageBoxes :: Maybe BoxTree
+  --, pageCSSRules :: CSSRules
   -- ^ Rendering tree
 
   , pageUrl :: URI
@@ -129,7 +130,7 @@ data Document = Document
   , documentResources :: DOMResourceMap
   , documentResourcesLoading :: M.Map URI (S.Set ElementID)   -- to remember what's in flight
   , documentResourceRequests :: [(URI, ElementID)]  -- to queue requests from inside DocumentT
-  -- , documentStyles :: CSSRules
+  -- , documentCSSRules :: CSSRules
 
   , documentHead :: ElementID
   , documentBody :: ElementID
@@ -188,8 +189,7 @@ instance HasDebugView Document where
             attrs = elementAttrs node
             st = elementStylesheet node
             hdr = ["@"++show nid++":"++T.unpack tag++" "++show (M.toList attrs)++
-                   " style="++showdbg (stylesheetAuthor st)++
-                   " css="++showdbg (stylesheetBrowser st)]
+                   " style="++showdbg (stylesheetComputed st)]
         in case elementContent node of
           Right _ ->
             hdr ++ indent (L.concatMap shownode (elementChildren elt))
@@ -432,7 +432,7 @@ emptyElement = Element
   , elementTag = ""
   , elementAttrs = M.empty
   , elementEvents = noEvents
-  , elementStylesheet = Stylesheet noStyle noStyle
+  , elementStylesheet = emptyStylesheet
   }
 
 
@@ -630,19 +630,30 @@ domParseHTMLAttributes nid = do
   -- TODO: parse class set
   -- TODO: parse id and add globally
   let htmlStyle = fromMaybe noStyle $ builtinHTMLStyleFor tag (elementAttrs node)
-  let mbStyleAttr = fmap (\t -> T.concat ["*{", t, "}"]) $ M.lookup "style" $ elementAttrs node
-  let (attrImpStyle, attrStyle) = case cssParser <$> mbStyleAttr of
-       Just [(_, _, impstyle, style)] -> (impstyle, style)
-       Just _ ->
-         let msg ="domParseHTMLAttributes@"++show nid++": failed to parse: "++show mbStyleAttr
-         in warning msg (noStyle, noStyle)
-       Nothing -> (noStyle, noStyle)
+
+  let mbStyleAttr = (\t -> mconcat ["*{", t, "}"]) <$> M.lookup "style" (elementAttrs node)
+  let attrStyle = case cssParser <$> mbStyleAttr of
+        Nothing -> (noStyle, noStyle)
+        Just [] ->
+          let msg ="domParseHTMLAttributes@"++show nid++": failed to parse: "++show mbStyleAttr
+          in warning msg (noStyle, noStyle)
+        Just blocks ->
+          let styleFromBlocks = maybe noStyle blockStyle . listToMaybe
+              (impblocks, regblocks) = L.partition blockImportant blocks
+          in (styleFromBlocks impblocks, styleFromBlocks regblocks)
+
+  let cssrulechain = undefined          -- TODO: match selectors on documentCSSRules
+  let cssStyle = (noStyle, noStyle)     -- TODO: styleFromRulechain documentCSSRules cssrulechain
+  let sheet = Stylesheet
+        { stylesheetUserBrowser = (noStyle, htmlStyle)   -- TODO: OriginImportantUser
+        , stylesheetAttr = attrStyle
+        , stylesheetAuthor = cssStyle
+        , stylesheetAuthorChain = cssrulechain
+        , stylesheetComputed = undefined
+        }
   setElement nid $ node
     { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
-    , elementStylesheet = Stylesheet
-        { stylesheetAuthor = attrStyle
-        , stylesheetBrowser = htmlStyle
-        }
+    , elementStylesheet = sheet{ stylesheetComputed = computedStyle sheet }
     }
   whenJust (M.lookup "autofocus" $ elementAttrs node) $ \_ ->
     modify $ \doc -> doc{ documentFocus = nid }
@@ -1479,7 +1490,7 @@ layoutElement :: CanMeasureText m => ElementRef -> LayoutOver m ()
 layoutElement elt = do
     let node = elementDeref elt
         content = elementContent node
-        display = (elementStylesheet node) `stylesheetValue` CSSDisplay
+        display = (elementStylesheet node) `stylesheetOwnValue` CSSDisplay
     if display == CSS_Keyword "none" then
       return ()
     else case (content, display) of

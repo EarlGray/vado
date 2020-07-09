@@ -85,12 +85,11 @@ overriding new old = Style
 cascadeStyle :: Stylesheet -> Style -> Style
            -- this module should not need this
 cascadeStyle Stylesheet{..} parentStyle = Style
-    { styleInherit = attrStyle `merge` htmlStyle `merge` styleInherit parentStyle
-    , styleOwn = attrOwn `M.union` htmlOwn
+    { styleInherit = compInherit `merge` styleInherit parentStyle
+    , styleOwn = compOwn
     }
   where
-    Style{ styleInherit = attrStyle, styleOwn = attrOwn} = stylesheetAuthor
-    Style{ styleInherit = htmlStyle, styleOwn = htmlOwn} = stylesheetBrowser
+    Style{ styleInherit = compInherit, styleOwn = compOwn } = stylesheetComputed
     merge = M.mergeWithKey cascadingValue id id
 
 {- | Augment/override/merge new CSS style with base style.
@@ -158,7 +157,7 @@ class IsCSSProperty prop where
   cssDefault :: prop -> CSSValue    -- TODO: rename to cssInitial
 
   cssValue :: Style -> prop -> CSSValue
-  cssValue st prop = fromMaybe (cssDefault prop) (cssValueMaybe st prop)
+  cssValue st prop = fromMaybe (cssDefault prop) $ cssValueMaybe st prop
 
 
 -- | Inheritable properites:
@@ -266,17 +265,46 @@ instance HasDebugView CSSOwnProperty where
 -- CSS stylesheets, selectors, rule matching and rule chains
 
 data Stylesheet = Stylesheet
-  { stylesheetAuthor :: Style
-  , stylesheetBrowser :: Style
+  { stylesheetUserBrowser :: (ImportantStyle, Style)
+  -- ^ OriginImportantUser and OriginUser+OriginBrowser
+  , stylesheetAttr :: (ImportantStyle, Style)
+  -- ^ OriginImportantAuthor, OriginAuthor from style=""
+  , stylesheetAuthor :: (ImportantStyle, Style)
+  -- ^ OriginImportantAuthor, OriginAuthor not from style=""
+  , stylesheetAuthorChain :: [RuleID]
+
+  , stylesheetComputed :: Style
+  -- ^ see computedStyle: all of the above styles cascaded into one.
   }
   deriving (Show)
 
 emptyStylesheet :: Stylesheet
-emptyStylesheet = Stylesheet noStyle noStyle
+emptyStylesheet = Stylesheet
+  { stylesheetUserBrowser = (noStyle, noStyle)
+  , stylesheetAttr = (noStyle, noStyle)
+  , stylesheetAuthorChain = []
+  , stylesheetAuthor = (noStyle, noStyle)
+  , stylesheetComputed = noStyle
+  }
 
-stylesheetValue :: IsCSSProperty prop => Stylesheet -> prop -> CSSValue
-stylesheetValue Stylesheet{..} prop =
-  fromMaybe (stylesheetBrowser `cssValue` prop) (stylesheetAuthor `cssValueMaybe` prop)
+stylesheetValue :: IsCSSProperty prop => Style -> Stylesheet -> prop -> CSSValue
+stylesheetValue parentStyle sheet prop =
+  case stylesheetComputed sheet `cssValueMaybe` prop  of
+    Just (CSS_Keyword "initial") -> cssDefault prop
+    Just (CSS_Keyword "inherit") -> parentStyle `cssValue` prop
+    Just val -> val
+    Nothing -> noStyle{styleInherit = styleInherit parentStyle} `cssValue` prop
+
+stylesheetOwnValue :: IsCSSProperty prop => Stylesheet -> prop -> CSSValue
+stylesheetOwnValue = stylesheetValue noStyle
+
+computedStyle :: Stylesheet -> Style
+computedStyle Stylesheet{..} = mconcat
+  [ fst $ stylesheetUserBrowser                     -- OriginImportantUser
+  , fst $ stylesheetAttr, fst $ stylesheetAuthor    -- OriginImportantAuthor
+  , snd $ stylesheetAttr, snd $ stylesheetAuthor    -- OriginAuthor
+  , snd $ stylesheetUserBrowser                     -- OriginUser, OriginBrowser
+  ]
 
 
 data CSSOrigin
@@ -314,9 +342,7 @@ data Selector
 type IdNum = Int
 type AttrNum = Int
 type TagNum = Int
-type FromStyle = Bool
 type Specificity = (IdNum, AttrNum, TagNum)
-type FullSpecificity = (CSSOrigin, FromStyle, IdNum, AttrNum, TagNum, RuleID)
 
 selectorSpecificity :: Selector -> Specificity
 selectorSpecificity = \case
@@ -344,23 +370,47 @@ selectorSpecificity = \case
 type RuleID = Int
 
 data CSSRules = CSSRules
-  { cssRulesStorage :: IM.IntMap {-RuleID-} ([AtText], Selector, Style)
-  , cssRulesSpecificity :: IM.IntMap Specificity
+  { cssRulesStorage :: IM.IntMap {-RuleID-} CSSBlock
+
+  -- "indexes"
+  , cssRulesById :: M.Map Text (S.Set RuleID)
+  , cssRulesByClass :: M.Map Text (S.Set RuleID)
+  , cssRulesByAttr :: M.Map Text (S.Set RuleID)
+  , cssRulesByTag :: M.Map Text (S.Set RuleID)
+  , cssRulesOther :: S.Set RuleID
   }
 
-cssAddRules :: [([AtText], Selector, Style)] -> CSSOrigin -> CSSRules -> CSSRules
-cssAddRules rs origin rules0 = flip St.execState rules0 $
-    forM_ rs $ \r@(ats, sel, st) -> do
+emptyCSSRules :: CSSRules
+emptyCSSRules = CSSRules
+  { cssRulesStorage = IM.empty
+  , cssRulesById = M.empty
+  , cssRulesByClass = M.empty
+  , cssRulesByAttr = M.empty
+  , cssRulesByTag = M.empty
+  , cssRulesOther = S.empty
+  }
+
+addCSSRules :: [CSSBlock] -> CSSRules -> CSSRules
+addCSSRules blocks rules0 = flip St.execState rules0 $
+    forM_ blocks $ \block -> do
       ruls <- St.gets cssRulesStorage
-      let rid = if IM.null ruls then 1 else 1 + fst (IM.findMax ruls)
+      let rid = if IM.null ruls then 1 else 1 + fst (IM.findMax ruls) :: RuleID
 
-      -- TODO: compute the indexes for each rule, add to indexes
-      let (ids, attrs, classes, pseudos) = selectorParts sel
+      let (ids, attrs, classes, tags) = selectorParts $ blockSelector block
+      let amendIndex keys index =
+            M.unionWith S.union index $ M.fromList $ map (\k -> (k, S.singleton rid)) keys
 
-      let specty = selectorSpecificity sel
-      St.modify $ \rules -> rules
-        { cssRulesStorage = IM.insert rid r $ cssRulesStorage rules
-        , cssRulesSpecificity = IM.insert rid specty $ cssRulesSpecificity rules
+      if L.null (ids++attrs++classes++tags)
+      then St.modify $ \rules -> rules
+        { cssRulesStorage = IM.insert rid block $ cssRulesStorage rules
+        , cssRulesOther = S.insert rid $ cssRulesOther rules
+        }
+      else St.modify $ \rules -> rules
+        { cssRulesStorage = IM.insert rid block $ cssRulesStorage rules
+        , cssRulesByTag = amendIndex tags $ cssRulesByTag rules
+        , cssRulesByAttr = amendIndex attrs $ cssRulesByAttr rules
+        , cssRulesByClass = amendIndex classes $ cssRulesByClass rules
+        , cssRulesById = amendIndex ids $ cssRulesById rules
         }
   where
     selectorParts :: Selector -> ([Text], [Text], [Text], [Text])
@@ -368,7 +418,7 @@ cssAddRules rs origin rules0 = flip St.execState rules0 $
       SelAny -> mempty
       SelTag t -> ([], [], [], [t])
       SelPseudoElem p -> ([], [], [], ["::" <> p])
-      SelPseudo p -> ([], [], [], [":" <> p])
+      SelPseudo p -> ([], [], [":" <> p], [])
       SelClass clss -> ([], [], [clss], [])
       SelHasAttr attr -> ([], [attr], [], [])
       SelAttrEq attr _ -> ([], [attr], [], [])
@@ -381,12 +431,24 @@ cssAddRules rs origin rules0 = flip St.execState rules0 $
       SelAnd [] -> mempty
       SelAnd (s:ss) -> selectorParts s <> selectorParts (SelAnd ss)
 
+
 --------------------------------------------------------------------------------
 -- CSS parsers and printers
 
 type AtText = Text
-type SelText = Text
+type IsImportant = Bool
 type ImportantStyle = Style
+
+type CSSBlock = ([AtText], Selector, IsImportant, Style)
+
+blockImportant :: CSSBlock -> IsImportant
+blockImportant (_, _, imp, _) = imp
+
+blockStyle :: CSSBlock -> Style
+blockStyle (_, _, _, st) = st
+
+blockSelector :: CSSBlock -> Selector
+blockSelector (_, sel, _, _) = sel
 
 -- TODO: cssParser should separate ImportantStyle and Style into separate lists
 -- TODO: weed out obviously unnecessary @media and other @-rules (e.g. `@media print`)
@@ -395,11 +457,11 @@ type ImportantStyle = Style
 -- | Takes a CSS document and parses it.
 -- Flattens nested @-clauses.
 -- Groups of selectors are decomposed into multiple blocks with the same body.
-cssParser :: Text -> [([AtText], Selector, ImportantStyle, Style)]
+cssParser :: Text -> [CSSBlock]
 cssParser t =
     either (\e -> warning e []) (L.concatMap (flatten [])) $ CSSP.parseNestedBlocks t
   where
-    flatten :: [AtText] -> CSSP.NestedBlock -> [([AtText], Selector, ImportantStyle, Style)]
+    flatten :: [AtText] -> CSSP.NestedBlock -> [CSSBlock]
     flatten ats = \case
       CSSP.NestedBlock at blocks ->
         L.concatMap (flatten (at:ats)) blocks
@@ -410,7 +472,11 @@ cssParser t =
             style1 = css $ map (\(k, v) -> (k, dropImportant v)) decls1
             style = css decls
             sels = either (\e -> warning e []) id $ cssSelectors seltext :: [Selector]
-        in map (\s -> (reverse ats, s, style1, style)) sels
+            unzipStyles s =
+              let important = if style1 == noStyle then [] else [(reverse ats, s, True, style1)]
+                  regular = if style == noStyle then [] else [(reverse ats, s, False, style)]
+              in important ++ regular
+        in L.concatMap unzipStyles sels
 
 
 -- | Read and split properties into own and inheritable
