@@ -1,6 +1,11 @@
 module Vado.Types where
 
-import Debug.Trace as Trace
+import qualified Data.Map as M
+import           Debug.Trace as Trace
+
+import           Data.Text (Text)
+
+type TagAttrs = (Text, M.Map Text Text)
 
 warning :: String -> a -> a
 warning msg = Trace.trace msg

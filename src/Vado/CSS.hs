@@ -11,7 +11,7 @@ import qualified Data.Either as Ei
 import qualified Data.IntMap as IM
 import qualified Data.List as L
 import qualified Data.Map as M
-import           Data.Maybe (fromMaybe, maybeToList)
+import           Data.Maybe (fromMaybe, maybeToList, mapMaybe)
 import qualified Data.Set as S
 import           Data.Text (Text)
 import qualified Data.Text as T
@@ -431,6 +431,39 @@ addCSSRules blocks rules0 = flip St.execState rules0 $
       SelAnd [] -> mempty
       SelAnd (s:ss) -> selectorParts s <> selectorParts (SelAnd ss)
 
+-- | Match on all rules in CSSRules.
+-- For each matching rule, sort it into important/regular chain.
+-- Sort each chain by Specificity in descending order.
+-- `matcher` is usually a closure on the element being matched.
+rulechainsForMatcher :: CSSRules -> TagAttrs -> (Selector -> Maybe Specificity)
+                     -> ([RuleID], [RuleID])
+rulechainsForMatcher CSSRules{..} (tag, attrs) matcher =
+    (elemsDesc imprules, elemsDesc regrules)
+  where
+    ruleset = mconcat $
+      mapMaybe (`M.lookup` cssRulesByAttr) (M.keys attrs) ++
+      mapMaybe (`M.lookup` cssRulesByClass) (maybe [] T.words $ M.lookup "class" attrs) ++
+      [ fromMaybe S.empty $ (`M.lookup` cssRulesById) =<< M.lookup "id" attrs
+      , fromMaybe S.empty $ tag `M.lookup` cssRulesByTag
+      , cssRulesOther
+      ]
+
+    -- match and compute specificity:
+    processRule :: RuleID -> Maybe (Either (Specificity, RuleID) (Specificity, RuleID))
+    processRule rid =  -- TODO: AtText?
+      let block = cssRulesStorage IM.! rid
+          imp = blockImportant block
+          mbSpecty = matcher $ blockSelector block
+      in (\specty -> (if imp then Left else Right) (specty, rid)) <$> mbSpecty
+
+    elemsDesc :: [(Specificity, RuleID)] -> [RuleID]
+    elemsDesc = map snd . M.toDescList . M.fromList
+
+    (imprules, regrules) = Ei.partitionEithers $ mapMaybe processRule $ S.toList ruleset
+
+styleFromRulechain :: CSSRules -> [RuleID] -> Style
+styleFromRulechain CSSRules{..} rulechain =
+  mconcat $ mapMaybe (\rid -> blockStyle <$> IM.lookup rid cssRulesStorage) rulechain
 
 --------------------------------------------------------------------------------
 -- CSS parsers and printers

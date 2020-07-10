@@ -14,6 +14,7 @@ import           Control.Monad.RWS.Strict as RWS
 import           Control.Monad.State (StateT(..))
 import qualified Control.Monad.State as St
 import qualified Data.Char as C
+import qualified Data.Either as Ei
 import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
 import qualified Data.Map.Strict as M
@@ -192,7 +193,7 @@ instance HasDebugView Document where
                    " style="++showdbg (stylesheetComputed st)]
         in case elementContent node of
           Right _ ->
-            hdr ++ indent (L.concatMap shownode (elementChildren elt))
+            hdr ++ indent (L.concatMap shownode (elemrefChildren elt))
           Left content ->
             hdr ++ indent [show content]
 
@@ -364,6 +365,7 @@ addEventListener nid eventname handler = do
           in events{ eventsOther = otherevts }
   setElement nid $ node{ elementEvents = events' }
 
+-- | ElementRef is useful for traversing the DOM without Document in context.
 -- ElementRef should not live longer that the current version of the IntMap storage.
 type ElementRef = (IM.IntMap Element, ElementID)
 
@@ -376,8 +378,8 @@ elementDeref (nodes, nid) = nodes IM.! nid
 elementRefID :: ElementRef -> ElementID
 elementRefID (_, nid) = nid
 
-elementChildren :: ElementRef -> [ElementRef]
-elementChildren (nodes, nid) = maybe [] (nodeChildren . elementContent) $ IM.lookup nid nodes
+elemrefChildren :: ElementRef -> [ElementRef]
+elemrefChildren (nodes, nid) = maybe [] (nodeChildren . elementContent) $ IM.lookup nid nodes
   where
     nodeChildren (Right fid) | fid /= noElement = go fid fid
     nodeChildren _ = []
@@ -386,16 +388,35 @@ elementChildren (nodes, nid) = maybe [] (nodeChildren . elementContent) $ IM.loo
           next = nextSibling $ elementSiblings cnode
       in (nodes, cid) : if next == fid then [] else go fid next
 
-elementAncestors :: ElementRef -> [ElementRef]
-elementAncestors (_nodes, nid) | nid == noElement = []
-elementAncestors (nodes, nid) = (nodes, nid) : elementAncestors (nodes, pid)
+elemrefAncestors :: ElementRef -> [ElementRef]
+elemrefAncestors (_nodes, nid) | nid == noElement = []
+elemrefAncestors (nodes, nid0) = go $ elementParent (nodes IM.! nid0)
   where
-    pid = elementParent (nodes IM.! nid)
+    go nid | nid == noElement = []
+    go nid = (nodes, nid) : go (elementParent (nodes IM.! nid))
+
+elemrefPrevious :: ElementRef -> Maybe ElementRef
+elemrefPrevious (nodes, nid) =
+  let node = nodes IM.! nid
+      pid = elementParent node
+      pnode = nodes IM.! pid
+      fid = Ei.fromRight noElement $ elementContent pnode
+      previd = prevSibling $ elementSiblings node
+  in if nid == fid || nid == previd then Nothing else Just (nodes, previd)
+
+{-
+elemrefNext :: ElementRef -> Maybe ElementRef
+elemrefNext (nodes, nid) =
+  let node = nodes IM.! nid
+      pid = elementParent node
+      pnode = nodes IM.! pid
+      fid = Ei.fromRight noElement $ elementContent pnode
+      nextid = nextSibling $ elementSiblings node
+  in if nid ==  || nid == previd then Nothing else Just (nodes, previd)
+-}
 
 -- | This is a DOM node
 type ElementID = Int
-
-type TagAttrs = (Text, M.Map Text Text)
 
 noElement :: ElementID
 noElement =   0
@@ -435,6 +456,12 @@ emptyElement = Element
   , elementStylesheet = emptyStylesheet
   }
 
+elementAttrWords :: Text -> Element -> [Text]
+elementAttrWords attr node =
+  fromMaybe [] $ fmap T.words $ M.lookup attr (elementAttrs node)
+
+elementTagAttrs :: Element -> TagAttrs
+elementTagAttrs node = (elementTag node, elementAttrs node)
 
 -- | Content of a leaf DOM node,
 -- i.e. what is to be drawn in this node.
@@ -642,7 +669,7 @@ domParseHTMLAttributes nid = do
               (impblocks, regblocks) = L.partition blockImportant blocks
           in (styleFromBlocks impblocks, styleFromBlocks regblocks)
 
-  let cssrulechain = undefined          -- TODO: match selectors on documentCSSRules
+  let cssrulechain = []                 -- TODO: match selectors on documentCSSRules
   let cssStyle = (noStyle, noStyle)     -- TODO: styleFromRulechain documentCSSRules cssrulechain
   let sheet = Stylesheet
         { stylesheetUserBrowser = (noStyle, htmlStyle)   -- TODO: OriginImportantUser
@@ -1216,7 +1243,7 @@ dispatchEvent nid event page0 = do
     -- TODO: custom listeners and preventDefault()
     -- TODO: page can change under ElementRefs; a page event loop
     elt <- inPageDocument page0 $ getElementRef nid
-    foldM handle page0 (elementAncestors elt)
+    foldM handle page0 (elt : elemrefAncestors elt)
   where
     handle page node = do
       let events = elementEvents $ elementDeref node
@@ -1454,7 +1481,7 @@ elementToBoxes :: CanMeasureText m =>
 elementToBoxes ctx params parentStyle node = do
     let st = (elementStylesheet $ elementDeref node) `cascadeStyle` parentStyle
     let doLayout = runLayout $ do
-            forM_ (elementChildren node) layoutElement
+            forM_ (elemrefChildren node) layoutElement
             layoutLineBreak
     (layout', posboxes) <- RWS.execRWST doLayout params Layout
       { ltX = 0, ltY = 0
@@ -1541,7 +1568,7 @@ layoutElement elt = do
           _ -> return ()
 
       (Right _, CSS_Keyword "inline") -> do
-        withStyle elt $ forM_ (elementChildren elt) layoutElement
+        withStyle elt $ forM_ (elemrefChildren elt) layoutElement
 
       (Right _, CSS_Keyword "list-item") ->
         layoutListItem elt
@@ -1953,7 +1980,50 @@ withStyling BoxTree{boxDim=V2 w h, boxStyling=(stpush, stpop)} (x, y, st0) actio
 
 
 --------------------------------------------------------------------------------
--- CSS styles
+-- DOM and CSS
+
+-- | domMatchSelector checks if an element matches a selector.
+-- If yes, returns Just Specificity, else Nothing
+domMatchSelector :: ElementRef -> Selector -> Maybe Specificity
+domMatchSelector elt sel =
+  let node = elementDeref elt
+      attrs = elementAttrs node
+  in case sel of
+    SelAny -> Just (0, 0, 0)
+    SelTag t | t == elementTag node -> Just (0, 0, 1)
+    SelClass c | c `L.elem` elementAttrWords "class" node -> Just (0, 1, 0)
+
+    SelHasAttr a | a `M.member` elementAttrs node -> Just (0, 1, 0)
+    SelAttrEq a s | Just s == M.lookup a attrs -> Just (0, 1, 0)
+    SelAttrWord a w | w `L.elem` elementAttrWords a node -> Just (0, 1, 0)
+    SelAttrPre a p | Just p == M.lookup a attrs -> Just (0, 1, 0)
+    SelAttrPre a p | maybe False (T.isPrefixOf (p <> "-")) (M.lookup a attrs) -> Just (0, 1, 0)
+    SelId id_ | Just id_ == M.lookup "id" attrs -> Just (1, 0, 0)
+
+    SelSiblings s1 s2 ->
+      let match1 = domMatchSelector elt s1
+          match2 = elemrefPrevious elt >>= \predelt -> domMatchSelector predelt s2
+      in liftA2 addSpecty match1 match2
+    SelChild s1 s2 ->
+      let match1 = domMatchSelector elt s1
+          match2 = mbHead (elemrefAncestors elt) >>= \parent -> domMatchSelector parent s2
+      in liftA2 addSpecty match1 match2
+    SelDescends s1 s2 ->
+      let match1 = domMatchSelector elt s1
+          match2 = listToMaybe $ mapMaybe (\el -> domMatchSelector el s2) $ elemrefAncestors elt
+      in liftA2 addSpecty match1 match2
+
+    SelAnd sels ->
+      let specties = map (domMatchSelector elt) sels
+      in if all isJust specties
+        then Just $ foldl addSpecty (0, 0, 0) $ catMaybes specties
+        else Nothing
+
+    SelPseudoElem _ -> Nothing  -- TODO
+    SelPseudo _ -> Nothing    -- TODO
+    _ -> Nothing
+  where
+    addSpecty (a1, b1, c1) (a2, b2, c2) = (a1+a2, b1+b2, c1+c2)
 
 
 --------------------------------------------------------------------------------
@@ -2139,13 +2209,16 @@ vadoHome =
       xmlNode' "body" [("style", "text-align: center; white-space: pre")]
         [ xmlNode "h1" [ xmlText "\n\n\nVado"]
         , xmlNode "hr" []
-        , xmlNode' "form" [("action", "vado:go"), ("method", "POST")]
+        , xmlNode' "form" [("action", "vado:go"), ("method", "POST"), ("id", "the-form")]
           [ xmlNode' "input" inputAttrs []
           , xmlNode "br" []
           , xmlNode' "input" [("type", "submit"), ("value", "I go!")] []
           ]
         ]
-    inputAttrs = [("type", "text"), ("name", "url"), ("id", "vado"), ("autofocus", "")]
+    inputAttrs =
+        [ ("type", "text"), ("name", "url"), ("id", "vado")
+        , ("class", "test1 test2"), ("autofocus", "")
+        ]
 
     -- TODO: use a "change" event
     url_onKeyReleased :: EventHandler
