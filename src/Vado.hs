@@ -131,7 +131,7 @@ data Document = Document
   , documentResources :: DOMResourceMap
   , documentResourcesLoading :: M.Map URI (S.Set ElementID)   -- to remember what's in flight
   , documentResourceRequests :: [(URI, ElementID)]  -- to queue requests from inside DocumentT
-  -- , documentCSSRules :: CSSRules
+  , documentCSSRules :: CSSRules
 
   , documentHead :: ElementID
   , documentBody :: ElementID
@@ -154,6 +154,7 @@ emptyDocument = Document
   , documentResources = M.empty
   , documentResourcesLoading = M.empty
   , documentResourceRequests = []
+  , documentCSSRules = emptyCSSRules
   , documentHead = noElement
   , documentBody = noElement
   , documentTitle = ""
@@ -179,6 +180,7 @@ instance HasDebugView Document where
       , "documentTitle = " ++ T.unpack (documentTitle doc)
       , "documentNewID = @" ++ show (documentNewID doc)
       , "documentFocus = @" ++ show (documentFocus doc)
+      , "documentCSSRules: " ++ show (documentCSSRules doc)
       , "documentResources = " ++ show (documentResources doc)
       ] ++ shownode (elementRef doc htmlElement)
     where
@@ -583,18 +585,24 @@ domEndHTMLElement name = do
           Left (TextContent title) | nextSibling (elementSiblings tnode) == fid ->
             modify $ \doc -> doc{ documentTitle = title }
           other ->
-            return $ warning ("domEndHTMLElement @"++show nid++": expected text in <title>"++
-                              ", found " ++ show other) ()
+            modify $ \doc ->
+              warning ("domEndHTMLElement @"++show nid++
+                       ": expected text in <title>, found " ++ show other) doc
       "style" -> do
         let Right fid = elementContent node
         tnode <- getElement fid
         case elementContent tnode of
-          Left (TextContent _) ->
-            -- TODO: parse, add to documentStyles, make "@import" requests.
-            return ()
+          Left (TextContent styletext) -> do
+            let rules = cssParser styletext
+            modify $ \doc ->
+              warning ("Parsed "++show (length rules)++" CSS rules from @"++show nid) $
+                doc{ documentCSSRules = addCSSRules rules $ documentCSSRules doc }
+            -- TODO: make "@import" requests.
+            -- TODO: re-layout
           other ->
-            return $ warning ("domEndHTMLElement @"++show nid++": expected text in <style>"++
-                              ", found " ++ show other) ()
+            modify $ \doc ->
+              warning ("domEndHTMLElement @"++show nid++
+                       ": expected text in <style>, found " ++ show other) doc
 
       "hr" -> fixupContent nid HorizLineContent
       "br" -> fixupContent nid NewlineContent

@@ -390,6 +390,9 @@ emptyCSSRules = CSSRules
   , cssRulesOther = S.empty
   }
 
+instance Show CSSRules where
+  show CSSRules{..} = "show CSSRules "++show (IM.size cssRulesStorage)++": TODO"
+
 addCSSRules :: [CSSBlock] -> CSSRules -> CSSRules
 addCSSRules blocks rules0 = flip St.execState rules0 $
     forM_ blocks $ \block -> do
