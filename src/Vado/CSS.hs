@@ -271,7 +271,7 @@ data Stylesheet = Stylesheet
   -- ^ OriginImportantAuthor, OriginAuthor from style=""
   , stylesheetAuthor :: (ImportantStyle, Style)
   -- ^ OriginImportantAuthor, OriginAuthor not from style=""
-  , stylesheetAuthorChain :: [RuleID]
+  , stylesheetAuthorChain :: ([RuleID], [RuleID])
 
   , stylesheetComputed :: Style
   -- ^ see computedStyle: all of the above styles cascaded into one.
@@ -282,7 +282,7 @@ emptyStylesheet :: Stylesheet
 emptyStylesheet = Stylesheet
   { stylesheetUserBrowser = (noStyle, noStyle)
   , stylesheetAttr = (noStyle, noStyle)
-  , stylesheetAuthorChain = []
+  , stylesheetAuthorChain = ([], [])
   , stylesheetAuthor = (noStyle, noStyle)
   , stylesheetComputed = noStyle
   }

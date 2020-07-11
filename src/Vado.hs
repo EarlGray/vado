@@ -651,6 +651,7 @@ domParseHTMLAttributes :: Monad m => ElementID -> DocumentT m ()
 domParseHTMLAttributes nid = do
   node <- getElement nid
   let tag = elementTag node
+  let attrs = elementAttrs node
   -- This can't be moved to domEndHTMLElement: children of <body> might need to know about it:
   case elementTag node of
     "head" -> modify $ \doc ->
@@ -664,9 +665,9 @@ domParseHTMLAttributes nid = do
     _ -> return ()
   -- TODO: parse class set
   -- TODO: parse id and add globally
-  let htmlStyle = fromMaybe noStyle $ builtinHTMLStyleFor tag (elementAttrs node)
+  let htmlStyle = fromMaybe noStyle $ builtinHTMLStyleFor tag attrs
 
-  let mbStyleAttr = (\t -> mconcat ["*{", t, "}"]) <$> M.lookup "style" (elementAttrs node)
+  let mbStyleAttr = (\t -> mconcat ["*{", t, "}"]) <$> M.lookup "style" attrs
   let attrStyle = case cssParser <$> mbStyleAttr of
         Nothing -> (noStyle, noStyle)
         Just [] ->
@@ -677,20 +678,22 @@ domParseHTMLAttributes nid = do
               (impblocks, regblocks) = L.partition blockImportant blocks
           in (styleFromBlocks impblocks, styleFromBlocks regblocks)
 
-  let cssrulechain = []                 -- TODO: match selectors on documentCSSRules
-  let cssStyle = (noStyle, noStyle)     -- TODO: styleFromRulechain documentCSSRules cssrulechain
+  rules <- gets documentCSSRules
+  eltref <- getElementRef nid
+  let (impchain, regchain) = rulechainsForMatcher rules (tag, attrs) $ domMatchSelector eltref
+  let cssStyle = (styleFromRulechain rules impchain, styleFromRulechain rules regchain)
   let sheet = Stylesheet
         { stylesheetUserBrowser = (noStyle, htmlStyle)   -- TODO: OriginImportantUser
         , stylesheetAttr = attrStyle
         , stylesheetAuthor = cssStyle
-        , stylesheetAuthorChain = cssrulechain
+        , stylesheetAuthorChain = (impchain, regchain)
         , stylesheetComputed = undefined
         }
   setElement nid $ node
     { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
     , elementStylesheet = sheet{ stylesheetComputed = computedStyle sheet }
     }
-  whenJust (M.lookup "autofocus" $ elementAttrs node) $ \_ ->
+  whenJust (M.lookup "autofocus" attrs) $ \_ ->
     modify $ \doc -> doc{ documentFocus = nid }
 
 -- | Having an effect inside DocumentT m (): just queue them for the wrapper to handle.
