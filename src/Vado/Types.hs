@@ -5,6 +5,7 @@ import           Debug.Trace as Trace
 
 import           Data.Text (Text)
 
+type TagName = Text
 type TagAttrs = (Text, M.Map Text Text)
 
 warning :: String -> a -> a

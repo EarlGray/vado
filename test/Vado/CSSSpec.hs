@@ -29,18 +29,48 @@ spec = do
     it "background-repeat" $ pendingWith "TODO"
     it "background" $ pendingWith "TODO"
     it "border-collapse" $ pendingWith "TODO"
-    it "border-color" $ pendingWith "TODO"
+    it "border-color" $
+      css [("border-color", "darkred grey")] `shouldBe` style
+        [ (CSSBorderTopColor,   CSS_RGB 0x8b 0x00 0x00)
+        , (CSSBorderRightColor, CSS_RGB 0x80 0x80 0x80)
+        , (CSSBorderBottomColor,CSS_RGB 0x8b 0x00 0x00)
+        , (CSSBorderLeftColor,  CSS_RGB 0x80 0x80 0x80)
+        ] []
     it "border-spacing" $ pendingWith "TODO"
     it "border-style" $ pendingWith "TODO"
-    it "border-top|right|bottom|left" $ pendingWith "TODO"
-    it "border-top|right|bottom|left-color" $ pendingWith "TODO"
+    it "border-top|right|bottom|left" $
+      css [("border-bottom", "thin solid red")] `shouldBe` style
+        [ (CSSBorderBottomColor, CSS_RGB 0xff 0x00 0x00)
+        , (CSSBorderBottomWidth, CSS_Keyword "thin")
+        ] []
+    it "border-top|right|bottom|left-color" $
+      css [("border-left-color", "honeydew")] `shouldBe`
+        style [(CSSBorderLeftColor, CSS_RGB 0xf0 0xff 0xf0)] []
     it "border-top|right|bottom|left-style" $ pendingWith "TODO"
-    it "border-top|right|bottom|left-width" $ pendingWith "TODO"
-    it "border-width" $ pendingWith "TODO"
-    it "border" $ pendingWith "TODO"
+    it "border-top|right|bottom|left-width" $
+      css [("border-bottom-width", "0.5em")] `shouldBe`
+        style [(CSSBorderBottomWidth, CSS_Em 0.5)] []
+    it "border-width" $
+      css [("border-width", "1em 2em 3em")] `shouldBe` style
+        [ (CSSBorderTopWidth,   CSS_Em 1.0)
+        , (CSSBorderRightWidth, CSS_Em 2.0)
+        , (CSSBorderBottomWidth,CSS_Em 3.0)
+        , (CSSBorderLeftWidth,  CSS_Em 2.0)
+        ] []
+    it "border" $
+      css [("border", "5px solid red")] `shouldBe` style
+        [ (CSSBorderTopWidth,   CSS_Px 5)
+        , (CSSBorderRightWidth, CSS_Px 5)
+        , (CSSBorderBottomWidth,CSS_Px 5)
+        , (CSSBorderLeftWidth,  CSS_Px 5)
+        , (CSSBorderTopColor,   CSS_RGB 0xff 0x00 0x00)
+        , (CSSBorderRightColor, CSS_RGB 0xff 0x00 0x00)
+        , (CSSBorderBottomColor,CSS_RGB 0xff 0x00 0x00)
+        , (CSSBorderLeftColor,  CSS_RGB 0xff 0x00 0x00)
+        ] []
     it "bottom" $ pendingWith "TODO"
     it "caption-side" $ pendingWith "TODO"
-    it "clear" $ pendingWith "TODO"
+    it "clear" $ css [("clear", "both")] `shouldBe` style [(CSSClear, CSS_Keyword "both")] []
     it "content" $ pendingWith "TODO"
     it "counter-increment" $ pendingWith "TODO"
     it "counter-reset" $ pendingWith "TODO"
@@ -49,7 +79,7 @@ spec = do
     it "display" $
       css [("display", "table-cell")] `shouldBe` style [(CSSDisplay, CSS_Keyword "table-cell")] []
     it "empty-cells" $ pendingWith "TODO"
-    it "float" $ pendingWith "TODO"
+    it "float" $ css [("float", "right")] `shouldBe` style [(CSSFloat, CSS_Keyword "right")] []
     it "font-family" $
       css [("font-family", "sans")] `shouldBe` style [] [(CSSFontFamily, CSS_Keyword "sans")]
     it "font-size" $
@@ -75,7 +105,7 @@ spec = do
       --           , (CSSLineHeight, CSS_Num 1.2)
       --           ]
       pendingWith "TODO: line-height, font-variant"
-    it "height" $ pendingWith "TODO"
+    it "height" $ css [("height", "15em")] `shouldBe` style [(CSSHeight, CSS_Em 15)] []
     it "left" $ pendingWith "TODO"
     it "letter-spacing" $ pendingWith "TODO"
     it "line-height" $ pendingWith "TODO"
@@ -83,19 +113,34 @@ spec = do
     it "list-style-position" $ pendingWith "TODO"
     it "list-style-type" $ pendingWith "TODO"
     it "list-style" $ pendingWith "TODO"
-    it "margin-top|right|bottom|let" $ pendingWith "TODO"
-    it "margin" $ pendingWith "TODO"
-    it "max-height" $ pendingWith "TODO"
-    it "max-width" $ pendingWith "TOOD"
-    it "min-height" $ pendingWith "TODO"
-    it "min-width" $ pendingWith "TODO"
+    it "margin-top|right|bottom|let" $
+      css [("margin-top", "1em")] `shouldBe` style [(CSSMarginTop, CSS_Em 1.0)] []
+    it "margin" $
+      css [("margin", "1em 2em 3em")] `shouldBe` style
+        [ (CSSMarginTop, CSS_Em 1.0)
+        , (CSSMarginRight, CSS_Em 2.0)
+        , (CSSMarginBottom, CSS_Em 3.0)
+        , (CSSMarginLeft, CSS_Em 2.0)
+        ] []
+    it "max-height" $ css [("max-height", "10em")] `shouldBe` style [(CSSMaxHeight, CSS_Em 10)] []
+    it "max-width" $ css [("max-width", "70%")] `shouldBe` style [(CSSMaxWidth, CSS_Percent 70)] []
+    it "min-height" $ css [("min-height", "10px")] `shouldBe` style [(CSSMinHeight, CSS_Px 10)] []
+    it "min-width" $ css [("min-width", "10%")] `shouldBe` style [(CSSMinWidth, CSS_Percent 10)] []
     it "orphans" $ pendingWith "TODO"
     it "outline-color" $ pendingWith "TODO"
     it "outline-width" $ pendingWith "TODO"
     it "outline" $ pendingWith "TODO"
-    it "padding-top|right|bottom|left" $ pendingWith "TODO"
-    it "padding" $ pendingWith "TODO"
-    it "position"  $ pendingWith "TODO"
+    it "padding-top|right|bottom|left" $
+      css [("padding-left", "5%")] `shouldBe` style [(CSSPaddingLeft, CSS_Percent 5.0)] []
+    it "padding" $
+      css [("padding", "1em 2em 3em")] `shouldBe` style
+        [ (CSSPaddingTop,    CSS_Em 1.0)
+        , (CSSPaddingRight,  CSS_Em 2.0)
+        , (CSSPaddingBottom, CSS_Em 3.0)
+        , (CSSPaddingLeft,   CSS_Em 2.0)
+        ] []
+    it "position" $
+      css [("position", "fixed")] `shouldBe` style [(CSSPosition, CSS_Keyword "fixed")] []
     it "right" $ pendingWith "TODO"
     it "table-layout" $ pendingWith "TODO"
     it "table-align" $ pendingWith "TODO"
@@ -114,7 +159,7 @@ spec = do
       css [("white-space", "pre")] `shouldBe`
         style [] [(CSSWhiteSpace, CSS_Keyword "pre")]
     it "widows" $ pendingWith "TODO"
-    it "width" $ pendingWith "TODO"
+    it "width" $ css [("width", "200px")] `shouldBe` style [(CSSWidth, CSS_Px 200)] []
     it "word-spacing" $ pendingWith "TODO"
     it "z-index" $ pendingWith "TODO"
 

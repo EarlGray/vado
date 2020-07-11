@@ -221,25 +221,91 @@ instance HasDebugView CSSProperty where
 
 -- | Non-inheritable properties:
 data CSSOwnProperty
-  = CSSDisplay
-  -- | CSSMargin
-  -- | CSSBorder
-  -- | CSSPadding
+  = CSSBorderBottomColor
+  | CSSBorderBottomWidth
+  | CSSBorderLeftColor
+  | CSSBorderLeftWidth
+  | CSSBorderRightColor
+  | CSSBorderRightWidth
+  | CSSBorderTopColor
+  | CSSBorderTopWidth   -- TODO: CSSBorder*Style
+  | CSSClear
+  | CSSDisplay
+  | CSSFloat
+  | CSSHeight
+  | CSSMarginBottom
+  | CSSMarginLeft
+  | CSSMarginRight
+  | CSSMarginTop
+  | CSSMaxHeight
+  | CSSMaxWidth
+  | CSSMinHeight
+  | CSSMinWidth
+  | CSSPaddingBottom
+  | CSSPaddingLeft
+  | CSSPaddingRight
+  | CSSPaddingTop
+  | CSSPosition
+  | CSSWidth
   deriving (Show, Eq, Ord, Enum)
 
 cssOwnPropertyNames :: M.Map CSSOwnProperty Text
 cssOwnPropertyNames = M.fromList
-  [ (CSSDisplay,                "display")
-  -- , (CSSMargin,                 "margin")
-  -- , (CSSBorder,                 "border")
-  -- , (CSSPadding,                "padding")
+  [ (CSSBorderBottomColor,  "border-bottom-color")
+  , (CSSBorderBottomWidth,  "border-bottom-width")
+  , (CSSBorderLeftColor,    "border-left-color")
+  , (CSSBorderLeftWidth,    "border-left-width")
+  , (CSSBorderRightColor,   "border-right-color")
+  , (CSSBorderRightWidth,   "border-right-width")
+  , (CSSBorderTopColor,     "border-top-color")
+  , (CSSBorderTopWidth,     "border-top-width")
+  , (CSSClear,              "clear")
+  , (CSSDisplay,            "display")
+  , (CSSFloat,              "float")
+  , (CSSHeight,             "height")
+  , (CSSMarginBottom,       "margin-bottom")
+  , (CSSMarginLeft,         "margin-left")
+  , (CSSMarginRight,        "margin-right")
+  , (CSSMarginTop,          "margin-top")
+  , (CSSMaxHeight,          "max-height")
+  , (CSSMaxWidth,           "max-width")
+  , (CSSMinHeight,          "min-height")
+  , (CSSMinWidth,           "min-width")
+  , (CSSPaddingBottom,      "padding-bottom")
+  , (CSSPaddingLeft,        "padding-left")
+  , (CSSPaddingRight,       "padding-right")
+  , (CSSPaddingTop,         "padding-top")
+  , (CSSPosition,           "position")
+  , (CSSWidth,              "width")
   ]
 cssOwnPropertyDefaults :: M.Map CSSOwnProperty CSSValue
 cssOwnPropertyDefaults = M.fromList
-  [ (CSSDisplay,        CSS_Keyword "block")
-  -- , (CSSMargin,         CSS_Px 0)
-  -- , (CSSBorder,         CSS_Px 0)
-  -- , (CSSPadding,        CSS_Px 0)
+  [ (CSSBorderBottomColor,  CSS_Keyword "auto")  -- the value of CSSColor
+  , (CSSBorderBottomWidth,  CSS_Keyword "medium")
+  , (CSSBorderLeftColor,    CSS_Keyword "auto")
+  , (CSSBorderLeftWidth,    CSS_Keyword "medium")
+  , (CSSBorderRightColor,   CSS_Keyword "auto")
+  , (CSSBorderRightWidth,   CSS_Keyword "medium")
+  , (CSSBorderTopColor,     CSS_Keyword "auto")
+  , (CSSBorderTopWidth,     CSS_Keyword "medium")
+  , (CSSClear,          CSS_Keyword "none")
+  , (CSSDisplay,        CSS_Keyword "block")
+  , (CSSFloat,          CSS_Keyword "none")
+  , (CSSHeight,         CSS_Keyword "auto")
+  , (CSSMarginBottom,   CSS_Px 0)
+  , (CSSMarginLeft,     CSS_Px 0)
+  , (CSSMarginRight,    CSS_Px 0)
+  , (CSSMarginTop,      CSS_Px 0)
+  , (CSSMaxHeight,      CSS_Keyword "none")
+  , (CSSMaxWidth,       CSS_Keyword "none")
+  , (CSSMinHeight,      CSS_Px 0)
+  , (CSSMinWidth,       CSS_Px 0)
+  , (CSSPaddingBottom,  CSS_Px 0)
+  , (CSSPaddingLeft,    CSS_Px 0)
+  , (CSSPaddingRight,   CSS_Px 0)
+  , (CSSPaddingTop,     CSS_Px 0)
+  , (CSSPosition,       CSS_Keyword "static")
+  , (CSSWidth,          CSS_Keyword "auto")
   ]
 
 cssNamesOfOwnProperties :: M.Map Text CSSOwnProperty
@@ -547,18 +613,57 @@ css properties = Style
                       else warning ("Unknown property: " ++ T.unpack name ++ "=" ++ show val) []
 
     desugarValues = \case
-      (Right (prop, CSS_Keyword color)) | prop `elem` [CSSColor, CSSBackgroundColor] ->
-        let mbUnaliased = M.lookup color cssColorAliases
-            -- yes, it's always Right:
-            Right color' = cssReadValue $ fromMaybe color $ mbUnaliased
+      Left (prop, CSS_Keyword color) | prop `elem`
+        [CSSBorderBottomColor, CSSBorderLeftColor, CSSBorderRightColor, CSSBorderTopColor] ->
+          let Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases
+          in Left (prop, color')
+      Right (prop, CSS_Keyword color) | prop `elem` [CSSColor, CSSBackgroundColor] ->
+        let Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases
         in Right (prop, color')
       other -> other
 
     cssShorthands :: M.Map Text (CSSValue -> [OwnOrInheritable])
     cssShorthands = M.fromList
-      [ ("font",            expandFont)
+      [ ("border", \vals -> concat
+            [ expandBorder [CSSBorderTopWidth, CSSBorderTopColor] vals
+            , expandBorder [CSSBorderRightWidth, CSSBorderRightColor] vals
+            , expandBorder [CSSBorderBottomWidth, CSSBorderBottomColor] vals
+            , expandBorder [CSSBorderLeftWidth, CSSBorderLeftColor] vals
+            ])
+      , ("border-bottom", expandBorder [CSSBorderBottomWidth, CSSBorderBottomColor])
+      , ("border-color", expandFields
+            [CSSBorderTopColor, CSSBorderRightColor, CSSBorderBottomColor, CSSBorderLeftColor])
+      , ("border-left", expandBorder [CSSBorderLeftWidth, CSSBorderLeftColor])
+      , ("border-right", expandBorder [CSSBorderRightWidth, CSSBorderRightColor])
+      , ("border-top", expandBorder [CSSBorderTopWidth, CSSBorderTopColor])
+      , ("border-width", expandFields
+            [CSSBorderTopWidth, CSSBorderRightWidth, CSSBorderBottomWidth, CSSBorderLeftWidth])
+      , ("font",   expandFont)
+      , ("margin", expandFields [CSSMarginTop, CSSMarginRight, CSSMarginBottom, CSSMarginLeft])
+      , ("padding",expandFields [CSSPaddingTop, CSSPaddingRight, CSSPaddingBottom, CSSPaddingLeft])
       , ("text-decoration", expandTextDecoration)
       ]
+
+    expandTextDecoration = \case
+      CSS_Keyword kw | kw `elem` ["none", "underline", "overline", "line-through"] ->
+        [Right (CSSTextDecorationLine, CSS_Keyword kw)]
+      CSS_Seq vals ->
+        concatMap expandTextDecoration vals
+      other -> warning ("Unknown value for text-decoration=" ++ show other) []
+
+    -- TODO: border-style
+    expandBorder [bwidth, bcolor] = \case
+      CSS_Seq [width, _style, color] -> map Left [(bwidth, width), (bcolor, color)]
+      CSS_Seq [width, _style] -> [Left (bwidth, width)]
+      CSS_Seq _ -> []
+      width -> [Left (bwidth, width)]
+    expandBorder other = error $ "expandBorder " ++ show other
+
+    expandFields props = \case
+      CSS_Seq [top, horiz, bottom] -> expandFields props $ CSS_Seq [top, horiz, bottom, horiz]
+      CSS_Seq [vert, horiz] -> expandFields props $ CSS_Seq [vert, horiz, vert, horiz]
+      CSS_Seq vals -> map Left $ zip props vals
+      other -> expandFields props $ CSS_Seq [other, other, other, other]
 
     -- https://developer.mozilla.org/en-US/docs/Web/CSS/font
     expandFont = \case
@@ -620,12 +725,6 @@ css properties = Style
             _ -> warning ("unknown font[-prop]=" ++ show val) $ parseFont vals
 
 
-    expandTextDecoration = \case
-      CSS_Keyword kw | kw `elem` ["none", "underline", "overline", "line-through"] ->
-        [Right (CSSTextDecorationLine, CSS_Keyword kw)]
-      CSS_Seq vals ->
-        concatMap expandTextDecoration vals
-      other -> warning ("Unknown value for text-decoration=" ++ show other) []
 
 -- | Parses a CSSValue from text for a CSS value
 cssReadValue :: Text -> Either Text CSSValue

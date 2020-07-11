@@ -353,7 +353,7 @@ domtreeEndElement = do
 --domtreeTraverse :: (Traversable t, Applicative f) => (ElementRef -> f b) -> Document -> f (t b)
 --domtreeTraverse = undefined
 
-addEventListener :: Monad m => ElementID -> Text -> EventHandler -> DocumentT m ()
+addEventListener :: Monad m => ElementID -> EventName -> EventHandler -> DocumentT m ()
 addEventListener nid eventname handler = do
   node <- getElement nid
   let events = elementEvents node
@@ -1225,6 +1225,7 @@ printHistory (back, forward) current = mapM_ putStrLn $
 --------------------------------------------------------------------------------
 -- Events, event handlers, event dispatch.
 
+type EventName = Text
 type EventHandler = SDL.Event -> ElementID -> Page -> IO Page
 
 -- | A set of events that an element may handle.
@@ -1233,7 +1234,7 @@ data Events = Events
   { eventsMouseReleased :: [EventHandler]
   , eventsKeyReleased :: [EventHandler]
   , eventsTextInput :: [EventHandler]
-  , eventsOther :: M.Map Text [EventHandler]
+  , eventsOther :: M.Map EventName [EventHandler]
   }
 
 instance Show Events where
