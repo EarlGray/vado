@@ -112,6 +112,33 @@ changePage action = do
     liftIO $ renderDOM page'
     put page'
 
+inPageDocument :: Monad m => Page -> DocumentT m a -> m a
+inPageDocument page f = inDocument (pageDocument page) f
+
+runPageDocument :: Monad m => Page -> DocumentT m () -> m Page
+runPageDocument page f = do
+  doc' <- runDocument (pageDocument page) f
+  return page{ pageDocument = doc' }
+
+inBrowserDocument :: Monad m => DocumentT m a -> BrowserT m a
+inBrowserDocument f = do
+  doc <- gets pageDocument
+  lift $ inDocument doc f
+
+runBrowserDocument :: Monad m => DocumentT m () -> BrowserT m ()
+runBrowserDocument f = BrowserT $ do
+  doc <- gets pageDocument
+  doc' <- lift $ runDocument doc f
+  modify $ \page -> page{ pageDocument = doc' }
+
+logDebug :: String -> Browser ()
+logDebug msg = do
+  debug <- gets pageDebugNetwork
+  when debug $ liftIO $ putStrLn msg
+
+logWarn :: MonadIO m => String -> m ()
+logWarn msg = liftIO $ putStrLn msg
+
 -- | This is a window to render on the screen.
 -- |   - contains a document
 -- |   - contains history
@@ -204,40 +231,16 @@ instance HasDebugView Document where
 
 type DocumentT m a = StateT Document m a
 
+docWarn :: Monad m => String -> DocumentT m ()
+docWarn msg = modify $ \doc -> warning msg doc
+
 -- | Run a computation in DocumentT, return the result, discard document changes.
 inDocument :: Monad m => Document -> DocumentT m a -> m a
 inDocument doc f = St.evalStateT f doc
 
-inPageDocument :: Monad m => Page -> DocumentT m a -> m a
-inPageDocument page f = inDocument (pageDocument page) f
-
 -- | Run an action on DocumentT, return a changed document.
 runDocument :: Monad m => Document -> DocumentT m () -> m Document
 runDocument doc f = St.execStateT f doc
-
-runPageDocument :: Monad m => Page -> DocumentT m () -> m Page
-runPageDocument page f = do
-  doc' <- runDocument (pageDocument page) f
-  return page{ pageDocument = doc' }
-
-inBrowserDocument :: Monad m => DocumentT m a -> BrowserT m a
-inBrowserDocument f = do
-  doc <- gets pageDocument
-  lift $ inDocument doc f
-
-runBrowserDocument :: Monad m => DocumentT m () -> BrowserT m ()
-runBrowserDocument f = BrowserT $ do
-  doc <- gets pageDocument
-  doc' <- lift $ runDocument doc f
-  modify $ \page -> page{ pageDocument = doc' }
-
-logDebug :: String -> Browser ()
-logDebug msg = do
-  debug <- gets pageDebugNetwork
-  when debug $ liftIO $ putStrLn msg
-
-logWarn :: MonadIO m => String -> m ()
-logWarn msg = liftIO $ putStrLn msg
 
 takeNewID :: Monad m => DocumentT m ElementID
 takeNewID = do
@@ -310,8 +313,9 @@ domtreeAppendChild pid mbXML content = do
             , elementAttrs = attrs
             }
       return nid
-    _ ->
-      return $ warning ("not an insertable element: " ++ show parent) noElement
+    _ -> do
+      docWarn $ "not an insertable element: " ++ show parent
+      return noElement
 
 domtreeStartElement :: Monad m
                     => ElementID -> Element
@@ -533,7 +537,7 @@ htmlDOMFromEvents = \case
     XMLTy.EventEndDoctype -> return ()
     XMLTy.EventInstruction _ -> return ()
     XMLTy.EventComment _ -> return ()
-    other -> return $ warning ("htmlDOMFromEvents: " ++ show other) ()
+    other -> docWarn $ "htmlDOMFromEvents: " ++ show other
   where
     xmlContent (XMLTy.ContentText t) = t
     xmlContent (XMLTy.ContentEntity t) = t
@@ -585,9 +589,8 @@ domEndHTMLElement name = do
           Left (TextContent title) | nextSibling (elementSiblings tnode) == fid ->
             modify $ \doc -> doc{ documentTitle = title }
           other ->
-            modify $ \doc ->
-              warning ("domEndHTMLElement @"++show nid++
-                       ": expected text in <title>, found " ++ show other) doc
+            docWarn ("domEndHTMLElement @"++show nid++
+                       ": expected text in <title>, found " ++ show other)
       "style" -> do
         let Right fid = elementContent node
         tnode <- getElement fid
@@ -600,9 +603,8 @@ domEndHTMLElement name = do
             -- TODO: make "@import" requests.
             -- TODO: re-layout
           other ->
-            modify $ \doc ->
-              warning ("domEndHTMLElement @"++show nid++
-                       ": expected text in <style>, found " ++ show other) doc
+            docWarn $ "domEndHTMLElement @"++show nid++
+                      ": expected text in <style>, found " ++ show other
 
       "hr" -> fixupContent nid HorizLineContent
       "br" -> fixupContent nid NewlineContent
@@ -704,7 +706,7 @@ domResourceFetch nid href = modify $ \doc ->
 
 -- | Request a redraw for a node
 documentRedraw :: Monad m => ElementID -> DocumentT m ()
-documentRedraw _nid = return $ warning "TODO: documentRedraw" ()
+documentRedraw _nid = docWarn "TODO: documentRedraw"
 
 --------------------------------------------------------------------------------
 -- XML Utilities
@@ -1040,7 +1042,7 @@ handlePageStreaming st event = do
           node <- inBrowserDocument $ getElement nid
           case M.lookup "src" $ elementAttrs node of
             Just dataurl -> decodeResourceDataUrl nid resuri dataurl
-            _ -> return $ warning ("no src in @" ++ show nid) ()
+            _ -> logWarn $ "no src in @" ++ show nid
 
     (PageStreaming, Resource.EventStreamClose) ->
       changePage $ \page -> do
@@ -1074,12 +1076,12 @@ handlePageStreaming st event = do
     decodeResourceDataUrl nid resuri href = do
       case Resource.decodeDataURL href of
         Left e ->
-          return $ warning ("failed to decode data url in @" ++ show nid ++ ": " ++ e) ()
+          logWarn $ "failed to decode data url in @" ++ show nid ++ ": " ++ e
         Right (conttype, content) -> do
           eiRes <- decodeResourceContent conttype content
           case eiRes of
             Left e ->
-              return $ warning ("failed to decode resource in src=data: of @"++show nid ++ ": "++ e) ()
+              logWarn ("failed to decode resource in src=data: of @"++show nid ++ ": "++ e)
             Right res ->
               runBrowserDocument $ modify $ \doc -> do
                 let resources0 = documentResources doc
@@ -1874,7 +1876,7 @@ chunksFromTokens whitespace ts = chunksFromTokens (warning msg $ CSS_Keyword "no
 
 renderDOM :: Page -> IO ()
 renderDOM Page{ pageBoxes = Nothing } =
-  return $ warning "renderDOM: page is not layed out yet" ()
+  logWarn "renderDOM: page is not layed out yet"
 renderDOM page@Page{ pageBoxes = Just body, pageDocument = doc, pageWindow = win } = do
   let minY = pageScroll page
   let (texture, renderer) = (windowTexture win, windowRenderer win)
@@ -1984,10 +1986,10 @@ withStyling BoxTree{boxDim=V2 w h, boxStyling=(stpush, stpop)} (x, y, st0) actio
       Canvas.rect $ Canvas.D x y w h
       case st `cssValueMaybe` CSSColor of
         Just (CSS_RGB r' g' b') -> Canvas.stroke $ Canvas.rgb r' g' b'
-        Just other -> return $ warning ("unknown stroke color: " ++ show other) ()
-        Nothing -> return $ warning "no stroke color set, weird" ()
+        Just other -> logWarn ("unknown stroke color: " ++ show other)
+        Nothing -> logWarn "no stroke color set, weird"
     applyBackgroundColor _ other =
-      return $ warning ("Unknown background color: " ++ show other) ()
+      logWarn ("Unknown background color: " ++ show other)
 
 
 
