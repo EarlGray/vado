@@ -10,9 +10,13 @@ mysub, mysup {
   display: inline;  /* should be default */
 }
 </style>
+<link rel="stylesheet" href="res/simple.css">
 </head>
 <body>
   <p>Builtin sub/sup: <br>He<sub>2</sub><sup>4</sup>
   <p>Styled sub/sup: <br>He<mysub>2</mysub><mysup>4</mysup>
+
+  <hr>
+  <span class="test-red">This block should be styled by an external stylesheet to be green</span>
 </body>
 </html>

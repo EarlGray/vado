@@ -23,6 +23,7 @@ import           Data.Maybe
 import qualified Data.Set as S
 import           Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import           Foreign.C.Types (CInt)
 import           Linear.V2 (V2(..))
 import qualified Network.HTTP.Client as HTTP
@@ -498,9 +499,11 @@ type DOMResourceMap = M.Map URI (HTTPResource, S.Set ElementID)
 
 data HTTPResource
   = ImageResource !(V2 Double) SDL.Texture
+  | CSSResource [CSSBlock]
 
 instance Show HTTPResource where
   show (ImageResource dim _) = "ImageResource " ++ show dim
+  show (CSSResource blocks) = "CSSResource " ++ show blocks
 
 --------------------------------------------------------------------------------
 -- | Normalize an XML tree of elements and text, possibly with
@@ -591,21 +594,6 @@ domEndHTMLElement name = do
           other ->
             docWarn ("domEndHTMLElement @"++show nid++
                        ": expected text in <title>, found " ++ show other)
-      "style" -> do
-        let Right fid = elementContent node
-        tnode <- getElement fid
-        case elementContent tnode of
-          Left (TextContent styletext) -> do
-            let rules = cssParser styletext
-            modify $ \doc ->
-              warning ("Parsed "++show (length rules)++" CSS rules from @"++show nid) $
-                doc{ documentCSSRules = addCSSRules rules $ documentCSSRules doc }
-            -- TODO: make "@import" requests.
-            -- TODO: re-layout
-          other ->
-            docWarn $ "domEndHTMLElement @"++show nid++
-                      ": expected text in <style>, found " ++ show other
-
       "hr" -> fixupContent nid HorizLineContent
       "br" -> fixupContent nid NewlineContent
 
@@ -620,6 +608,34 @@ domEndHTMLElement name = do
             Just "submit" -> TextContent $ fromMaybe "submit" $ M.lookup "value" attrs
             Just "hidden" -> TextContent ""
             inpty -> warning ("Unknown input type: " ++ show inpty) $ TextContent ""
+
+      "style" -> do
+        let Right fid = elementContent node
+        tnode <- getElement fid
+        case elementContent tnode of
+          Left (TextContent styletext) -> do
+            let rules = cssParser styletext
+            modify $ \doc ->
+              warning ("Parsed "++show (length rules)++" CSS rules from @"++show nid) $
+                doc{ documentCSSRules = addCSSRules rules $ documentCSSRules doc }
+            -- TODO: make "@import" requests.
+            -- TODO: re-layout
+          other ->
+            docWarn $ "domEndHTMLElement @"++show nid++
+                      ": expected text in <style>, found " ++ show other
+      "link" | Just "stylesheet" == M.lookup "rel" attrs ->
+        case fromMaybe "text/css" $ M.lookup "type" attrs of
+          "text/css" ->
+            case M.lookup "href" attrs of
+              Nothing -> docWarn $ "no href in <link rel=stylesheet>" ++ show node
+              Just href -> do
+                case URI.parseURIReference (T.unpack href) of
+                  Nothing -> docWarn $ "failed to parse link href=" ++ T.unpack href
+                  Just u -> do
+                    docuri <- gets documentLocation
+                    let resuri = u `URI.relativeTo` docuri
+                    domResourceFetch nid resuri
+          _ -> docWarn $ "unknown type in " ++ show node
 
       "img" -> do
         -- TODO: fix separate TextContent/ImageContent for displaying `alt`
@@ -695,6 +711,7 @@ domParseHTMLAttributes nid = do
     { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
     , elementStylesheet = sheet{ stylesheetComputed = computedStyle sheet }
     }
+
   whenJust (M.lookup "autofocus" attrs) $ \_ ->
     modify $ \doc -> doc{ documentFocus = nid }
 
@@ -1106,7 +1123,35 @@ handleResourceEvent st uri event =
       mbRes <- decodeResourceContent contentType content
       case mbRes of
         Left oops -> logWarn $ "ERROR: <"++show uri++">: " ++ oops
-        Right res -> do
+
+        Right (CSSResource blocks) -> do
+          logWarn $ "Parsed "++show (length blocks)++" CSS rules from "++show uri
+          runBrowserDocument $ modify $ \doc ->
+            doc{ documentCSSRules = addCSSRules blocks $ documentCSSRules doc }
+
+          -- re-match the rules in the document
+          allNodes <- fmap IM.toList $ inBrowserDocument $ gets documentAllNodes
+          rules <- inBrowserDocument $ gets documentCSSRules
+          changed <- fmap concat $ forM allNodes $ \(nid, node) -> do
+              eltref <- inBrowserDocument $ getElementRef nid
+              let tagattrs = (elementTag node, elementAttrs node)
+              let newchains = rulechainsForMatcher rules tagattrs $ domMatchSelector eltref
+
+              let sheet0 = elementStylesheet node
+              if newchains == stylesheetAuthorChain sheet0 then return []
+              else do
+                let (impchain, regchain) = newchains
+                let style = (styleFromRulechain rules impchain, styleFromRulechain rules regchain)
+                let sheet = sheet0{ stylesheetAuthor = style }
+                runBrowserDocument $ setElement nid $
+                  node{ elementStylesheet = sheet{ stylesheetComputed = computedStyle sheet } }
+                return [nid]
+
+          when (not $ L.null changed) $ do
+            logDebug $ "Relayout needed for nodes: " ++ show changed
+            changePage $ \p -> Just <$> layoutPage p
+
+        Right res@(ImageResource _ _) -> do
           runBrowserDocument $ modify $ \doc ->
             doc{ documentResources = M.insert uri (res, nodes) (documentResources doc) }
 
@@ -1148,6 +1193,12 @@ decodeResourceContent contentType = \case
       return $ Right (ImageResource wh texture)
     else
       return $ Left ("decodeResourceContent: an unknown image format " ++ T.unpack contentType)
+
+  Resource.ContentBytes bs | T.isPrefixOf "text/css" contentType -> do
+    -- TODO: handle non-utf8 encodings properly
+    let txt = Ei.fromRight (TE.decodeLatin1 bs) $ TE.decodeUtf8' bs
+    let rules = cssParser txt
+    return $ Right (CSSResource rules)
 
   _content ->
     return $ Left ("decodeResourceContent: unknown Content-Type=" ++ T.unpack contentType)
