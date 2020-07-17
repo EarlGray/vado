@@ -229,10 +229,12 @@ data CSSOwnProperty
   | CSSBorderRightWidth
   | CSSBorderTopColor
   | CSSBorderTopWidth   -- TODO: CSSBorder*Style
+  | CSSBottom
   | CSSClear
   | CSSDisplay
   | CSSFloat
   | CSSHeight
+  | CSSLeft
   | CSSMarginBottom
   | CSSMarginLeft
   | CSSMarginRight
@@ -241,12 +243,17 @@ data CSSOwnProperty
   | CSSMaxWidth
   | CSSMinHeight
   | CSSMinWidth
+  | CSSOverflowX
+  | CSSOverflowY
   | CSSPaddingBottom
   | CSSPaddingLeft
   | CSSPaddingRight
   | CSSPaddingTop
   | CSSPosition
+  | CSSRight
+  | CSSTop
   | CSSWidth
+  | CSSZIndex
   deriving (Show, Eq, Ord, Enum)
 
 cssOwnPropertyNames :: M.Map CSSOwnProperty Text
@@ -259,10 +266,12 @@ cssOwnPropertyNames = M.fromList
   , (CSSBorderRightWidth,   "border-right-width")
   , (CSSBorderTopColor,     "border-top-color")
   , (CSSBorderTopWidth,     "border-top-width")
+  , (CSSBottom,             "bottom")
   , (CSSClear,              "clear")
   , (CSSDisplay,            "display")
   , (CSSFloat,              "float")
   , (CSSHeight,             "height")
+  , (CSSLeft,               "left")
   , (CSSMarginBottom,       "margin-bottom")
   , (CSSMarginLeft,         "margin-left")
   , (CSSMarginRight,        "margin-right")
@@ -271,12 +280,17 @@ cssOwnPropertyNames = M.fromList
   , (CSSMaxWidth,           "max-width")
   , (CSSMinHeight,          "min-height")
   , (CSSMinWidth,           "min-width")
+  , (CSSOverflowX,          "overflow-x")
+  , (CSSOverflowY,          "overflow-y")
   , (CSSPaddingBottom,      "padding-bottom")
   , (CSSPaddingLeft,        "padding-left")
   , (CSSPaddingRight,       "padding-right")
   , (CSSPaddingTop,         "padding-top")
   , (CSSPosition,           "position")
+  , (CSSRight,              "right")
+  , (CSSTop,                "top")
   , (CSSWidth,              "width")
+  , (CSSZIndex,             "z-index")
   ]
 cssOwnPropertyDefaults :: M.Map CSSOwnProperty CSSValue
 cssOwnPropertyDefaults = M.fromList
@@ -288,10 +302,12 @@ cssOwnPropertyDefaults = M.fromList
   , (CSSBorderRightWidth,   CSS_Keyword "medium")
   , (CSSBorderTopColor,     CSS_Keyword "auto")
   , (CSSBorderTopWidth,     CSS_Keyword "medium")
+  , (CSSBottom,         CSS_Keyword "auto")
   , (CSSClear,          CSS_Keyword "none")
   , (CSSDisplay,        CSS_Keyword "block")
   , (CSSFloat,          CSS_Keyword "none")
   , (CSSHeight,         CSS_Keyword "auto")
+  , (CSSLeft,           CSS_Keyword "auto")
   , (CSSMarginBottom,   CSS_Px 0)
   , (CSSMarginLeft,     CSS_Px 0)
   , (CSSMarginRight,    CSS_Px 0)
@@ -300,12 +316,17 @@ cssOwnPropertyDefaults = M.fromList
   , (CSSMaxWidth,       CSS_Keyword "none")
   , (CSSMinHeight,      CSS_Px 0)
   , (CSSMinWidth,       CSS_Px 0)
+  , (CSSOverflowX,      CSS_Keyword "visible")
+  , (CSSOverflowY,      CSS_Keyword "visible")
   , (CSSPaddingBottom,  CSS_Px 0)
   , (CSSPaddingLeft,    CSS_Px 0)
   , (CSSPaddingRight,   CSS_Px 0)
   , (CSSPaddingTop,     CSS_Px 0)
   , (CSSPosition,       CSS_Keyword "static")
+  , (CSSRight,          CSS_Keyword "auto")
+  , (CSSTop,            CSS_Keyword "auto")
   , (CSSWidth,          CSS_Keyword "auto")
+  , (CSSZIndex,         CSS_Keyword "auto")
   ]
 
 cssNamesOfOwnProperties :: M.Map Text CSSOwnProperty
@@ -640,6 +661,7 @@ css properties = Style
             [CSSBorderTopWidth, CSSBorderRightWidth, CSSBorderBottomWidth, CSSBorderLeftWidth])
       , ("font",   expandFont)
       , ("margin", expandFields [CSSMarginTop, CSSMarginRight, CSSMarginBottom, CSSMarginLeft])
+      , ("overflow", expandOverflow)
       , ("padding",expandFields [CSSPaddingTop, CSSPaddingRight, CSSPaddingBottom, CSSPaddingLeft])
       , ("text-decoration", expandTextDecoration)
       ]
@@ -650,6 +672,12 @@ css properties = Style
       CSS_Seq vals ->
         concatMap expandTextDecoration vals
       other -> warning ("Unknown value for text-decoration=" ++ show other) []
+
+    expandOverflow = \case
+      kw@(CSS_Keyword _) -> map Left [(CSSOverflowX, kw), (CSSOverflowY, kw)]
+      CSS_Seq [ox@(CSS_Keyword _), oy@(CSS_Keyword _)] ->
+        map Left [(CSSOverflowX, ox), (CSSOverflowY, oy)]
+      other -> warning ("expandOverflow: unknown value " ++ show other) []
 
     -- TODO: border-style
     expandBorder [bwidth, bcolor] = \case

@@ -17,7 +17,7 @@ style owns props = Style{ styleOwn = M.fromList owns, styleInherit = M.fromList 
 
 spec :: Spec
 spec = do
-  describe "css_properties_support" $ do
+  describe "known_properties" $ do
     -- CSS 2.1, Appendix F
     it "background-attachment" $ pendingWith "TODO"
     it "background-color" $
@@ -68,7 +68,8 @@ spec = do
         , (CSSBorderBottomColor,CSS_RGB 0xff 0x00 0x00)
         , (CSSBorderLeftColor,  CSS_RGB 0xff 0x00 0x00)
         ] []
-    it "bottom" $ pendingWith "TODO"
+    it "bottom" $
+      css [("bottom", "10%")] `shouldBe` style [(CSSBottom, CSS_Percent 10)] []
     it "caption-side" $ pendingWith "TODO"
     it "clear" $ css [("clear", "both")] `shouldBe` style [(CSSClear, CSS_Keyword "both")] []
     it "content" $ pendingWith "TODO"
@@ -106,7 +107,7 @@ spec = do
       --           ]
       pendingWith "TODO: line-height, font-variant"
     it "height" $ css [("height", "15em")] `shouldBe` style [(CSSHeight, CSS_Em 15)] []
-    it "left" $ pendingWith "TODO"
+    it "left" $ css [("left", "10%")] `shouldBe` style [(CSSLeft, CSS_Percent 10)] []
     it "letter-spacing" $ pendingWith "TODO"
     it "line-height" $ pendingWith "TODO"
     it "list-style-image" $ pendingWith "TODO"
@@ -130,6 +131,13 @@ spec = do
     it "outline-color" $ pendingWith "TODO"
     it "outline-width" $ pendingWith "TODO"
     it "outline" $ pendingWith "TODO"
+    it "overflow-x" $
+      css [("overflow-x", "hidden")] `shouldBe` style [(CSSOverflowX, CSS_Keyword "hidden")] []
+    it "overflow-y" $
+      css [("overflow-y", "scroll")] `shouldBe` style [(CSSOverflowY, CSS_Keyword "scroll")] []
+    it "overflow" $
+      css [("overflow", "hidden scroll")] `shouldBe`
+        style [(CSSOverflowX, CSS_Keyword "hidden"), (CSSOverflowY, CSS_Keyword "scroll")] []
     it "padding-top|right|bottom|left" $
       css [("padding-left", "5%")] `shouldBe` style [(CSSPaddingLeft, CSS_Percent 5.0)] []
     it "padding" $
@@ -141,7 +149,7 @@ spec = do
         ] []
     it "position" $
       css [("position", "fixed")] `shouldBe` style [(CSSPosition, CSS_Keyword "fixed")] []
-    it "right" $ pendingWith "TODO"
+    it "right" $ css [("right", "25em")] `shouldBe` style [(CSSRight, CSS_Em 25)] []
     it "table-layout" $ pendingWith "TODO"
     it "table-align" $ pendingWith "TODO"
     it "text-align" $
@@ -151,7 +159,7 @@ spec = do
       --  style [(CSSTextDecorationLine, CSS_Keyword "underline")] []
       pendingWith "TODO: make own property"
     it "text-transform" $ pendingWith "TODO"
-    it "top" $ pendingWith "TODO"
+    it "top" $ css [("top", "200px")] `shouldBe` style [(CSSTop, CSS_Px 200)] []
     it "unicode-bidi" $ pendingWith "TODO"
     it "vertical-align" $ pendingWith "TODO"
     it "visibility" $ pendingWith "TODO"
@@ -161,7 +169,8 @@ spec = do
     it "widows" $ pendingWith "TODO"
     it "width" $ css [("width", "200px")] `shouldBe` style [(CSSWidth, CSS_Px 200)] []
     it "word-spacing" $ pendingWith "TODO"
-    it "z-index" $ pendingWith "TODO"
+    it "z-index" $
+      css [("z-index", "3")] `shouldBe` style [(CSSZIndex, CSS_Num 3)] []
 
   describe "cssReadValue" $ do
     it "keywords" $ cssReadValue "green" `shouldBe` Right (CSS_Keyword "green")

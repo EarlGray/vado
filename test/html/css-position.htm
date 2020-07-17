@@ -2,11 +2,17 @@
 <head>
 <title><whut>Test:</whut> page title, reading CSS &lt;style&gt;</title>
 <style>
-sub, sup { font-size: 65%; }
+mysub { top: 0.4em }
+mysup { top: -0.4em }
+mysub, mysup {
+  position: relative;
+  font-size: 0.8em;
+  display: inline;  /* should be default */
+}
 </style>
 </head>
 <body>
-  <p>He<span style="font-size: 65%">2</span><span style="font-size: 65%">4</span>
-  <p>He<sub>2</sub><sup>4</sup>
+  <p>Builtin sub/sup: <br>He<sub>2</sub><sup>4</sup>
+  <p>Styled sub/sup: <br>He<mysub>2</mysub><mysup>4</mysup>
 </body>
 </html>
