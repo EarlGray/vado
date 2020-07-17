@@ -2119,7 +2119,8 @@ styleFont st = Canvas.Font face size weight italic
     size =
       case st `cssValueMaybe` CSSFontSize of
         Just (CSS_Px px) -> px
-        other -> warning ("styleFont: unknown font-size=" ++ show other) defaultFontSize
+        Just other -> warning ("styleFont: unknown font-size=" ++ show other) defaultFontSize
+        Nothing -> defaultFontSize
     weight = (st `cssValueMaybe` CSSFontWeight == Just (CSS_Keyword "bold"))
     italic = (st `cssValueMaybe` CSSFontStyle == Just (CSS_Keyword "italic"))
 

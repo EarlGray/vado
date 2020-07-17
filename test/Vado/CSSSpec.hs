@@ -27,7 +27,10 @@ spec = do
     it "background-image" $ pendingWith "TODO"
     it "background-position" $ pendingWith "TODO"
     it "background-repeat" $ pendingWith "TODO"
-    it "background" $ pendingWith "TODO"
+    it "background (-color)" $
+      css [("background", "indigo")] `shouldBe`
+        style [] [(CSSBackgroundColor, CSS_RGB 0x4b 0x00 0x82)]
+    it "background" $ pendingWith "TODO: full background"
     it "border-collapse" $ pendingWith "TODO"
     it "border-color" $
       css [("border-color", "darkred grey")] `shouldBe` style
@@ -109,7 +112,7 @@ spec = do
     it "height" $ css [("height", "15em")] `shouldBe` style [(CSSHeight, CSS_Em 15)] []
     it "left" $ css [("left", "10%")] `shouldBe` style [(CSSLeft, CSS_Percent 10)] []
     it "letter-spacing" $ pendingWith "TODO"
-    it "line-height" $ pendingWith "TODO"
+    it "line-height" $ css [("line-height", "0")] `shouldBe` style [] [(CSSLineHeight, CSS_Num 0)]
     it "list-style-image" $ pendingWith "TODO"
     it "list-style-position" $ pendingWith "TODO"
     it "list-style-type" $ pendingWith "TODO"

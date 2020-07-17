@@ -168,9 +168,10 @@ data CSSProperty
   | CSSFontSize
   | CSSFontStyle
   | CSSFontWeight
-  | CSSWhiteSpace
+  | CSSLineHeight
   | CSSTextAlign
   | CSSTextDecorationLine
+  | CSSWhiteSpace
   deriving (Show, Eq, Ord, Enum)
 
 cssPropertyNames :: M.Map CSSProperty Text
@@ -181,9 +182,10 @@ cssPropertyNames = M.fromList
   , (CSSFontSize,           "font-size")
   , (CSSFontStyle,          "font-style")
   , (CSSFontWeight,         "font-weight")
-  , (CSSWhiteSpace,         "white-space")
+  , (CSSLineHeight,         "line-height")
   , (CSSTextAlign,          "text-align")
   , (CSSTextDecorationLine, "text-decoraton-line")
+  , (CSSWhiteSpace,         "white-space")
   ]
 
 cssNamesOfProperties :: M.Map Text CSSProperty
@@ -198,6 +200,7 @@ cssPropertyDefaults = M.fromList
   , (CSSFontSize,           CSS_Keyword "medium")      -- ?
   , (CSSFontStyle,          CSS_Keyword "normal")
   , (CSSFontWeight,         CSS_Keyword "normal")
+  , (CSSLineHeight,         CSS_Keyword "normal")
   , (CSSTextAlign,          CSS_Keyword "left")
   , (CSSTextDecorationLine, CSS_Keyword "none")
   , (CSSWhiteSpace,         CSS_Keyword "normal")
@@ -645,7 +648,8 @@ css properties = Style
 
     cssShorthands :: M.Map Text (CSSValue -> [OwnOrInheritable])
     cssShorthands = M.fromList
-      [ ("border", \vals -> concat
+      [ ("background", expandBackground)
+      , ("border", \vals -> concat
             [ expandBorder [CSSBorderTopWidth, CSSBorderTopColor] vals
             , expandBorder [CSSBorderRightWidth, CSSBorderRightColor] vals
             , expandBorder [CSSBorderBottomWidth, CSSBorderBottomColor] vals
@@ -678,6 +682,22 @@ css properties = Style
       CSS_Seq [ox@(CSS_Keyword _), oy@(CSS_Keyword _)] ->
         map Left [(CSSOverflowX, ox), (CSSOverflowY, oy)]
       other -> warning ("expandOverflow: unknown value " ++ show other) []
+
+    expandBackground :: CSSValue -> [OwnOrInheritable]
+    expandBackground = \case
+        CSS_Seq vals -> concatMap matchColor vals
+        kw@(CSS_Keyword _) -> matchColor kw
+        rgb@(CSS_RGB _ _ _) -> matchColor rgb
+        other -> warning ("expandBackground: unknown value " ++ show other) []
+      where
+        matchColor = \case
+          CSS_Keyword kw ->
+            case M.lookup kw cssColorAliases of
+              Just color -> let Right rgb = cssReadValue color in [Right (CSSBackgroundColor, rgb)]
+              Nothing -> []
+          rgb@(CSS_RGB _ _ _) ->
+            [Right (CSSBackgroundColor, rgb)]
+          _ -> []
 
     -- TODO: border-style
     expandBorder [bwidth, bcolor] = \case
