@@ -1446,6 +1446,8 @@ body_onKeyReleased event _nid page = do
       return $ vadoScroll (negate $ vadoViewHeight page) page
     SDL.KeycodeQ | modifiers == noKeyModifiers ->
       exitSuccess
+    SDL.KeycodeR | isKeyCtrlPressed modifiers ->
+      navigatePage (pageUrl page) page
     SDL.KeycodeRight | isKeyAltPressed modifiers ->
       case pageHistory page of
         (_, nexturl:_) -> navigatePage nexturl page
