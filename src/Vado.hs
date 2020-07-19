@@ -735,6 +735,9 @@ domResourceFetch nid href = modify $ \doc ->
   let resuri = href `URI.relativeTo` documentLocation doc
   in doc{ documentResourceRequests = (resuri, nid) : documentResourceRequests doc }
 
+domEmitEvent :: Monad m => ElementID -> EventName -> DocumentT m ()
+domEmitEvent nid evt = docWarn $ "TODO: domEmitEvent @"++show nid++" "++T.unpack evt
+
 -- | Request a redraw for a node
 documentRedraw :: Monad m => ElementID -> DocumentT m ()
 documentRedraw _nid = docWarn "TODO: documentRedraw"
@@ -975,7 +978,7 @@ navigatePage uri page = do
   let fullURI = uri `URI.relativeTo` (documentLocation $ pageDocument page)
   -- TODO: check if fullURI is canonicalized:
   liftIO $ do
-    Resource.requestGetMaybeStreaming resman fullURI ["text/html", "text"]
+    Resource.requestGet resman fullURI ["text/html"]
     when (pageDebugNetwork page) $ putStrLn $ "navigatePage " ++ show fullURI
   return $ page
     { pageState = PageConnecting
@@ -1121,7 +1124,7 @@ handlePageStreaming st event = do
       resources <- gets documentResources
       wereLoading <- gets documentResourcesLoading
       unless (resuri `M.member` wereLoading || resuri `M.member` resources) $
-        liftIO $ Resource.requestGet resman resuri
+        liftIO $ Resource.requestGet resman resuri []
 
       let multimapAdd v = M.alter (\vs -> Just (v `S.insert` fromMaybe S.empty vs))
       let nowLoading = multimapAdd nid resuri wereLoading
@@ -1373,6 +1376,9 @@ builtinHTMLEvents = HM.fromList
       { eventsKeyReleased = [input_onKeyReleased]
       , eventsTextInput = [input_onTextInput]
       })
+  , ("form", noEvents
+      { eventsOther = M.fromList [("change", [form_onSubmit])]
+      })
   ]
 
 clickLink :: EventHandler
@@ -1427,15 +1433,14 @@ modify_input f node =
 
 input_onKeyReleased :: EventHandler
 input_onKeyReleased event nid page = runPageDocument page $ do
+  -- TODO: it's not always a text input
   let KeyboardEvent e = SDL.eventPayload event
   let keysym = SDL.keyboardEventKeysym e
   case SDL.keysymKeycode keysym of
     SDL.KeycodeBackspace ->
       modifyElement nid $ modify_input (\case "" -> ""; t -> T.init t)
-    -- SDL.KeycodeReturn ->
-      -- undefined
-      -- TODO: find a parent form, use its submit action
-      -- emitEvent nid "change"
+    SDL.KeycodeReturn ->
+      domEmitEvent nid "change"
     -- TODO: Mac (GUI) keyboard layout support:
     SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
       clipboard <- lift $ SDL.getClipboardText
@@ -1497,6 +1502,10 @@ body_onKeyReleased event _nid page = do
     _ ->
       return page
 
+form_onSubmit :: EventHandler
+form_onSubmit event nid page = do
+  putStrLn $ "form_onSubmit: @"++show nid++" event="++show event
+  return page
 
 --------------------------------------------------------------------------------
 -- Layout engine

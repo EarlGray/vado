@@ -78,16 +78,9 @@ quitManager :: Manager -> IO ()
 quitManager Manager{..} = manReqChan `send` Quit
 
 -- | Resource Manager requests:
-requestGet :: Manager -> URI -> IO ()
-requestGet Manager{..} uri =
-  -- TODO: vado:
-  -- TODO: data:
-  -- TODO: file://
-  manReqChan `send` Get uri
-
-requestGetMaybeStreaming :: Manager -> URI -> [Text] -> IO ()
-requestGetMaybeStreaming Manager{..} uri mimetypes =
-  manReqChan `send` Stream uri mimetypes
+requestGet :: Manager -> URI -> [Text] -> IO ()
+requestGet Manager{..} uri mimetypes =
+  manReqChan `send` Get uri mimetypes
 
 requestCancel :: Manager -> URI -> IO ()
 requestCancel Manager{..} uri = manReqChan `send` Cancel uri
@@ -174,9 +167,8 @@ drainEvents resman = go
 -- | Resource Manager: internal channel interface
 
 data Request
-  = Get URI
-  | Stream URI [Text]
-  -- ^ request uri, possibly streaming for the list of mime-type prefixes
+  = Get URI [Text]
+  -- ^ request uri, possibly setting up a streaming parser in mimetypes
   | Cancel URI
   | Done URI        -- only for workers
   | Quit
@@ -194,10 +186,7 @@ eventloop inch outch state = do
   case req of
     Quit ->
       CC.myThreadId >>= CC.killThread
-    Get uri -> do
-      tid <- CC.forkIO $ runHttp bodyAsBytestring inch outch (manHTTPManager state) uri
-      eventloop inch outch $ state{ manThreadByURI = M.insert uri tid $ manThreadByURI state }
-    Stream uri mimetypes -> do
+    Get uri mimetypes -> do
       tid <- CC.forkIO $ runStreaming mimetypes inch outch (manHTTPManager state) uri
       eventloop inch outch $ state{ manThreadByURI = M.insert uri tid $ manThreadByURI state }
     Done uri -> do
@@ -208,9 +197,13 @@ eventloop inch outch state = do
       eventloop inch outch $ state{ manThreadByURI = M.delete uri $ manThreadByURI state }
 
 runStreaming :: [Text] -> Chan Request -> Chan Event -> HTTP.Manager -> URI -> IO ()
-runStreaming mimetypes = runHttp maybeStreamBody
+runStreaming mimetypes inch outch httpman uri = do
+    doHttp httpman uri maybeStreamBody
+        `Exc.catch` \(e :: Exc.SomeException) -> outch `send` (uri, EventConnectionError e)
+    inch `send` Done uri
   where
-    maybeStreamBody outch uri (req, resp) = do
+    maybeStreamBody :: BodyHandler
+    maybeStreamBody (req, resp) = do
       let headers = HTTP.responseHeaders resp
       let contentType = fromMaybe "application/octet-stream" $ httpHeader headers "content-type"
       if "text/html" `T.isPrefixOf` contentType && "text/html" `L.elem` mimetypes
@@ -225,31 +218,21 @@ runStreaming mimetypes = runHttp maybeStreamBody
                   .| CL.map (\chunk -> (uri, EventStreamChunk (ChunkHtml chunk)))
                   .| Ch.sinkTMChan outch
         liftIO $ outch `send` (uri, EventStreamClose)
-      else
-        bodyAsBytestring outch uri (req, resp)
+      else do
+        bs <- Bs.concat <$> HTTP.brConsume (HTTP.responseBody resp)
+        outch `send` (uri, EventContentReady (req, resp) (ContentBytes bs))
 
-type BodyHandler = Chan Event -> URI -> (HTTP.Request, HTTP.Response HTTP.BodyReader) -> IO ()
+type BodyHandler = (HTTP.Request, HTTP.Response HTTP.BodyReader) -> IO ()
 
-runHttp :: BodyHandler -> Chan Request -> Chan Event -> HTTP.Manager -> URI -> IO ()
-runHttp onBody inch outch httpman uri = do
-    doHttp outch httpman uri onBody
-        `Exc.catch` \(e :: Exc.SomeException) -> outch `send` (uri, EventConnectionError e)
-    inch `send` Done uri
-
-doHttp :: Chan Event -> HTTP.Manager -> URI -> BodyHandler -> IO ()
-doHttp outch httpman uri onBody = do
+doHttp :: HTTP.Manager -> URI -> BodyHandler -> IO ()
+doHttp httpman uri onBody = do
   req0 <- HTTP.parseRequest $ show uri
   let req1 = req0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "Vado Browser") ] }
 
   HTTP.withResponseHistory req1 httpman $ \respHistory -> do
     let req = HTTP.hrFinalRequest respHistory
     let resp = HTTP.hrFinalResponse respHistory
-    onBody outch uri (req, resp)
-
-bodyAsBytestring :: BodyHandler
-bodyAsBytestring outch uri (req, resp) = do
-  bs <- Bs.concat <$> HTTP.brConsume (HTTP.responseBody resp)
-  outch `send` (uri, EventContentReady (req, resp) (ContentBytes bs))
+    onBody (req, resp)
 
 -- | data: urls helpers
 decodeDataURL :: Text -> Either String (Text, Content)
@@ -289,7 +272,7 @@ test :: Text -> IO ()
 test address = do
   resman <- runManager
   let Just uri = URI.parseAbsoluteURI $ T.unpack address
-  requestGetMaybeStreaming resman uri ["text/html", "text"]
+  requestGet resman uri ["text/html", "text"]
   runResourceT $ do
     let sink (u, r) = do
           case r of
@@ -298,7 +281,7 @@ test address = do
               putStrLn $ "@@@ image: src=" ++ show href
               let Just rel = URI.parseURIReference $ T.unpack href
               let imguri = rel `URI.relativeTo` u
-              requestGet resman imguri
+              requestGet resman imguri []
             _ -> return ()
           print (u, r)
     runConduit (Ch.sourceTMChan (manEventChan resman)  .| CL.mapM_ (liftIO . sink))
