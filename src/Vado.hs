@@ -739,6 +739,31 @@ domResourceFetch nid href = modify $ \doc ->
 documentRedraw :: Monad m => ElementID -> DocumentT m ()
 documentRedraw _nid = docWarn "TODO: documentRedraw"
 
+-- HTML 5 misc
+
+htmlAutoclosePBefore :: [TagName]
+htmlAutoclosePBefore =
+ [ "address", "article", "aside", "blockquote", "details", "div", "dl"
+ , "fieldset", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6"
+ , "header", "hgroup", "hr", "main", "menu", "nav", "ol"
+ , "p", "pre", "section", "table", "ul" ]
+
+-- | if element is focusable, return `Just tabindex` (the attribute value) or `Just 0`.
+-- If not focusable, Nothing.
+elementTabIndex :: Element -> Maybe Int
+elementTabIndex node =
+  let tag = elementTag node
+      attrs = elementAttrs node
+  in case ("disabled" `M.member` attrs, "tabindex" `M.lookup` attrs) of
+    (_, mbIdx) | tag == "a" ->
+      maybe (Just 0) mbReadText mbIdx
+    (False, mbIdx) | tag `elem` ["area", "button", "input", "textarea", "select"] ->
+      maybe (Just 0) mbReadText mbIdx
+    (_, Just idx) ->
+      mbReadText idx
+    _ ->
+      Nothing
+
 --------------------------------------------------------------------------------
 -- XML Utilities
 
@@ -754,15 +779,6 @@ xmlTextName name =
   in T.toLower $ case XML.nameNamespace name of
     Just ns -> T.concat [ns, ":", n]
     _ -> n
-
--- HTML 5 misc
-
-htmlAutoclosePBefore :: [TagName]
-htmlAutoclosePBefore =
- [ "address", "article", "aside", "blockquote", "details", "div", "dl"
- , "fieldset", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6"
- , "header", "hgroup", "hr", "main", "menu", "nav", "ol"
- , "p", "pre", "section", "table", "ul" ]
 
 -- Constructing XML
 xmlElement' :: Text -> [(Text, Text)] -> [XML.Node] -> XML.Element
@@ -1026,21 +1042,24 @@ handleUIEvent event =
         let V2 _ dy = mouseWheelEventPos e
         return $ Just $ vadoScroll (negate $ 10 * fromIntegral dy) page
 
-      SDL.MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released ->
-        changePage $ \page -> do
-          let P (V2 xi yi) = mouseButtonEventPos e
-          case pageBoxes page of
-            Just boxes -> do
-              let pagepos = V2 (fromIntegral xi) (fromIntegral yi + pageScroll page)
-              let stack = P pagepos `findInBox` boxes
-              case boxNode <$> mbHead stack of
-                Just nid -> do
-                  putStrLn $ "MouseButtonEvent: dispatchEvent @" ++ show nid
-                  Just <$> dispatchEvent nid event page
-                Nothing ->
-                  return $ warning "click event without a box" Nothing
-            _ ->
-              return Nothing
+      SDL.MouseButtonEvent e | SDL.mouseButtonEventMotion e == Released -> do
+        let P (V2 xi yi) = mouseButtonEventPos e
+        mbBoxes <- gets pageBoxes
+        whenJust mbBoxes $ \boxes -> do
+          scrollY <- gets pageScroll
+          let pagepos = V2 (fromIntegral xi) (fromIntegral yi + scrollY)
+          let stack = P pagepos `findInBox` boxes
+          case boxNode <$> mbHead stack of
+            Nothing -> logWarn "click event without a box"
+            Just nid -> do
+              node <- inBrowserDocument $ getElement nid
+              when (isJust $ elementTabIndex node) $ do
+                -- TODO: emit "blur" event for documentFocus
+                runBrowserDocument $ modify $ \doc -> doc{ documentFocus = nid }
+                liftIO $ putStrLn $ "MouseButtonEvent: focused @" ++ show nid
+                -- TODO: emit "focus" event for nid
+              liftIO $ putStrLn $ "MouseButtonEvent: dispatchEvent @" ++ show nid
+              changePage $ \page -> Just <$> dispatchEvent nid event page
 
       SDL.KeyboardEvent _ -> return ()
       SDL.MouseMotionEvent _ -> return ()
