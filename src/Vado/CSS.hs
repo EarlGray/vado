@@ -105,16 +105,14 @@ cascadingOver style parent = style { styleInherit = inheritable `merge` styleInh
 -- -}
 
 cascadingValue :: CSSProperty -> CSSValue -> CSSValue -> Maybe CSSValue
+cascadingValue _ (CSS_Keyword "inherit") st = Just st
 cascadingValue CSSFontSize new (CSS_Px oldsz) =
   case new of
     CSS_Keyword kw ->
       case kw `L.lookup` (relkeywords ++ abskeywords) of
-        Just val ->
-          cascadingValue CSSFontSize val (CSS_Px oldsz)
-        Nothing ->
-          warning ("font-size ignored: " ++ show kw) Nothing
-    _ ->
-      CSS_Px <$> cssRelEmLength oldsz oldsz new
+        Just val -> cascadingValue CSSFontSize val (CSS_Px oldsz)
+        Nothing -> warning ("font-size ignored: " ++ show kw) Nothing
+    _ -> CSS_Px <$> cssRelEmLength oldsz oldsz new
   where
     relkeywords =
       [ ("smaller", CSS_Percent 70)
@@ -129,6 +127,8 @@ cascadingValue CSSFontSize new (CSS_Px oldsz) =
       , ("x-large",   CSS_Em 1.70)
       , ("xx-large",  CSS_Em 2.00)
       ]
+cascadingValue CSSFontSize new old =
+  warning ("cascadingValue: old font-size is " ++ show old) $ Just new
 cascadingValue _ st _ = Just st
 
 
@@ -307,7 +307,7 @@ cssOwnPropertyDefaults = M.fromList
   , (CSSBorderTopWidth,     CSS_Keyword "medium")
   , (CSSBottom,         CSS_Keyword "auto")
   , (CSSClear,          CSS_Keyword "none")
-  , (CSSDisplay,        CSS_Keyword "block")
+  , (CSSDisplay,        CSS_Keyword "inline")
   , (CSSFloat,          CSS_Keyword "none")
   , (CSSHeight,         CSS_Keyword "auto")
   , (CSSLeft,           CSS_Keyword "auto")
@@ -644,6 +644,8 @@ css properties = Style
       Right (prop, CSS_Keyword color) | prop `elem` [CSSColor, CSSBackgroundColor] ->
         let Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases
         in Right (prop, color')
+      Right (CSSFontSize, pt@(CSS_Pt _)) ->
+        Right (CSSFontSize, CSS_Px $ fromMaybe undefined $ cssLength pt)
       other -> other
 
     cssShorthands :: M.Map Text (CSSValue -> [OwnOrInheritable])
@@ -873,7 +875,7 @@ cssparseSelector =
         [s] -> return s
         other -> return $ SelAnd other
     selpAny = Atto.char '*' *> pure SelAny
-    selpTag = (SelTag . T.pack) <$> Atto.many1 (Atto.letter <|> Atto.digit)
+    selpTag = (SelTag . T.toLower . T.pack) <$> Atto.many1 (Atto.letter <|> Atto.digit)
     selpClass = SelClass <$> (Atto.char '.' *> csspIdent)
     -- TODO: parenthesis in pseudoclasses
     selpPseudoElem =

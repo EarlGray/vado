@@ -548,12 +548,20 @@ htmlDOMFromEvents = \case
     xmlAttr (k, []) = (xmlTextName k, "")
     xmlAttr (k, vs) = (xmlTextName k, xmlContent $ last vs)
 
-
 domStartHTMLElement :: Monad m => TagAttrs -> DocumentT m ()
 domStartHTMLElement (tag, attrs) = do
-  opened <- gets documentBuildState
+  -- DOM fixing:
+  mbPid <- mbHead <$> gets documentBuildState
+  mbParent <- mapM getElement mbPid
+  case (tag, fmap elementTag mbParent) of
+    ("li", Just "li") -> domEndHTMLElement "li"
+    (_, Just "p") | tag `elem` htmlAutoclosePBefore -> domEndHTMLElement "p"
+    _ -> return ()
+
+  opened <- gets documentBuildState     -- do not move before the fixing
   let pid = if null opened then noElement else head opened
 
+  -- insert
   let node = emptyElement { elementTag = tag, elementAttrs = attrs }
   nid <- domtreeStartElement pid node
   modify $ \doc -> doc{ documentBuildState = (nid:opened) }
@@ -571,11 +579,9 @@ domAppendHTMLContent mbTagAttrs content = do
 domEndHTMLElement :: Monad m => Text -> DocumentT m ()
 domEndHTMLElement name = do
   opened <- gets documentBuildState
-  whenJust (mbHead opened) $ \nid -> do
-    node <- getElement nid
-    when (elementTag node /= name) $
-      error $ "domEndHTMLElement: " ++ show (elementTag node) ++" /= " ++ show name++
-              ", opened=" ++ show opened
+  mbNode <- mapM getElement $ mbHead opened
+  whenJust (liftA2 (,) (mbHead opened) mbNode) $ \(nid, node) -> do
+    let attrs = elementAttrs node
 
     -- hr, br and such are not containers, change their content if needed:
     let fixupContent nid' content = modifyElement nid' $ \node' ->
@@ -583,7 +589,6 @@ domEndHTMLElement name = do
           then node' { elementContent = Left content }
           else error $ "fixupContent: expected an empty container in " ++ show node'
 
-    let attrs = elementAttrs node
     case elementTag node of
       "title" -> do
         let Right fid = elementContent node
@@ -611,18 +616,21 @@ domEndHTMLElement name = do
 
       "style" -> do
         let Right fid = elementContent node
-        tnode <- getElement fid
-        case elementContent tnode of
-          Left (TextContent styletext) -> do
-            let rules = cssParser styletext
-            modify $ \doc ->
-              warning ("Parsed "++show (length rules)++" CSS rules from @"++show nid) $
-                doc{ documentCSSRules = addCSSRules rules $ documentCSSRules doc }
-            -- TODO: make "@import" requests.
-            -- TODO: re-layout
-          other ->
-            docWarn $ "domEndHTMLElement @"++show nid++
-                      ": expected text in <style>, found " ++ show other
+        if fid == noElement then return ()  -- empty style
+        else do
+          tnode <- getElement fid
+          case elementContent tnode of
+            Left (TextContent styletext) -> do
+              let rules = cssParser styletext
+              modify $ \doc ->
+                warning ("Parsed "++show (length rules)++" CSS rules from @"++show nid) $
+                  doc{ documentCSSRules = addCSSRules rules $ documentCSSRules doc }
+              -- TODO: make "@import" requests.
+              -- TODO: re-layout
+            other ->
+              docWarn $ "domEndHTMLElement @"++show nid++
+                        ": expected text in <style>, found " ++ show other
+
       "link" | Just "stylesheet" == M.lookup "rel" attrs ->
         case fromMaybe "text/css" $ M.lookup "type" attrs of
           "text/css" ->
@@ -663,7 +671,13 @@ domEndHTMLElement name = do
 
       _ -> return ()
 
-  void $ domtreeEndElement
+  case (name, elementTag <$> mbNode) of
+    ("li", Just tag) | tag `elem` ["ul", "ol"] -> return ()
+    ("p", Just tag) | tag /= "p" -> return ()
+    (_, Just tag) | tag /= name ->
+      error $ "domEndHTMLElement: "++ show tag ++" /= " ++ show name++", opened=" ++ show opened
+    _ ->
+      void domtreeEndElement
 
 domParseHTMLAttributes :: Monad m => ElementID -> DocumentT m ()
 domParseHTMLAttributes nid = do
@@ -737,9 +751,18 @@ tagName = xmlTextName . XML.elementName
 xmlTextName :: XML.Name -> Text
 xmlTextName name =
   let n = XML.nameLocalName name
-  in case XML.nameNamespace name of
+  in T.toLower $ case XML.nameNamespace name of
     Just ns -> T.concat [ns, ":", n]
     _ -> n
+
+-- HTML 5 misc
+
+htmlAutoclosePBefore :: [TagName]
+htmlAutoclosePBefore =
+ [ "address", "article", "aside", "blockquote", "details", "div", "dl"
+ , "fieldset", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6"
+ , "header", "hgroup", "hr", "main", "menu", "nav", "ol"
+ , "p", "pre", "section", "table", "ul" ]
 
 -- Constructing XML
 xmlElement' :: Text -> [(Text, Text)] -> [XML.Node] -> XML.Element
@@ -978,7 +1001,7 @@ handleUIEvent :: SDL.Event -> Browser ()
 handleUIEvent event =
     case SDL.eventPayload event of
       SDL.QuitEvent ->
-        liftIO $ exitSuccess
+        SDL.quit >> liftIO exitSuccess
 
       SDL.WindowResizedEvent e -> changePage $ \page -> do
         let size = windowResizedEventSize e
@@ -1444,8 +1467,8 @@ body_onKeyReleased event _nid page = do
       return $ vadoScroll (vadoViewHeight page) page
     SDL.KeycodePageUp -> do
       return $ vadoScroll (negate $ vadoViewHeight page) page
-    SDL.KeycodeQ | modifiers == noKeyModifiers ->
-      exitSuccess
+    SDL.KeycodeQ | isKeyCtrlPressed modifiers ->
+      SDL.quit >> liftIO exitSuccess >> return page
     SDL.KeycodeR | isKeyCtrlPressed modifiers ->
       navigatePage (pageUrl page) page
     SDL.KeycodeRight | isKeyAltPressed modifiers ->
@@ -1634,7 +1657,7 @@ layoutElement elt = do
             layoutInlineBox wh baseline elt (BoxInline $ ImageBox wh href) []
           _ -> return ()
 
-      (Right _, CSS_Keyword "inline") -> do
+      (Right _, CSS_Keyword kw) | kw `elem` ["inline", "inline-block"] -> do
         withStyle elt $ forM_ (elemrefChildren elt) layoutElement
 
       (Right _, CSS_Keyword "list-item") ->
@@ -2121,7 +2144,8 @@ styleFont st = Canvas.Font face size weight italic
     size =
       case st `cssValueMaybe` CSSFontSize of
         Just (CSS_Px px) -> px
-        Just other -> warning ("styleFont: unknown font-size=" ++ show other) defaultFontSize
+        Just other ->
+          warning ("styleFont: unknown font-size=" ++ show other) defaultFontSize
         Nothing -> defaultFontSize
     weight = (st `cssValueMaybe` CSSFontWeight == Just (CSS_Keyword "bold"))
     italic = (st `cssValueMaybe` CSSFontStyle == Just (CSS_Keyword "italic"))
@@ -2176,39 +2200,60 @@ buttonStyle = css
 -- | Default stylings for standard HTML elements.
 builtinHTMLStyles :: HM.HashMap Text Style
 builtinHTMLStyles = HM.fromList $
-     [ ("h1",       css [("font-size", "2.00em"), fontweight_bold])  -- TODO: use rem?
-     , ("h2",       css [("font-size", "1.50em"), fontweight_bold])
-     , ("h3",       css [("font-size", "1.17em"), fontweight_bold])
-     , ("h4",       css [("font-size", "1.00em"), fontweight_bold])
-     , ("h5",       css [("font-size", "0.83em"), fontweight_bold])
-     , ("h6",       css [("font-size", "0.75em"), fontweight_bold])
+     [ ("h1",       css [display_block, ("font-size", "2.00em"), fontweight_bold])-- TODO: use rem?
+     , ("h2",       css [display_block, ("font-size", "1.50em"), fontweight_bold])
+     , ("h3",       css [display_block, ("font-size", "1.17em"), fontweight_bold])
+     , ("h4",       css [display_block, ("font-size", "1.00em"), fontweight_bold])
+     , ("h5",       css [display_block, ("font-size", "0.83em"), fontweight_bold])
+     , ("h6",       css [display_block, ("font-size", "0.75em"), fontweight_bold])
      ] ++
      [ ("a",        css [color "#00e", display_inline, ("text-decoration", "underline")])
      , ("abbr",     inline)
      , ("acronym",  inline)
+     , ("address",  css [display_block])
+     , ("article",  css [display_block])
+     , ("aside",    css [display_block])
      , ("b",        css [fontweight_bold, display_inline])
      , ("bdo",      inline)
      , ("big",      css [("font-size", "117%"), display_inline])
-     , ("blockquote", css [("margin", "40px 15px")])
+     , ("blockquote", css [display_block, ("margin", "40px 15px")])
      , ("body",     bodyStyle)
      , ("button",   buttonStyle)
      , ("cite",     css [fontstyle_italic, display_inline])
      , ("code",     css [fontfamily defaultFontFaceMono, display_inline])
+     , ("dd",       css [display_block])
+     , ("detauls",  css [display_block])
      , ("dfn",      inline)
+     , ("dialog",   css [display_block])
+     , ("div",      css [display_block])
+     , ("dt",       css [display_block])
      , ("em",       css [fontstyle_italic, display_inline])
+     , ("fieldset", css [display_block])
+     , ("figcaption", css [display_block])
+     , ("figure",   css [display_block])
+     , ("footer",   css [display_block])
+     , ("form",     css [display_block])
+     , ("header",   css [display_block])
+     , ("hgroup",   css [display_block])
+     , ("hr",       css [display_block])
      , ("i",        css [fontstyle_italic, display_inline])
      , ("img",      inline)
      , ("input",    textinputStyle)   -- TODO: different types
      , ("kbd",      inline)
      , ("label",    inline)
      , ("li",       css [("display", "list-item")])
+     , ("main",     css [display_block])
      , ("map",      inline)
      , ("mark",     css [("background-color", "yellow"), display_inline])
+     , ("nav",      css [display_block])
      , ("object",   inline)
-     , ("pre",      css [("white-space", "pre"), ("margin", "13px 0"), fontfamily defaultFontFaceMono])
+     , ("ol",       css [display_block])
+     , ("p",        css [display_block])
+     , ("pre",      css [display_block, ("white-space", "pre"), ("margin", "13px 0"), fontfamily defaultFontFaceMono])
      , ("q",        inline)
      , ("samp",     inline)
      , ("script",   inline)
+     , ("section",  css [display_block])
      , ("select",   inline)
      , ("small",    css [("font-size", "83%"), display_inline])
      , ("span",     inline)
@@ -2216,12 +2261,15 @@ builtinHTMLStyles = HM.fromList $
      , ("strong",   css [fontweight_bold, display_inline])
      , ("sub",      inline)
      , ("sup",      inline)
+     , ("table",    css [display_block])
      , ("td",       inline)   -- TODO: proper tables
      , ("th",       inline)   -- TODO: proper tables
      , ("time",     inline)
      , ("textarea", inline)
+     , ("tr",       css [display_block])     -- TODO: proper tables
      , ("tt",       inline)
      , ("u",        css [("text-decoration", "underline"), display_inline])
+     , ("ul",       css [display_block])
      , ("var",      inline)
      ] ++
      [ ("script",   nodisplay)
@@ -2232,6 +2280,7 @@ builtinHTMLStyles = HM.fromList $
     inline = css [display_inline]
     nodisplay = css [("display", "none")]
     display_inline = ("display", "inline")
+    display_block = ("display", "block")
     fontstyle_italic = ("font-style", "italic")
     fontweight_bold = ("font-weight", "bold")
     fontfamily fam = ("font-family", T.pack $ show fam)
