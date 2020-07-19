@@ -37,9 +37,13 @@ import qualified Network.HTTP.Client.TLS as TLS
 import qualified Network.HTTP.Types.Header as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import           Network.HTTP.Types.URI (urlDecode)
+import qualified Web.FormUrlEncoded as Form
 
 import qualified Data.XML.Types as XML
 import qualified Text.HTML.DOM as HTML
+
+
+import           Vado.Types
 
 -- | Names
 type Chan a = Ch.TMChan a
@@ -54,6 +58,9 @@ httpHeader headers which = (T.toLower . T.decodeLatin1) <$> L.lookup which heade
 httpResponseContentType :: HTTP.Response HTTP.BodyReader -> Text
 httpResponseContentType resp =
   fromMaybe "application/octet-stream" $ httpHeader (HTTP.responseHeaders resp) "content-type"
+
+mimeTypeForm :: Bc.ByteString
+mimeTypeForm = T.encodeUtf8 "application/x-www-form-urlencoded"
 
 -- | Resource Manager: public interface
 -- | It exposes non-blocking operations that put requests into a queue.
@@ -82,6 +89,9 @@ requestGet :: Manager -> URI -> [Text] -> IO ()
 requestGet Manager{..} uri mimetypes =
   manReqChan `send` Get uri mimetypes
 
+requestPost :: Manager -> URI -> Content -> [Text] -> IO ()
+requestPost Manager{..} uri content mimetypes = manReqChan `send` Post uri content mimetypes
+
 requestCancel :: Manager -> URI -> IO ()
 requestCancel Manager{..} uri = manReqChan `send` Cancel uri
 
@@ -108,6 +118,7 @@ data Chunk
 data Content
   = ContentBytes Bs.ByteString
   | ContentXML XML.Document
+  | ContentForm (M.Map Text [Text])
   deriving (Eq)
 
 instance Show EventKind where
@@ -141,10 +152,9 @@ instance Show EventKind where
 
 instance Show Content where
   show = \case
-    ContentXML _ ->
-      "Resource.ContentXML "
-    ContentBytes bs ->
-      "Resource.ContentBytes <" ++ show (Bs.length bs) ++ " bytes>"
+    ContentXML _ -> "Resource.ContentXML "
+    ContentBytes bs -> "Resource.ContentBytes <" ++ show (Bs.length bs) ++ " bytes>"
+    ContentForm fields -> "Resource.ContentForm " ++ show fields
 
 waitEvent :: Manager -> IO Event
 waitEvent resman = do
@@ -168,6 +178,7 @@ drainEvents resman = go
 
 data Request
   = Get URI [Text]
+  | Post URI Content [Text]
   -- ^ request uri, possibly setting up a streaming parser in mimetypes
   | Cancel URI
   | Done URI        -- only for workers
@@ -187,7 +198,10 @@ eventloop inch outch state = do
     Quit ->
       CC.myThreadId >>= CC.killThread
     Get uri mimetypes -> do
-      tid <- CC.forkIO $ runStreaming mimetypes inch outch (manHTTPManager state) uri
+      tid <- CC.forkIO $ runStreaming mimetypes inch outch (manHTTPManager state) uri Nothing
+      eventloop inch outch $ state{ manThreadByURI = M.insert uri tid $ manThreadByURI state }
+    Post uri content mimetypes -> do
+      tid <- CC.forkIO $ runStreaming mimetypes inch outch (manHTTPManager state) uri (Just content)
       eventloop inch outch $ state{ manThreadByURI = M.insert uri tid $ manThreadByURI state }
     Done uri -> do
       eventloop inch outch $ state{ manThreadByURI = M.delete uri $ manThreadByURI state }
@@ -196,9 +210,11 @@ eventloop inch outch state = do
         CC.killThread tid
       eventloop inch outch $ state{ manThreadByURI = M.delete uri $ manThreadByURI state }
 
-runStreaming :: [Text] -> Chan Request -> Chan Event -> HTTP.Manager -> URI -> IO ()
-runStreaming mimetypes inch outch httpman uri = do
-    doHttp httpman uri maybeStreamBody
+runStreaming :: [Text] -> Chan Request -> Chan Event
+             -> HTTP.Manager -> URI -> Maybe Content
+             -> IO ()
+runStreaming mimetypes inch outch httpman uri mbContent = do
+    doHttp httpman uri mbContent maybeStreamBody
         `Exc.catch` \(e :: Exc.SomeException) -> outch `send` (uri, EventConnectionError e)
     inch `send` Done uri
   where
@@ -224,12 +240,29 @@ runStreaming mimetypes inch outch httpman uri = do
 
 type BodyHandler = (HTTP.Request, HTTP.Response HTTP.BodyReader) -> IO ()
 
-doHttp :: HTTP.Manager -> URI -> BodyHandler -> IO ()
-doHttp httpman uri onBody = do
-  req0 <- HTTP.parseRequest $ show uri
-  let req1 = req0 { HTTP.requestHeaders = [ (HTTP.hUserAgent, "Vado Browser") ] }
+doHttp :: HTTP.Manager -> URI -> Maybe Content -> BodyHandler -> IO ()
+doHttp httpman uri mbContent onBody = do
+  req0 <- HTTP.requestFromURI uri
+  let req1 = req0
+        { HTTP.requestHeaders =
+            [ (HTTP.hHost, Bc.pack $ uriRegName $ fromJust $ uriAuthority uri)
+            , (HTTP.hUserAgent, "Vado Browser")
+            ]
+        }
+  let req2 = case mbContent of
+        Just (ContentForm fields) ->
+          let lbs = Form.urlEncodeAsForm fields
+          in req1
+            { HTTP.method = "POST"
+            , HTTP.requestHeaders =
+               (HTTP.hContentType, mimeTypeForm) :
+               HTTP.requestHeaders req1
+            , HTTP.requestBody = HTTP.RequestBodyLBS lbs
+            }
+        Just other -> warning ("TODO: doHTTP POST for " ++ show other) req1
+        Nothing -> req1
 
-  HTTP.withResponseHistory req1 httpman $ \respHistory -> do
+  HTTP.withResponseHistory req2 httpman $ \respHistory -> do
     let req = HTTP.hrFinalRequest respHistory
     let resp = HTTP.hrFinalResponse respHistory
     onBody (req, resp)
@@ -285,3 +318,11 @@ test address = do
             _ -> return ()
           print (u, r)
     runConduit (Ch.sourceTMChan (manEventChan resman)  .| CL.mapM_ (liftIO . sink))
+
+testPost :: Text -> IO ()
+testPost address = do
+  resman <- runManager
+  let Just uri = URI.parseAbsoluteURI $ T.unpack address
+  requestPost resman uri (ContentForm $ M.fromList [("hello", ["world", "світ"])]) []
+  evt <- waitEvent resman
+  print evt

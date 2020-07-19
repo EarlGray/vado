@@ -30,6 +30,7 @@ library
                      , containers
                      , css-text
                      , html-conduit
+                     , http-api-data
                      , http-client
                      , http-client-tls
                      , http-types
