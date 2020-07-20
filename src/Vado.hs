@@ -132,6 +132,13 @@ runBrowserDocument f = BrowserT $ do
   doc' <- lift $ runDocument doc f
   modify $ \page -> page{ pageDocument = doc' }
 
+withBrowserDocument :: Monad m => DocumentT m a -> BrowserT m a
+withBrowserDocument f = do
+  doc <- gets pageDocument
+  (result, doc') <- lift $ St.runStateT f doc
+  modify $ \page -> page{ pageDocument = doc' }
+  return result
+
 logDebug :: String -> Browser ()
 logDebug msg = do
   debug <- gets pageDebugNetwork
@@ -158,7 +165,7 @@ data Document = Document
   , documentXMLType :: Maybe XML.Doctype
   , documentResources :: DOMResourceMap
   , documentResourcesLoading :: M.Map URI (S.Set ElementID)   -- to remember what's in flight
-  , documentResourceRequests :: [(URI, ElementID)]  -- to queue requests from inside DocumentT
+  , documentEvents :: [DocumentEvent]   -- to queue requests from inside DocumentT
   , documentCSSRules :: CSSRules
 
   , documentHead :: ElementID
@@ -181,7 +188,7 @@ emptyDocument = Document
   , documentXMLType = Nothing
   , documentResources = M.empty
   , documentResourcesLoading = M.empty
-  , documentResourceRequests = []
+  , documentEvents = []
   , documentCSSRules = emptyCSSRules
   , documentHead = noElement
   , documentBody = noElement
@@ -642,7 +649,7 @@ domEndHTMLElement name = do
                   Just u -> do
                     docuri <- gets documentLocation
                     let resuri = u `URI.relativeTo` docuri
-                    domResourceFetch nid resuri
+                    documentEnqueue $ DocResourceRequest nid resuri
           _ -> docWarn $ "unknown type in " ++ show node
 
       "img" -> do
@@ -730,17 +737,29 @@ domParseHTMLAttributes nid = do
     modify $ \doc -> doc{ documentFocus = nid }
 
 -- | Having an effect inside DocumentT m (): just queue them for the wrapper to handle.
-domResourceFetch :: Monad m => ElementID -> URI -> DocumentT m ()
-domResourceFetch nid href = modify $ \doc ->
-  let resuri = href `URI.relativeTo` documentLocation doc
-  in doc{ documentResourceRequests = (resuri, nid) : documentResourceRequests doc }
+data DocumentEvent
+  = DocResourceRequest ElementID URI
+  | DocEmitEvent ElementID EventName
+  deriving (Show)
 
-domEmitEvent :: Monad m => ElementID -> EventName -> DocumentT m ()
-domEmitEvent nid evt = docWarn $ "TODO: domEmitEvent @"++show nid++" "++T.unpack evt
+drainDocumentEvents :: Monad m => DocumentT m [DocumentEvent]
+drainDocumentEvents = do
+  resReqs <- gets (L.reverse . documentEvents)
+  modify $ \doc -> doc{ documentEvents = [] }
+  return resReqs
+
+documentEnqueue :: Monad m => DocumentEvent -> DocumentT m ()
+documentEnqueue event = modify $ \doc ->
+  doc{ documentEvents = event : documentEvents doc }
+
+domResourceFetch :: Monad m => ElementID -> URI -> DocumentT m ()
+domResourceFetch nid href = do
+  docuri <- gets documentLocation
+  documentEnqueue $ DocResourceRequest nid (href `URI.relativeTo` docuri)
 
 -- | Request a redraw for a node
 documentRedraw :: Monad m => ElementID -> DocumentT m ()
-documentRedraw _nid = docWarn "TODO: documentRedraw"
+documentRedraw nid = docWarn $ "TODO: documentRedraw @"++show nid
 
 -- HTML 5 misc
 
@@ -1016,6 +1035,10 @@ asyncEventLoop = forever $ do
     else
       logWarn $ "eventloop: unknown resource " ++ show u ++ " for event " ++ show event
 
+  -- DOM-emitted events
+  resReqs <- withBrowserDocument $ drainDocumentEvents
+  forM_ resReqs $ handleDOMEvent
+
 handleUIEvent :: SDL.Event -> Browser ()
 handleUIEvent event =
     case SDL.eventPayload event of
@@ -1035,11 +1058,11 @@ handleUIEvent event =
         changePage $ \page -> do
           -- print e
           let focused = documentFocus $ pageDocument page
-          Just <$> dispatchEvent focused event page
+          Just <$> dispatchEvent focused (Right event) page
 
       SDL.TextInputEvent _ -> changePage $ \page -> do
         let focused = documentFocus $ pageDocument page
-        Just <$> dispatchEvent focused event page
+        Just <$> dispatchEvent focused (Right event) page
 
       SDL.MouseWheelEvent e -> changePage $ \page -> do
         let V2 _ dy = mouseWheelEventPos e
@@ -1062,7 +1085,7 @@ handleUIEvent event =
                 liftIO $ putStrLn $ "MouseButtonEvent: focused @" ++ show nid
                 -- TODO: emit "focus" event for nid
               liftIO $ putStrLn $ "MouseButtonEvent: dispatchEvent @" ++ show nid
-              changePage $ \page -> Just <$> dispatchEvent nid event page
+              changePage $ \page -> Just <$> dispatchEvent nid (Right event) page
 
       SDL.KeyboardEvent _ -> return ()
       SDL.MouseMotionEvent _ -> return ()
@@ -1070,7 +1093,6 @@ handleUIEvent event =
 
 handlePageStreaming :: PageState -> Resource.EventKind -> Browser ()
 handlePageStreaming st event = do
-  debug <- gets pageDebugNetwork
   case (st, event) of
     (_, Resource.EventConnectionError exc) | st `elem` [PageConnecting, PageStreaming] ->
       changePage $ \page -> do
@@ -1093,19 +1115,6 @@ handlePageStreaming st event = do
       -- grow the DOM tree:
       runBrowserDocument $ htmlDOMFromEvents update
 
-      resman <- gets pageResMan
-      resReqs <- drainDocumentRequests
-      forM_ resReqs $ \(resuri, nid) -> do
-        if URI.uriScheme resuri /= "blob:" then do
-          when debug $ logWarn $ "eventloop: @" ++ show nid ++ " requests " ++ show resuri
-          runBrowserDocument $ documentMakeRequest resman resuri nid
-        else do
-          -- assumption: the only source of blobs are <img src="data:...">
-          node <- inBrowserDocument $ getElement nid
-          case M.lookup "src" $ elementAttrs node of
-            Just dataurl -> decodeResourceDataUrl nid resuri dataurl
-            _ -> logWarn $ "no src in @" ++ show nid
-
     (PageStreaming, Resource.EventStreamClose) ->
       changePage $ \page -> do
         Just <$> layoutPage page{ pageState = PageReady }
@@ -1118,9 +1127,22 @@ handlePageStreaming st event = do
       -- TODO: construct the page, go to PageReady/PageWaitResources
       error $ "TODO: eventloop: non-streaming page"
     -}
+
+handleDOMEvent :: DocumentEvent -> Browser ()
+handleDOMEvent (DocResourceRequest nid resuri) = do
+    resman <- gets pageResMan
+    if URI.uriScheme resuri /= "blob:" then do
+      logDebug $ "eventloop: @" ++ show nid ++ " requests " ++ show resuri
+      runBrowserDocument $ documentMakeRequest resman
+    else do
+      -- assumption: the only source of blobs are <img src="data:...">
+      node <- inBrowserDocument $ getElement nid
+      case M.lookup "src" $ elementAttrs node of
+        Just dataurl -> decodeResourceDataUrl dataurl
+        _ -> logWarn $ "no src in @" ++ show nid
   where
-    documentMakeRequest :: Resource.Manager -> URI -> ElementID -> DocumentT IO ()
-    documentMakeRequest resman resuri nid = do
+    documentMakeRequest :: Resource.Manager -> DocumentT IO ()
+    documentMakeRequest resman = do
       resources <- gets documentResources
       wereLoading <- gets documentResourcesLoading
       unless (resuri `M.member` wereLoading || resuri `M.member` resources) $
@@ -1130,12 +1152,7 @@ handlePageStreaming st event = do
       let nowLoading = multimapAdd nid resuri wereLoading
       modify $ \doc -> doc{ documentResourcesLoading = nowLoading }
 
-    drainDocumentRequests = do
-      resReqs <- inBrowserDocument $ gets (L.reverse . documentResourceRequests)
-      runBrowserDocument $ modify $ \doc -> doc{ documentResourceRequests = [] }
-      return resReqs
-
-    decodeResourceDataUrl nid resuri href = do
+    decodeResourceDataUrl href = do
       case Resource.decodeDataURL href of
         Left e ->
           logWarn $ "failed to decode data url in @" ++ show nid ++ ": " ++ e
@@ -1149,6 +1166,11 @@ handlePageStreaming st event = do
                 let resources0 = documentResources doc
                 let resources = M.insert resuri (res, S.singleton nid) resources0
                 doc{ documentResources = resources }
+
+handleDOMEvent (DocEmitEvent nid evt) = do
+  modifyPage (\p -> Just <$> dispatchEvent nid (Left evt) p)
+
+--handleDOMEvent other = logWarn $ "TODO: handleDOMEvent " ++ show other
 
 handleResourceEvent :: PageState -> URI -> Resource.EventKind -> Browser ()
 handleResourceEvent st uri event =
@@ -1324,7 +1346,7 @@ printHistory (back, forward) current = mapM_ putStrLn $
 -- Events, event handlers, event dispatch.
 
 type EventName = Text
-type EventHandler = SDL.Event -> ElementID -> Page -> IO Page
+type EventHandler = Either EventName SDL.Event -> ElementID -> Page -> IO Page
 
 -- | A set of events that an element may handle.
 -- TODO: refactor to a map + an enum of known enum names
@@ -1347,7 +1369,7 @@ noEvents = Events
   }
 
 -- TODO: button, modifiers, clientX/clientY
-dispatchEvent :: ElementID -> SDL.Event -> Page -> IO Page
+dispatchEvent :: ElementID -> Either EventName SDL.Event -> Page -> IO Page
 dispatchEvent nid event page0 = do
     -- TODO: stopPropagation()
     -- TODO: custom listeners and preventDefault()
@@ -1357,11 +1379,14 @@ dispatchEvent nid event page0 = do
   where
     handle page node = do
       let events = elementEvents $ elementDeref node
-      let listeners = case SDL.eventPayload event of
-            MouseButtonEvent _ -> eventsMouseReleased events
-            KeyboardEvent _ -> eventsKeyReleased events
-            TextInputEvent _ -> eventsTextInput events
-            _ -> []
+      let listeners = case event of
+            Right evsdl -> case SDL.eventPayload evsdl of
+              MouseButtonEvent _ -> eventsMouseReleased events
+              KeyboardEvent _ -> eventsKeyReleased events
+              TextInputEvent _ -> eventsTextInput events
+              _ -> []
+            Left evdom ->
+              fromMaybe [] $ evdom `M.lookup` eventsOther events
       foldM (\p listener -> listener event (elementRefID node) p) page listeners
 
 builtinHTMLEvents :: HM.HashMap Text Events
@@ -1434,13 +1459,14 @@ modify_input f node =
 input_onKeyReleased :: EventHandler
 input_onKeyReleased event nid page = runPageDocument page $ do
   -- TODO: it's not always a text input
-  let KeyboardEvent e = SDL.eventPayload event
+  let Right evsdl = event
+  let KeyboardEvent e = SDL.eventPayload evsdl
   let keysym = SDL.keyboardEventKeysym e
   case SDL.keysymKeycode keysym of
     SDL.KeycodeBackspace ->
       modifyElement nid $ modify_input (\case "" -> ""; t -> T.init t)
     SDL.KeycodeReturn ->
-      domEmitEvent nid "change"
+      documentEnqueue $ DocEmitEvent nid "change"
     -- TODO: Mac (GUI) keyboard layout support:
     SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
       clipboard <- lift $ SDL.getClipboardText
@@ -1451,7 +1477,8 @@ input_onKeyReleased event nid page = runPageDocument page $ do
 
 input_onTextInput :: EventHandler
 input_onTextInput event nid page = runPageDocument page $ do
-  let TextInputEvent e = SDL.eventPayload event
+  let Right evsdl = event
+  let TextInputEvent e = SDL.eventPayload evsdl
   let input = SDL.textInputEventText e
   -- lift $ putStrLn $ "input_onTextInput: " ++ T.unpack input
   modifyElement nid $ modify_input (`T.append` input)
@@ -1459,7 +1486,8 @@ input_onTextInput event nid page = runPageDocument page $ do
 
 body_onKeyReleased :: EventHandler
 body_onKeyReleased event _nid page = do
-  let SDL.KeyboardEvent e = SDL.eventPayload event
+  let Right evsdl = event
+  let SDL.KeyboardEvent e = SDL.eventPayload evsdl
   let modifiers = SDL.keysymModifier $ SDL.keyboardEventKeysym e
   --putStrLn $ "body_onKeyReleased: " ++ show e
   case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
@@ -1505,6 +1533,8 @@ body_onKeyReleased event _nid page = do
 form_onSubmit :: EventHandler
 form_onSubmit event nid page = do
   putStrLn $ "form_onSubmit: @"++show nid++" event="++show event
+  -- TODO: gather the parameters
+  -- TODO: make a streaming POST request
   return page
 
 --------------------------------------------------------------------------------
@@ -2368,7 +2398,8 @@ vadoHome =
     -- TODO: use a "change" event
     url_onKeyReleased :: EventHandler
     url_onKeyReleased event nid page = do
-      let KeyboardEvent e = SDL.eventPayload event
+      let Right evsdl = event
+      let KeyboardEvent e = SDL.eventPayload evsdl
       let keysym = SDL.keyboardEventKeysym e
       case SDL.keysymKeycode keysym of
         SDL.KeycodeReturn -> do
