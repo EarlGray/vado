@@ -13,6 +13,7 @@ import qualified Control.Monad.Identity as MId
 import           Control.Monad.RWS.Strict as RWS
 import           Control.Monad.State (StateT(..))
 import qualified Control.Monad.State as St
+import qualified Data.ByteString.Char8 as Bc
 import qualified Data.Char as C
 import qualified Data.Either as Ei
 import qualified Data.HashMap.Strict as HM
@@ -27,6 +28,7 @@ import qualified Data.Text.Encoding as TE
 import           Foreign.C.Types (CInt)
 import           Linear.V2 (V2(..))
 import qualified Network.HTTP.Client as HTTP
+import qualified Network.HTTP.Types.URI as URIh
 import           Network.URI as URI
 import qualified SDL
 import qualified SDL.Cairo as Cairo
@@ -392,16 +394,6 @@ elementDeref (nodes, nid) = nodes IM.! nid
 elementRefID :: ElementRef -> ElementID
 elementRefID (_, nid) = nid
 
-elemrefChildren :: ElementRef -> [ElementRef]
-elemrefChildren (nodes, nid) = maybe [] (nodeChildren . elementContent) $ IM.lookup nid nodes
-  where
-    nodeChildren (Right fid) | fid /= noElement = go fid fid
-    nodeChildren _ = []
-    go fid cid =
-      let cnode = nodes IM.! cid
-          next = nextSibling $ elementSiblings cnode
-      in (nodes, cid) : if next == fid then [] else go fid next
-
 elemrefAncestors :: ElementRef -> [ElementRef]
 elemrefAncestors (_nodes, nid) | nid == noElement = []
 elemrefAncestors (nodes, nid0) = go $ elementParent (nodes IM.! nid0)
@@ -428,6 +420,29 @@ elemrefNext (nodes, nid) =
       nextid = nextSibling $ elementSiblings node
   in if nid ==  || nid == previd then Nothing else Just (nodes, previd)
 -}
+
+elemrefChildren :: ElementRef -> [ElementRef]
+elemrefChildren (nodes, nid) = maybe [] (nodeChildren . elementContent) $ IM.lookup nid nodes
+  where
+    nodeChildren (Right fid) | fid /= noElement = go fid fid
+    nodeChildren _ = []
+    go fid cid =
+      let cnode = nodes IM.! cid
+          next = nextSibling $ elementSiblings cnode
+      in (nodes, cid) : if next == fid then [] else go fid next
+
+elemrefDescendants :: ElementRef -> [ElementRef]
+elemrefDescendants eltref =
+  concatMap (\elt -> elt : elemrefDescendants elt) $ elemrefChildren eltref
+
+querySelectorsAllRef :: [Selector] -> ElementRef -> [ElementRef]
+querySelectorsAllRef sels parent = do
+    mapMaybe checkNode $ elemrefDescendants parent
+  where
+    checkNode noderef =
+      if any (isJust . domMatchSelector noderef) sels
+      then Just noderef
+      else Nothing
 
 -- | This is a DOM node
 type ElementID = Int
@@ -980,31 +995,37 @@ webSearch :: String -> URI
 webSearch s = fromJust $ URI.parseAbsoluteURI $ "https://google.com/search?q=" ++ es
   where es = URI.escapeURIString URI.isAllowedInURI s
 
-navigatePage :: URI -> Page -> IO Page
-navigatePage uri page0 | uriScheme uri == "vado:" = do
-  case uriPath uri of
-    "home" -> do
-      -- TODO: cancel all pending resource requests
-      page <- layoutPage $ vadoPage vadoHome page0
-      return page
-        { pageState = PageReady
-        , pageHistory = historyRewind (pageHistory page) (pageUrl page) uri
-        }
-    _ ->
-      error $ "unknown address " ++ show uri
-navigatePage uri page = do
-  let resman = pageResMan page
-  let fullURI = uri `URI.relativeTo` (documentLocation $ pageDocument page)
-  -- TODO: check if fullURI is canonicalized:
-  liftIO $ do
-    Resource.requestGet resman fullURI ["text/html"]
-    when (pageDebugNetwork page) $ putStrLn $ "navigatePage " ++ show fullURI
-  return $ page
-    { pageState = PageConnecting
-    , pageUrl = fullURI
-    , pageHistory = historyRewind (pageHistory page) (pageUrl page) fullURI
-    }
+navigate :: Maybe Resource.Content -> URI -> Page -> IO Page
+navigate mbSend uri page =
+  if uriScheme uri == "vado:" then
+    case uriPath uri of
+      "home" -> do
+        -- TODO: cancel all pending resource requests
+        page1 <- layoutPage $ vadoPage vadoHome page
+        return page1
+          { pageState = PageReady
+          , pageHistory = historyRewind (pageHistory page1) (pageUrl page1) uri
+          }
+      _ ->
+        error $ "navigate: unknown address " ++ show uri
+  else do
+    let resman = pageResMan page
+    let fullURI = uri `URI.relativeTo` (documentLocation $ pageDocument page)
+    -- TODO: check if fullURI is canonicalized:
+    liftIO $ do
+      when (pageDebugNetwork page) $ putStrLn $ "navigatePage " ++ show fullURI
+      case mbSend of
+        Nothing -> Resource.requestGet resman fullURI ["text/html"]
+        Just content -> Resource.requestPost resman fullURI content ["text/html"]
+    return $ page
+      { pageState = PageConnecting
+      , pageUrl = fullURI
+      , pageHistory = historyRewind (pageHistory page) (pageUrl page) fullURI
+      }
   -- TODO: loading UI indicator, e.g. refresh button -> stop button
+
+navigatePage :: URI -> Page -> IO Page
+navigatePage = navigate Nothing
 
 -- | Page event loop.
 fps :: CInt
@@ -1025,7 +1046,7 @@ asyncEventLoop = forever $ do
     st <- gets pageState
     loading <- gets (documentResourcesLoading . pageDocument)
     case event of
-      Resource.EventStreamChunk _ -> return ()
+      --Resource.EventStreamChunk _ -> return ()
       _ -> logDebug $ "[" ++ show st ++ "] " ++ show (u, event)
 
     if u == uri then
@@ -1531,11 +1552,53 @@ body_onKeyReleased event _nid page = do
       return page
 
 form_onSubmit :: EventHandler
-form_onSubmit event nid page = do
-  putStrLn $ "form_onSubmit: @"++show nid++" event="++show event
-  -- TODO: gather the parameters
-  -- TODO: make a streaming POST request
-  return page
+form_onSubmit event formID page = do
+    putStrLn $ "form_onSubmit: @"++show formID++" event="++show event
+
+    -- gather the parameters:
+    formref <- inPageDocument page $ getElementRef formID
+    let controls = querySelectorsAllRef formControlSelectors formref
+    let values = mapMaybe (nodeFormValue . elementDeref) controls
+
+    let attrs = elementAttrs $ elementDeref formref
+    let formAction = fromMaybe undefined $ M.lookup "action" attrs -- TODO: default to docuri
+    case URI.parseURIReference $ T.unpack formAction of
+      Nothing ->
+        return $ warning ("form_onSubmit: cannot parse action="++T.unpack formAction) page
+      Just formURI -> do
+        case maybe "get" T.toLower $ M.lookup "method" attrs of
+          "get" -> do
+            let values' = map (\(k, v) -> (k, listToMaybe v)) values
+            let bsQuery = URIh.renderQuery True $ URIh.queryTextToQuery values'
+            let queryURI = formURI{ uriQuery = Bc.unpack bsQuery }
+            putStrLn $ "form_onSubmit: method=GET action="++show queryURI
+            navigatePage queryURI page
+          "post" -> do
+            -- TODO: check enctype
+            let fields = M.fromListWith mappend values
+            putStrLn $ "form_onSubmit: method=POST action="++show formURI++" form="++show fields
+            navigate (Just $ Resource.ContentForm fields) formURI page
+          other ->
+            return $ warning ("form_onSubmit: invalid method="++T.unpack other) page
+  where
+    formControlSelectors = [SelTag "input", SelTag "select", SelTag "textarea"]
+
+    nodeFormValue :: Element -> Maybe (Text, [Text])
+    nodeFormValue node | elementTag node == "input" =
+      let attrs = elementAttrs node
+      in case M.lookup "name" attrs <|> M.lookup "id" attrs of    -- TODO: check if can use "id"
+          Nothing -> warning ("Form control without name"++show node) Nothing
+          Just name ->
+            case M.lookup "type" attrs of
+              Just ty | ty `elem` ["hidden", "submit"] ->
+                Just (name, maybeToList $ M.lookup "value" attrs)
+              _ ->
+                case elementContent node of
+                  Left (InputTextContent value) -> Just (name, [value])
+                  other -> warning ("Unexpected content in <input>: "++ show other) $ Just (name, [])
+    nodeFormValue node =
+      warning ("form_onSubmit: cannot extract value from "++show node) Nothing
+
 
 --------------------------------------------------------------------------------
 -- Layout engine
@@ -2277,6 +2340,7 @@ builtinHTMLStyles = HM.fromList $
      , ("blockquote", css [display_block, ("margin", "40px 15px")])
      , ("body",     bodyStyle)
      , ("button",   buttonStyle)
+     , ("center",   css [("text-align", "center")])
      , ("cite",     css [fontstyle_italic, display_inline])
      , ("code",     css [fontfamily defaultFontFaceMono, display_inline])
      , ("dd",       css [display_block])
@@ -2384,7 +2448,7 @@ vadoHome =
       xmlNode' "body" [("style", "text-align: center; white-space: pre")]
         [ xmlNode "h1" [ xmlText "\n\n\nVado"]
         , xmlNode "hr" []
-        , xmlNode' "form" [("action", "vado:go"), ("method", "POST"), ("id", "the-form")]
+        , xmlNode' "notform" [("action", "vado:go"), ("method", "POST"), ("id", "the-form")]
           [ xmlNode' "input" inputAttrs []
           , xmlNode "br" []
           , xmlNode' "input" [("type", "submit"), ("value", "I go!")] []
