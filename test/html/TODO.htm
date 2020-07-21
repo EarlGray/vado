@@ -42,7 +42,12 @@
 <li>[DONE: 2020/07/11] CSS: parse <code>&lt;style&gt;</code> tags</li>
 <li>[DONE: 2020/07/17] CSS: load external stylesheets</li>
 <li>[DONE: 2020/07/18] HTML: fixing &lt;li&gt; without closing element</li>
+<li>[DONE: 2020/07/19] UI: focus element on click, defocus other elements</li>
+<li>[DONE: 2020/07/22] UI, Forms: <code>&lt;input type="submit"&gt;</code> event: emit and handle</li>
+<li>[DONE: 2020/07/19] UI, Forms: Network: sending an encoded form, POST requests</li>
 <li>[WIP] CSS, Layout: margins, borders and padding</li>
+<li>Network: do manual redirects to work around <code>http-client</code>'s broken cross-domain redirects</li>
+<li>HTML: redirect on &lt;meta http-equiv="Refresh"&gt;</li>
 <li>HTML bug: fix no<code>&lt;body&gt;</code></li>
 <li>HTML: disregarding SVG (SVGResource?)</li>
 <li>Refactor: BoxTree :: IntMap Box</li>
@@ -58,7 +63,6 @@
 <li>Misc: command-line options (e.g. default fonts)</li>
 <li>HTML, UI: &lt;ol&gt;, numbered lists</li>
 <li>UI: better text input widget</li>
-<li>UI: focus element on click, defocus other elements</li>
 <li>UI, HTML: walk focusable elements with <kbd>Tab</kbd> key, handling <code>tabindex</code></li>
 <li>UI: Mac and Linux/Windows keyboard shortcuts</li>
 <li>HTML: same-page links (<code>&lt;a href="#id"&gt;</code>)</li>
@@ -67,12 +71,6 @@
 <li>Misc: profiling, CPU and memory optimization</li>
 <li>Misc: persistent settings and cache (SQLite?)</li>
 <li>HTML: support for non-UTF encodings (e.g. piping through iconv?)</li>
-<li>Forms:
-  <ul>
-    <li>UI: <code>&lt;input type="submit"&gt;</code> event: emit and handle</li>
-    <li>Network: sending an encoded form, POST requests</li>
-  </ul>
-</li>
 <li>HTML: <code>&lt;audio&gt;</code> with offload to mplayer/mpv</li>
 <li>UI, CSS: buttons</li>
 <li>UI: optimized scroll (skiplist of subboxes in large boxes?) - blit copy + TileIndex</li>
