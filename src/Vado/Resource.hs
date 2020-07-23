@@ -244,10 +244,7 @@ doHttp :: HTTP.Manager -> URI -> Maybe Content -> BodyHandler -> IO ()
 doHttp httpman uri mbContent onBody = do
   req0 <- HTTP.requestFromURI uri
   let req1 = req0
-        { HTTP.requestHeaders =
-            [ (HTTP.hHost, Bc.pack $ uriRegName $ fromJust $ uriAuthority uri)
-            , (HTTP.hUserAgent, "Vado Browser")
-            ]
+        { HTTP.requestHeaders = [ (HTTP.hUserAgent, "Vado Browser") ]
         }
   let req2 = case mbContent of
         Just (ContentForm fields) ->
