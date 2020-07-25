@@ -72,6 +72,7 @@ intmapAppend val im = let (i, _) = IM.findMax im in IM.insert (i+1) val im
 data Page = Page
   { pageState :: PageState
   , pageDocument :: Document
+  , pageEvents :: IM.IntMap {-ElementID-} Events
   , pageBoxes :: Maybe BoxTree
   --, pageCSSRules :: CSSRules
   -- ^ Rendering tree
@@ -207,7 +208,6 @@ documentElement = Element
   , elementTag = ""
   , elementAttrs = M.empty
   , elementStylesheet = emptyStylesheet
-  , elementEvents = noEvents
   }
 
 instance HasDebugView Document where
@@ -367,20 +367,6 @@ domtreeEndElement = do
 --domtreeTraverse :: (Traversable t, Applicative f) => (ElementRef -> f b) -> Document -> f (t b)
 --domtreeTraverse = undefined
 
-addEventListener :: Monad m => ElementID -> EventName -> EventHandler -> DocumentT m ()
-addEventListener nid eventname handler = do
-  node <- getElement nid
-  let events = elementEvents node
-  let events' = case eventname of
-        "keyup" -> events{ eventsKeyReleased = handler : eventsKeyReleased events }
-        "click" -> events{ eventsMouseReleased = handler : eventsMouseReleased events }
-        "input" -> events{ eventsTextInput = handler : eventsTextInput events }
-        _ ->
-          let otherevts0 =  eventsOther events
-              otherevts = M.alter (\vs -> Just (handler : fromMaybe [] vs)) eventname otherevts0
-          in events{ eventsOther = otherevts }
-  setElement nid $ node{ elementEvents = events' }
-
 -- | ElementRef is useful for traversing the DOM without Document in context.
 -- ElementRef should not live longer that the current version of the IntMap storage.
 type ElementRef = (IM.IntMap Element, ElementID)
@@ -470,7 +456,6 @@ data Element = Element
   , elementAttrs :: M.Map Text Text
 
   , elementStylesheet :: Stylesheet
-  , elementEvents :: Events
   }
   deriving (Show)
 
@@ -481,7 +466,6 @@ emptyElement = Element
   , elementContent = Right noElement
   , elementTag = ""
   , elementAttrs = M.empty
-  , elementEvents = noEvents
   , elementStylesheet = emptyStylesheet
   }
 
@@ -513,7 +497,7 @@ instance Show DOMContent where
   show NewlineContent = "NewlineContent"
   show HorizLineContent = "HorizLineContent"
   show (ImageContent href wh) = "ImageContent " ++ show href ++ " (" ++ show wh ++ ")"
-  show (InputTextContent t) = "TextInputContent \"" ++ T.unpack t ++ "\""
+  show (InputTextContent t) = "InputTextContent \"" ++ T.unpack t ++ "\""
 
 
 -- Map from a URI to the resource and the list of elements that use this resource
@@ -744,8 +728,7 @@ domParseHTMLAttributes nid = do
         , stylesheetComputed = undefined
         }
   setElement nid $ node
-    { elementEvents = fromMaybe noEvents $ HM.lookup tag builtinHTMLEvents
-    , elementStylesheet = sheet{ stylesheetComputed = computedStyle sheet }
+    { elementStylesheet = sheet{ stylesheetComputed = computedStyle sheet }
     }
 
   whenJust (M.lookup "autofocus" attrs) $ \_ ->
@@ -976,6 +959,7 @@ vadoMain = do
   page0 <- layoutPage $ vadoPage vadoWait $ Page
     { pageState = PageReady
     , pageDocument = emptyDocument
+    , pageEvents = IM.empty
     , pageBoxes = Nothing
     , pageResMan = resman
     , pageUrl = fromJust $ URI.parseURI "vado:home"
@@ -1000,11 +984,11 @@ navigate mbSend uri page =
   if uriScheme uri == "vado:" then
     case uriPath uri of
       "home" -> do
-        -- TODO: cancel all pending resource requests
+        -- TODO: cancel all pending resource requests; clear resources
         page1 <- layoutPage $ vadoPage vadoHome page
-        return page1
-          { pageState = PageReady
-          , pageHistory = historyRewind (pageHistory page1) (pageUrl page1) uri
+        Just nid <- inPageDocument page1 $ getElementById "vado"
+        return (addEventListener nid "keyup" vadoHome_onKeyReleased page1)
+          { pageHistory = historyRewind (pageHistory page1) (pageUrl page1) uri
           }
       _ ->
         error $ "navigate: unknown address " ++ show uri
@@ -1079,11 +1063,11 @@ handleUIEvent event =
         changePage $ \page -> do
           -- print e
           let focused = documentFocus $ pageDocument page
-          Just <$> dispatchEvent focused (Right event) page
+          Just <$> dispatchEvent (Right event) focused page
 
       SDL.TextInputEvent _ -> changePage $ \page -> do
         let focused = documentFocus $ pageDocument page
-        Just <$> dispatchEvent focused (Right event) page
+        Just <$> dispatchEvent (Right event) focused page
 
       SDL.MouseWheelEvent e -> changePage $ \page -> do
         let V2 _ dy = mouseWheelEventPos e
@@ -1106,7 +1090,7 @@ handleUIEvent event =
                 liftIO $ putStrLn $ "MouseButtonEvent: focused @" ++ show nid
                 -- TODO: emit "focus" event for nid
               liftIO $ putStrLn $ "MouseButtonEvent: dispatchEvent @" ++ show nid
-              changePage $ \page -> Just <$> dispatchEvent nid (Right event) page
+              changePage $ \page -> Just <$> dispatchEvent (Right event) nid page
 
       SDL.KeyboardEvent _ -> return ()
       SDL.MouseMotionEvent _ -> return ()
@@ -1128,6 +1112,7 @@ handlePageStreaming st event = do
         return $ Just page
           { pageState = PageStreaming
           , pageDocument = emptyDocument{ documentLocation = finalURI }
+          , pageEvents = IM.empty
           , pageBoxes = Nothing
           , pageWindow = (pageWindow page){ windowScroll = 0 }
           }
@@ -1189,7 +1174,7 @@ handleDOMEvent (DocResourceRequest nid resuri) = do
                 doc{ documentResources = resources }
 
 handleDOMEvent (DocEmitEvent nid evt) = do
-  modifyPage (\p -> Just <$> dispatchEvent nid (Left evt) p)
+  modifyPage (\p -> Just <$> dispatchEvent (Left evt) nid p)
 
 --handleDOMEvent other = logWarn $ "TODO: handleDOMEvent " ++ show other
 
@@ -1367,7 +1352,14 @@ printHistory (back, forward) current = mapM_ putStrLn $
 -- Events, event handlers, event dispatch.
 
 type EventName = Text
-type EventHandler = Either EventName SDL.Event -> ElementID -> Page -> IO Page
+
+data EventContext = EventContext
+  { evctxPage :: Page
+  , evctxStopPropagation :: Bool
+  , evctxPreventDefault :: Bool
+  }
+
+type EventHandler = Either EventName SDL.Event -> ElementID -> StateT EventContext IO ()
 
 -- | A set of events that an element may handle.
 -- TODO: refactor to a map + an enum of known enum names
@@ -1390,25 +1382,67 @@ noEvents = Events
   }
 
 -- TODO: button, modifiers, clientX/clientY
-dispatchEvent :: ElementID -> Either EventName SDL.Event -> Page -> IO Page
-dispatchEvent nid event page0 = do
-    -- TODO: stopPropagation()
-    -- TODO: custom listeners and preventDefault()
-    -- TODO: page can change under ElementRefs; a page event loop
-    elt <- inPageDocument page0 $ getElementRef nid
-    foldM handle page0 (elt : elemrefAncestors elt)
+dispatchEvent :: Either EventName SDL.Event -> ElementID -> Page -> IO Page
+dispatchEvent event nid0 page0 = do
+    let ctx = EventContext
+          { evctxPage=page0
+          , evctxPreventDefault=False
+          , evctxStopPropagation=False
+          }
+    -- TODO: the "capture" propagation
+    evctxPage <$> St.execStateT (bubbleUp nid0) ctx
   where
-    handle page node = do
-      let events = elementEvents $ elementDeref node
-      let listeners = case event of
-            Right evsdl -> case SDL.eventPayload evsdl of
-              MouseButtonEvent _ -> eventsMouseReleased events
-              KeyboardEvent _ -> eventsKeyReleased events
-              TextInputEvent _ -> eventsTextInput events
-              _ -> []
-            Left evdom ->
-              fromMaybe [] $ evdom `M.lookup` eventsOther events
-      foldM (\p listener -> listener event (elementRefID node) p) page listeners
+    getNodeEvents :: ElementID -> Page -> Events
+    getNodeEvents nid page = fromMaybe noEvents $ IM.lookup nid $ pageEvents page
+
+    bubbleUp :: ElementID -> StateT EventContext IO ()
+    bubbleUp nid | nid == noElement =
+      return ()
+    bubbleUp nid = do
+      page <- gets evctxPage
+      -- custom events:
+      forM_ (listeners $ getNodeEvents nid page) $ \listener -> listener event nid
+
+      -- builtin events:
+      node <- inPageDocument page $ getElement nid
+      preventDefault <- gets evctxPreventDefault
+      unless preventDefault $
+        whenJust (HM.lookup (elementTag node) builtinHTMLEvents) $ \events -> do
+          forM_ (listeners events) $ \listener -> listener event nid
+
+      stopProp <- gets evctxStopPropagation
+      unless stopProp $ bubbleUp (elementParent node)
+
+    listeners :: Events -> [EventHandler]
+    listeners events = case event of
+      Right evsdl -> case SDL.eventPayload evsdl of
+        MouseButtonEvent _ -> eventsMouseReleased events
+        KeyboardEvent _ -> eventsKeyReleased events
+        TextInputEvent _ -> eventsTextInput events
+        _ -> []
+      Left evdom ->
+        fromMaybe [] $ evdom `M.lookup` eventsOther events
+
+addEventListener :: ElementID -> EventName -> EventHandler -> Page -> Page
+addEventListener nid eventname handler page =
+  let eventmap = pageEvents page
+      events = fromMaybe noEvents $ IM.lookup nid eventmap
+      events' = case eventname of
+        "keyup" -> events{ eventsKeyReleased = handler : eventsKeyReleased events }
+        "click" -> events{ eventsMouseReleased = handler : eventsMouseReleased events }
+        "input" -> events{ eventsTextInput = handler : eventsTextInput events }
+        _ ->
+          let otherevts0 =  eventsOther events
+              otherevts = M.alter (\vs -> Just (handler : fromMaybe [] vs)) eventname otherevts0
+          in events{ eventsOther = otherevts }
+  in page{ pageEvents = IM.insert nid events' eventmap }
+
+eventHandlerWithPage :: (Page -> IO Page) -> StateT EventContext IO ()
+eventHandlerWithPage f = do
+  page <- gets evctxPage
+  page' <- liftIO $ f page
+  modify $ \ctx -> ctx{ evctxPage = page' }
+
 
 builtinHTMLEvents :: HM.HashMap Text Events
 builtinHTMLEvents = HM.fromList
@@ -1427,16 +1461,21 @@ builtinHTMLEvents = HM.fromList
       })
   ]
 
+--
 clickLink :: EventHandler
-clickLink _event nid page = do
+clickLink _event nid = do
+  page <- gets evctxPage
   node <- inPageDocument page $ getElement nid
-  case M.lookup "href" $ elementAttrs node of
-    Just href -> do
-      case URI.parseURIReference $ T.unpack href of
-        Just uri -> navigatePage uri page
-        Nothing -> return page
-    Nothing ->
-      return page
+  whenJust ("href" `M.lookup` elementAttrs node) $ \href ->
+    whenJust (URI.parseURIReference $ T.unpack href) $ \uri -> do
+      page' <- liftIO $ navigatePage uri page
+      put EventContext
+        { evctxPage=page'
+        , evctxStopPropagation=True
+        , evctxPreventDefault=True
+        }
+
+-- Keyboard handlers helpers
 
 noKeyModifiers :: SDL.KeyModifier
 noKeyModifiers = SDL.KeyModifier
@@ -1468,7 +1507,6 @@ isKeyAltPressed mods =
   (SDL.keyModifierLeftAlt mods || SDL.keyModifierRightAlt mods) &&
   (mods{ SDL.keyModifierLeftAlt=False, SDL.keyModifierRightAlt=False } == noKeyModifiers)
 
-
 --- Text input events
 
 modify_input :: (Text -> Text) -> Element -> Element
@@ -1478,40 +1516,44 @@ modify_input f node =
     _ -> warning ("an input event not on a text input: " ++ show node) node
 
 input_onKeyReleased :: EventHandler
-input_onKeyReleased event nid page = runPageDocument page $ do
-  -- TODO: it's not always a text input
-  let Right evsdl = event
-  let KeyboardEvent e = SDL.eventPayload evsdl
-  let keysym = SDL.keyboardEventKeysym e
-  case SDL.keysymKeycode keysym of
-    SDL.KeycodeBackspace ->
-      modifyElement nid $ modify_input (\case "" -> ""; t -> T.init t)
-    SDL.KeycodeReturn ->
-      documentEnqueue $ DocEmitEvent nid "change"
-    -- TODO: Mac (GUI) keyboard layout support:
-    SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
-      clipboard <- lift $ SDL.getClipboardText
-      modifyElement nid $ modify_input (const clipboard)
-    _ -> return ()
-    --  lift $ putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
-  documentRedraw nid
+input_onKeyReleased event nid =
+  eventHandlerWithPage $ \page -> runPageDocument page $ do
+    -- TODO: it's not always a text input
+    let Right evsdl = event
+    let KeyboardEvent e = SDL.eventPayload evsdl
+    let keysym = SDL.keyboardEventKeysym e
+    case SDL.keysymKeycode keysym of
+      SDL.KeycodeBackspace ->
+        modifyElement nid $ modify_input (\case "" -> ""; t -> T.init t)
+      SDL.KeycodeReturn ->
+        documentEnqueue $ DocEmitEvent nid "change"
+      -- TODO: Mac (GUI) keyboard layout support:
+      SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
+        clipboard <- lift $ SDL.getClipboardText
+        modifyElement nid $ modify_input (const clipboard)
+      _ -> return ()
+      --  lift $ putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
+    documentRedraw nid
 
 input_onTextInput :: EventHandler
-input_onTextInput event nid page = runPageDocument page $ do
-  let Right evsdl = event
-  let TextInputEvent e = SDL.eventPayload evsdl
-  let input = SDL.textInputEventText e
-  -- lift $ putStrLn $ "input_onTextInput: " ++ T.unpack input
-  modifyElement nid $ modify_input (`T.append` input)
-  documentRedraw nid
+input_onTextInput event nid = do
+  eventHandlerWithPage $ \page ->
+    runPageDocument page $ do
+      let Right evsdl = event
+      let TextInputEvent e = SDL.eventPayload evsdl
+      let input = SDL.textInputEventText e
+      -- lift $ putStrLn $ "input_onTextInput: " ++ T.unpack input
+      modifyElement nid $ modify_input (`T.append` input)
+      documentRedraw nid
 
 body_onKeyReleased :: EventHandler
-body_onKeyReleased event _nid page = do
+body_onKeyReleased event _nid = do
+  page <- gets evctxPage
   let Right evsdl = event
   let SDL.KeyboardEvent e = SDL.eventPayload evsdl
   let modifiers = SDL.keysymModifier $ SDL.keyboardEventKeysym e
   --putStrLn $ "body_onKeyReleased: " ++ show e
-  case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
+  page' <- liftIO $ case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
     SDL.KeycodeE | isKeyCtrlShiftPressed modifiers -> do
       let debug = not $ pageDebugNetwork page
       putStrLn $ "Setting pageDebugNetwork to " ++ show debug
@@ -1550,10 +1592,12 @@ body_onKeyReleased event _nid page = do
         _ -> return page
     _ ->
       return page
+  modify $ \ctx -> ctx{ evctxPage = page' }
 
 form_onSubmit :: EventHandler
-form_onSubmit event formID page = do
-    putStrLn $ "form_onSubmit: @"++show formID++" event="++show event
+form_onSubmit event formID = do
+    logWarn $ "form_onSubmit: @"++show formID++" event="++show event
+    page <- gets evctxPage
 
     -- gather the parameters:
     formref <- inPageDocument page $ getElementRef formID
@@ -1564,22 +1608,28 @@ form_onSubmit event formID page = do
     let formAction = fromMaybe undefined $ M.lookup "action" attrs -- TODO: default to docuri
     case URI.parseURIReference $ T.unpack formAction of
       Nothing ->
-        return $ warning ("form_onSubmit: cannot parse action="++T.unpack formAction) page
+        logWarn $ "form_onSubmit: cannot parse action="++T.unpack formAction
       Just formURI -> do
-        case maybe "get" T.toLower $ M.lookup "method" attrs of
+        page' <- liftIO $ case maybe "get" T.toLower $ M.lookup "method" attrs of
           "get" -> do
             let values' = map (\(k, v) -> (k, listToMaybe v)) values
             let bsQuery = URIh.renderQuery True $ URIh.queryTextToQuery values'
             let queryURI = formURI{ uriQuery = Bc.unpack bsQuery }
-            putStrLn $ "form_onSubmit: method=GET action="++show queryURI
+            logWarn $ "form_onSubmit: method=GET action="++show queryURI
             navigatePage queryURI page
           "post" -> do
             -- TODO: check enctype
             let fields = M.fromListWith mappend values
-            putStrLn $ "form_onSubmit: method=POST action="++show formURI++" form="++show fields
-            navigate (Just $ Resource.ContentForm fields) formURI page
+            logWarn $ "form_onSubmit: method=POST action="++show formURI++" form="++show fields
+            liftIO $ navigate (Just $ Resource.ContentForm fields) formURI page
           other ->
             return $ warning ("form_onSubmit: invalid method="++T.unpack other) page
+
+        put EventContext
+          { evctxPage = page'
+          , evctxStopPropagation = True
+          , evctxPreventDefault = True
+          }
   where
     formControlSelectors = [SelTag "input", SelTag "select", SelTag "textarea"]
 
@@ -1690,7 +1740,9 @@ elementToBoxes :: CanMeasureText m =>
      LayoutCtx -> LayoutParams -> Style -> ElementRef ->
      m (BoxTree, LayoutCtx)
 elementToBoxes ctx params parentStyle node = do
-    let st = (elementStylesheet $ elementDeref node) `cascadeStyle` parentStyle
+    let st0 = elementStylesheet $ elementDeref node
+    -- TODO: fix style up if font-size is not in pixels at this point
+    let st = st0 `cascadeStyle` parentStyle
     let doLayout = runLayout $ do
             forM_ (elemrefChildren node) layoutElement
             layoutLineBreak
@@ -2265,9 +2317,8 @@ styleFont st = Canvas.Font face size weight italic
     size =
       case st `cssValueMaybe` CSSFontSize of
         Just (CSS_Px px) -> px
-        Just other ->
-          warning ("styleFont: unknown font-size=" ++ show other) defaultFontSize
-        Nothing -> defaultFontSize
+        --Just other -> warning ("styleFont: unknown font-size=" ++ show other) defaultFontSize
+        _ -> defaultFontSize
     weight = (st `cssValueMaybe` CSSFontWeight == Just (CSS_Keyword "bold"))
     italic = (st `cssValueMaybe` CSSFontStyle == Just (CSS_Keyword "italic"))
 
@@ -2433,6 +2484,7 @@ vadoPage doc page = page
   { pageState = PageReady
   , pageDocument = doc
   , pageBoxes = Nothing
+  , pageEvents = IM.empty
   , pageWindow = (pageWindow page){ windowScroll = 0 }
   }
 
@@ -2441,9 +2493,6 @@ vadoHome =
   MId.runIdentity $ fromEmptyDocument $ do
     modify $ \doc -> doc{ documentLocation = fromJust $ URI.parseURI "vado:home" }
     htmlDOMFromXML $ xmlHtml body
-    mbNid <- getElementById "vado"
-    whenJust mbNid $ \nid ->
-      addEventListener nid "keyup" url_onKeyReleased
   where
     body =
       xmlNode' "body" [("style", "text-align: center; white-space: pre")]
@@ -2460,24 +2509,32 @@ vadoHome =
         , ("class", "test1 test2"), ("autofocus", "")
         ]
 
-    -- TODO: use a "change" event
-    url_onKeyReleased :: EventHandler
-    url_onKeyReleased event nid page = do
-      let Right evsdl = event
-      let KeyboardEvent e = SDL.eventPayload evsdl
-      let keysym = SDL.keyboardEventKeysym e
-      case SDL.keysymKeycode keysym of
-        SDL.KeycodeReturn -> do
-          -- get the address
-          node <- inPageDocument page $ getElement nid
-          let Left (InputTextContent address) = elementContent node
-          -- set up the waiting page
-          layoutPage (vadoPage vadoWait page) >>= renderDOM
-          -- decide where to go
-          let mbHref =  URI.parseURI $ T.unpack address
-          let href = fromMaybe (webSearch $ T.unpack address) mbHref
-          navigatePage href page
-        _ -> return page
+-- TODO: use a "change" event
+vadoHome_onKeyReleased :: EventHandler
+vadoHome_onKeyReleased event nid = do
+  let Right evsdl = event
+  let KeyboardEvent e = SDL.eventPayload evsdl
+  let keysym = SDL.keyboardEventKeysym e
+  case SDL.keysymKeycode keysym of
+    SDL.KeycodeReturn -> do
+      -- get the address
+      page <- gets evctxPage
+      node <- inPageDocument page $ getElement nid
+      liftIO $ print node
+      let Left (InputTextContent address) = elementContent node
+      -- set up the waiting page
+      liftIO (layoutPage (vadoPage vadoWait page) >>= renderDOM)
+      -- decide where to go
+      let mbHref =  URI.parseURI $ T.unpack address
+      let href = fromMaybe (webSearch $ T.unpack address) mbHref
+      page' <- liftIO $ navigatePage href page
+      put EventContext
+        { evctxPage = page'
+        , evctxStopPropagation = True
+        , evctxPreventDefault = True
+        }
+    _ ->
+      return ()
 
 
 vadoError :: Text -> Document

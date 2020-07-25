@@ -84,8 +84,8 @@ overriding new old = Style
 -- | Given a node and a parent style, compute cascaded node style
 cascadeStyle :: Stylesheet -> Style -> Style
            -- this module should not need this
-cascadeStyle Stylesheet{..} parentStyle = Style
-    { styleInherit = compInherit `merge` styleInherit parentStyle
+cascadeStyle Stylesheet{..} inheritedStyle = Style
+    { styleInherit = compInherit `merge` styleInherit inheritedStyle
     , styleOwn = compOwn
     }
   where
