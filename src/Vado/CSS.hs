@@ -928,6 +928,11 @@ cssLength = \case
   CSS_Pt pt -> Just (pt * 4/3)
   _ -> Nothing
 
+stylePreservesNewlines :: Style -> Bool
+stylePreservesNewlines st =
+  case st `cssValueMaybe` CSSWhiteSpace of
+    Just (CSS_Keyword "pre") -> True
+    _ -> False
 
 -- interactive UI elements must stand out from the surrounding elements,
 -- unless explicitly overriden.

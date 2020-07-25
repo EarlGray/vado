@@ -1,15 +1,32 @@
 module Vado.Types where
 
+import           Control.Monad (forM_)
 import qualified Data.Map as M
+import           Data.Maybe (listToMaybe)
 import           Debug.Trace as Trace
+import           Text.Read (readMaybe)
 
 import           Data.Text (Text)
+import qualified Data.Text as T
+
+-- | This is a omnipresent module for the project.
 
 type TagName = Text
 type TagAttrs = (Text, M.Map Text Text)
 
 warning :: String -> a -> a
 warning msg = Trace.trace msg
+
+-- Meaningful names:
+
+whenJust :: Monad m => Maybe a -> (a -> m ()) -> m ()
+whenJust = forM_
+
+mbHead :: [a] -> Maybe a
+mbHead = listToMaybe
+
+mbReadText :: Read a => Text -> Maybe a
+mbReadText = readMaybe . T.unpack
 
 
 class HasDebugView a where
