@@ -2,3 +2,7 @@ resolver: lts-12.26
 extra-deps:
 - git: https://github.com/chrisdone/sdl2-cairo.git
   commit: fab0d5128feefe0941336af79d8b3ad63c5db00c
+- git: https://github.com/haskell-game/sdl2.git
+  commit: c2a6d4f3e132a4db16c64f3fcdd0e2ee30ada9a3
+- git: https://github.com/haskell-game/sdl2-image.git
+  commit: 382395c763b473032721c71921b5c9241142178f
