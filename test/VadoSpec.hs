@@ -2,6 +2,7 @@
 
 module VadoSpec (spec) where
 
+import Data.Maybe (fromJust)
 import Test.Hspec
 import Vado
 import Vado.CSS
@@ -62,7 +63,7 @@ spec = do
   describe "domMatchSelector" $ do
     let match = domMatchSelector
     let doc = vadoHome -- TODO: a test document
-    Just eid <- inDocument doc $ getElementById "vado"
+    eid <- fmap fromJust $ inDocument doc $ getElementById "vado"
     let elt = elementRef doc eid
     it "*" $ match elt SelAny `shouldBe` Just (0, 0, 0)
     it "tag" $ match elt (SelTag "input") `shouldBe` Just (0, 0, 1)

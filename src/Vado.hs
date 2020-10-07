@@ -2441,8 +2441,9 @@ vadoHome =
   MId.runIdentity $ fromEmptyDocument $ do
     modify $ \doc -> doc{ documentLocation = fromJust $ URI.parseURI "vado:home" }
     htmlDOMFromXML $ xmlHtml body
-    Just nid <- getElementById "vado"
-    addEventListener nid "keyup" url_onKeyReleased
+    mbNid <- getElementById "vado"
+    whenJust mbNid $ \nid ->
+      addEventListener nid "keyup" url_onKeyReleased
   where
     body =
       xmlNode' "body" [("style", "text-align: center; white-space: pre")]
