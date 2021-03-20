@@ -73,8 +73,8 @@ data Manager = Manager
 
 runManager :: IO Manager
 runManager = do
-  inch <- atomically $ Ch.newTMChan
-  outch <- atomically $ Ch.newTMChan
+  inch <- atomically Ch.newTMChan
+  outch <- atomically Ch.newTMChan
   httpman <- HTTP.newManager TLS.tlsManagerSettings
   _ <- CC.forkIO $ do
     eventloop inch outch (ManagerState M.empty httpman)
@@ -127,23 +127,23 @@ instance Show EventKind where
       ["EventStreamMetadata " ++ maybe "" T.unpack mbStreamType
       , "> " ++ show (HTTP.method req) ++ " " ++ show (HTTP.path req) ++ " " ++ show ver
       ]
-      ++ (map (\(name, value) -> "> " ++ show name ++ ": " ++ show value) reqh)
+      ++ map (\(name, value) -> "> " ++ show name ++ ": " ++ show value) reqh
       ++ ["< " ++ show (HTTP.statusCode status) ++ " " ++ show (HTTP.statusMessage status)]
-      ++ (map (\(name, value) -> "< " ++ show name ++ ": " ++ show value) resph)
+      ++ map (\(name, value) -> "< " ++ show name ++ ": " ++ show value) resph
     where
       ver = HTTP.requestVersion req
       reqh = HTTP.requestHeaders req
       status = HTTP.responseStatus resp
       resph = HTTP.responseHeaders resp
+  show EventStreamClose = "EventStreamClose"
   show (EventStreamChunk chunk) = "EventStreamChunk " ++ show chunk
-  show (EventStreamClose) = "EventStreamClose"
   show (EventContentReady (req, resp) content) = unlines $
       ["EventContentReady " ++ show content
       , "> " ++ show (HTTP.method req) ++ " " ++ show (HTTP.path req) ++ " " ++ show ver
       ]
-      ++ (map (\(name, value) -> "> " ++ show name ++ ": " ++ show value) reqh)
+      ++ map (\(name, value) -> "> " ++ show name ++ ": " ++ show value) reqh
       ++ ["< " ++ show (HTTP.statusCode status) ++ " " ++ show (HTTP.statusMessage status)]
-      ++ (map (\(name, value) -> "< " ++ show name ++ ": " ++ show value) resph)
+      ++ map (\(name, value) -> "< " ++ show name ++ ": " ++ show value) resph
     where
       ver = HTTP.requestVersion req
       reqh = HTTP.requestHeaders req

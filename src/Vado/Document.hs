@@ -155,7 +155,7 @@ getElementRef nid = do
 getElementById :: Monad m => Text -> DocumentT m (Maybe ElementID)
 getElementById eid = do
   nodes <- IM.toList <$> gets documentAllNodes
-  return $ fmap fst $ L.find (\(_, elt) -> M.lookup "id" (elementAttrs elt) == Just eid) nodes
+  return $ fst <$> L.find (\(_, elt) -> M.lookup "id" (elementAttrs elt) == Just eid) nodes
 
 alterNode :: Monad m => ElementID -> (Maybe Element -> Maybe Element) -> DocumentT m ()
 alterNode nid f = do
@@ -222,7 +222,7 @@ emptyElement = Element
 
 elementAttrWords :: Text -> Element -> [Text]
 elementAttrWords attr node =
-  fromMaybe [] $ fmap T.words $ M.lookup attr (elementAttrs node)
+  maybe [] T.words $ M.lookup attr (elementAttrs node)
 
 elementTagAttrs :: Element -> TagAttrs
 elementTagAttrs node = (elementTag node, elementAttrs node)
@@ -356,7 +356,7 @@ domMatchSelector elt sel =
       in liftA2 addSpecty match1 match2
     SelDescends s1 s2 ->
       let match1 = domMatchSelector elt s1
-          match2 = listToMaybe $ mapMaybe (\el -> domMatchSelector el s2) $ elemrefAncestors elt
+          match2 = listToMaybe $ mapMaybe (`domMatchSelector` s2) $ elemrefAncestors elt
       in liftA2 addSpecty match1 match2
 
     SelAnd sels ->
@@ -373,7 +373,7 @@ domMatchSelector elt sel =
 
 
 
--- | Having an effect inside DocumentT m (): just queue them for the wrapper to handle.
+-- | Having an effect inside DocumentT m (): just queue them for the outside to handle.
 type EventName = Text
 
 data DocumentEvent
@@ -537,7 +537,7 @@ domStartHTMLElement (tag, attrs) = do
   -- insert
   let node = emptyElement { elementTag = tag, elementAttrs = attrs }
   nid <- domtreeStartElement pid node
-  modify $ \doc -> doc{ documentBuildState = (nid:opened) }
+  modify $ \doc -> doc{ documentBuildState = nid:opened }
 
   domParseHTMLAttributes nid
 
@@ -582,7 +582,7 @@ domEndHTMLElement name = do
             Just "text" -> InputTextContent value
             Just "password" -> InputTextContent value    -- TODO: a password input
             Just "button" -> TextContent value
-            Just "checkbox" -> TextContent $ maybe "\x2610" (\_ -> "\x2611") $ M.lookup "checked" attrs
+            Just "checkbox" -> TextContent $ maybe "\x2610" (const "\x2611") $ M.lookup "checked" attrs
             Just "submit" -> TextContent $ fromMaybe "submit" $ M.lookup "value" attrs
             Just "hidden" -> TextContent ""
             inpty -> warning ("Unknown input type: " ++ show inpty) $ TextContent ""
@@ -728,7 +728,7 @@ elementTabIndex node =
 --------------------------------------------------------------------------------
 -- XML Utilities
 
-decodeAttr :: Read a => Text -> (M.Map Text Text) -> Maybe a
+decodeAttr :: Read a => Text -> M.Map Text Text -> Maybe a
 decodeAttr attr attrs = mbReadText =<< M.lookup attr attrs
 
 tagName :: XML.Element -> Text

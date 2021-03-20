@@ -190,7 +190,7 @@ navigate mbSend uri page =
         error $ "navigate: unknown address " ++ show uri
   else do
     let resman = pageResMan page
-    let fullURI = uri `URI.relativeTo` (documentLocation $ pageDocument page)
+    let fullURI = uri `URI.relativeTo` documentLocation (pageDocument page)
     -- TODO: check if fullURI is canonicalized:
     liftIO $ do
       when (pageDebugNetwork page) $ putStrLn $ "navigatePage " ++ show fullURI
@@ -277,8 +277,8 @@ asyncEventLoop = forever $ do
       logWarn $ "eventloop: unknown resource " ++ show u ++ " for event " ++ show event
 
   -- DOM-emitted events
-  resReqs <- withBrowserDocument $ drainDocumentEvents
-  forM_ resReqs $ handleDOMEvent
+  resReqs <- withBrowserDocument $ do drainDocumentEvents
+  forM_ resReqs $ do handleDOMEvent
 
 handleUIEvent :: SDL.Event -> Browser ()
 handleUIEvent event =
@@ -421,7 +421,7 @@ handleResourceEvent st uri event =
       let nodes = wereLoading M.! uri
       runBrowserDocument $ do
         loading <- gets (M.delete uri . documentResourcesLoading)
-        when (M.null loading) $ liftIO $ putStrLn $ "All resources are ready"
+        when (M.null loading) $ liftIO $ putStrLn "All resources are ready"
         modify $ \doc -> doc{ documentResourcesLoading = loading }
 
       let contentType = Resource.httpResponseContentType resp
@@ -472,7 +472,7 @@ handleResourceEvent st uri event =
                       mbW = decodeAttr "width" attrs :: Maybe Double
                       mbH = decodeAttr "height" attrs :: Maybe Double
                   in liftA2 V2 mbW mbH
-            return $ any isNothing $ map maybeWH $ S.toList nodes
+            return $ any (isNothing . maybeWH) $ S.toList nodes
           if needsLayout then do
             logDebug $ "Relayout caused by " ++ show uri
             changePage $ \p -> Just <$> layoutPage p
@@ -482,7 +482,7 @@ handleResourceEvent st uri event =
       logDebug $ "ERROR: "++show uri++" : " ++ show exc
       runBrowserDocument $ do
         loading <- gets (M.delete uri . documentResourcesLoading)
-        when (M.null loading) $ liftIO $ putStrLn $ "All resources are ready"
+        when (M.null loading) $ liftIO $ putStrLn "All resources are ready"
         modify $ \doc -> doc{ documentResourcesLoading = loading }
 
     _ ->
@@ -1053,7 +1053,7 @@ newtype LayoutOver m a
 -- | Entry point for layout procedure
 layoutPage :: Page -> IO Page
 layoutPage page@Page{..} | documentBody pageDocument == noElement =
-  return $ warning ("layoutPage: no body") page
+  return $ warning "layoutPage: no body" page
 layoutPage page = do
     let doc = pageDocument page
     let ctx = LayoutCtx { ltResources = documentResources doc }
