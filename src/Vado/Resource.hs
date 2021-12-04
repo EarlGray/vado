@@ -8,7 +8,7 @@ module Vado.Resource where
 import           Control.Applicative hiding (empty)
 import qualified Control.Exception as Exc   -- TODO: safe-exceptions?
 import           Control.Monad (forM_)
-import           Control.Monad.IO.Class (liftIO)
+import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Control.Monad.Trans.Resource (runResourceT)
 
 import qualified Data.ByteString as Bs
@@ -48,8 +48,8 @@ import           Vado.Types
 -- | Names
 type Chan a = Ch.TMChan a
 
-send :: Chan a -> a -> IO ()
-send chan message = atomically $ Ch.writeTMChan chan message
+send :: MonadIO m => Chan a -> a -> m ()
+send chan message = liftIO $ atomically $ Ch.writeTMChan chan message
 
 -- | Utils
 httpHeader :: [HTTP.Header] -> HTTP.HeaderName -> Maybe Text

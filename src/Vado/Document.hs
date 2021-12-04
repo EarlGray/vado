@@ -544,7 +544,7 @@ domStartHTMLElement (tag, attrs) = do
 domAppendHTMLContent :: Monad m => Maybe TagAttrs -> DOMContent -> DocumentT m ()
 domAppendHTMLContent mbTagAttrs content = do
   opened <- gets documentBuildState
-  when (L.null opened) $ error "domAppendHTMLContent: no opened elements"
+  when (null opened) $ error "domAppendHTMLContent: no opened elements"
   let pid = head opened
   nid <- domtreeAppendChild pid mbTagAttrs content
   domParseHTMLAttributes nid
@@ -557,10 +557,12 @@ domEndHTMLElement name = do
     let attrs = elementAttrs node
 
     -- hr, br and such are not containers, change their content if needed:
-    let fixupContent nid' content = modifyElement nid' $ \node' ->
-          if elementContent node' == Right noElement
-          then node' { elementContent = Left content }
-          else error $ "fixupContent: expected an empty container in " ++ show node'
+    let fixupContent nid' content = do
+            doc <- St.get
+            modifyElement nid' $ \node' ->
+              if elementContent node' == Right noElement
+              then node' { elementContent = Left content }
+              else error $ warning (showdbg doc) $ "fixupContent: expected an empty container in " ++ show node'
 
     case elementTag node of
       "title" -> do

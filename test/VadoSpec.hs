@@ -2,11 +2,10 @@
 
 module VadoSpec (spec) where
 
-import Data.Maybe (fromJust)
+--import Data.Maybe (fromJust)
 import Test.Hspec
-import Vado
-import Vado.CSS
-
+import           Vado.CSS
+import           Vado.Layout (textTokens, chunksFromTokens)
 
 spec :: Spec
 spec = do

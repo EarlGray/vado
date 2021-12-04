@@ -18,6 +18,7 @@ library
       Vado
       Vado.CSS
       Vado.Document
+      Vado.Layout
       Vado.Resource
       Vado.Types
   other-modules:       Paths_vado

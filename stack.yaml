@@ -5,5 +5,6 @@ packages:
 extra-deps:
 - cairo-0.13.8.1
 - gtk2hs-buildtools-0.13.8.0
+- html-conduit-1.3.2.2
 - git: https://github.com/chrisdone/sdl2-cairo.git
   commit: fab0d5128feefe0941336af79d8b3ad63c5db00c
