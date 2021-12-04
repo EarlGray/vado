@@ -557,10 +557,12 @@ domEndHTMLElement name = do
     let attrs = elementAttrs node
 
     -- hr, br and such are not containers, change their content if needed:
-    let fixupContent nid' content = modifyElement nid' $ \node' ->
-          if elementContent node' == Right noElement
-          then node' { elementContent = Left content }
-          else error $ "fixupContent: expected an empty container in " ++ show node'
+    let fixupContent nid' content = do
+            doc <- St.get
+            modifyElement nid' $ \node' ->
+              if elementContent node' == Right noElement
+              then node' { elementContent = Left content }
+              else error $ warning (showdbg doc) $ "fixupContent: expected an empty container in " ++ show node'
 
     case elementTag node of
       "title" -> do

@@ -1,6 +1,7 @@
 module Vado.Types where
 
 import           Control.Monad (forM_)
+import           Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.Map as M
 import           Data.Maybe (listToMaybe)
 import           Debug.Trace as Trace
@@ -16,6 +17,10 @@ type TagAttrs = (Text, M.Map Text Text)
 
 warning :: String -> a -> a
 warning msg = Trace.trace msg
+
+logWarn :: MonadIO m => String -> m ()
+logWarn msg = liftIO $ putStrLn msg
+
 
 -- Meaningful names:
 
