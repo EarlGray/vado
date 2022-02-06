@@ -132,7 +132,7 @@ cascadingValue CSSFontSize new old =
 cascadingValue _ st _ = Just st
 
 
--- A difference in styles, useful for rendering.
+-- | A difference in styles, useful for rendering.
 type StyleDiff = M.Map CSSProperty CSSValue
 
 -- | Get the difference between two (complete) styles both ways.

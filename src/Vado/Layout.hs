@@ -6,7 +6,6 @@ module Vado.Layout where
 
 import           Control.Applicative
 import           Control.Monad.RWS.Strict as RWS
---import           Control.Monad.State (StateT(..))
 import qualified Data.Char as C
 import qualified Data.List as L
 import qualified Data.Map.Strict as M
@@ -15,7 +14,6 @@ import           Data.Text (Text)
 import qualified Data.Text as T
 
 import           Network.URI as URI
-import           Linear.V2 (V2(..))
 import qualified SDL.Cairo.Canvas as Canvas
 import qualified SDL.Video.Renderer as SDL
 import           SDL.Vect
