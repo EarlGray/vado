@@ -1,3 +1,5 @@
+{- HLINT ignore "Eta reduce" -}
+
 module Vado.Types where
 
 import           Control.Monad (forM_)
@@ -36,10 +38,6 @@ mbHead = listToMaybe
 mbReadText :: Read a => Text -> Maybe a
 mbReadText = readMaybe . T.unpack
 
--- A rant about Haskell linters: they encourage eta-reduce instead of
--- giving meaningful names and often value cleverness over common sense.
--- In this case, the linter complains about `when (not $ null something)` not
--- being the double negation `unless (null something)`.
 nonEmpty :: Foldable t => t a -> Bool
 nonEmpty = not . null
 

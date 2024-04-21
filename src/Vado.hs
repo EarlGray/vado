@@ -1,9 +1,13 @@
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+
+{- HLINT ignore "Eta reduce" -}   -- more is less
+{- HLINT ignore "Use fmap" -}     -- plain Haskell
+{- HLINT ignore "Use second" -}   -- plain Haskell
 
 module Vado where
 
@@ -22,7 +26,6 @@ import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import           Foreign.C.Types (CInt)
-import           Linear.V2 (V2(..))
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.URI as URIh
 import           Network.URI as URI
@@ -30,9 +33,11 @@ import qualified SDL
 import qualified SDL.Cairo as Cairo
 import qualified SDL.Cairo.Canvas as Canvas
 import           SDL.Event as SDL
+--import qualified SDL.Video.Renderer as SDL
 import qualified SDL.Image as Image
 import           SDL.Vect
 --import           System.CPUTime (getCPUTime)
+import qualified Data.StateVar as SV
 import qualified System.Environment as Env
 import           System.Exit (exitSuccess)
 
@@ -300,12 +305,26 @@ vadoWindow = do
       }
   -- Setup Cairo rendering on the window.
   renderer <- SDL.createRenderer window (-1) SDL.defaultRenderer
-  Just (SDL.Rectangle _ viewport@(V2 w h)) <-
-    SDL.get (SDL.rendererViewport renderer)
+
+  rscale <- SV.get (SDL.rendererScale renderer)
+  logInfo $ "SDL.rendererScale = " ++ show rscale
+
+  logicalResolution <- SV.get (SDL.rendererLogicalSize renderer)
+  logInfo $ "logical resolution: " ++ show logicalResolution
+
+  Just (SDL.Rectangle _ viewport@(V2 vw vh)) <- SDL.get (SDL.rendererViewport renderer)
+  logInfo $ "viewport: " ++ show viewport
+
+  let scale = V2 (vw `doubleDiv` ww) (vh `doubleDiv` wh)
+        where
+          V2 ww wh = defaultWindowSize :: V2 Int
+          doubleDiv x y = fromIntegral x / fromIntegral y :: Double
+  logInfo $ "scale: " ++ show scale
+
   texture0 <- Cairo.createCairoTexture renderer viewport
   return $ VadoWindow
     { windowRenderer = renderer
-    , windowViewport = V2 (fromIntegral w) (fromIntegral h)
+    , windowViewport = fromIntegral <$> viewport
     , windowTexture = texture0
     , windowScroll = 0
     }
@@ -636,7 +655,7 @@ handleUIEvent event =
         let win = pageWindow page
         SDL.destroyTexture $ windowTexture win
         texture' <- Cairo.createCairoTexture (windowRenderer win) (fromIntegral <$> size)
-        let win' = win{ windowTexture=texture', windowViewport=(fromIntegral <$> size) }
+        let win' = win{ windowTexture=texture', windowViewport=fromIntegral <$> size }
         -- TODO: optimize, don't do full layout again:
         Just <$> layoutPage page{ pageWindow=win' }
 
@@ -762,7 +781,7 @@ input_onKeyReleased event nid =
         documentEnqueue $ DocEmitEvent nid "change"
       -- TODO: Mac (GUI) keyboard layout support:
       SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
-        clipboard <- lift $ SDL.getClipboardText
+        clipboard <- lift SDL.getClipboardText
         modifyElement nid $ inputModify (const clipboard)
       _ -> return ()
       --  lift $ putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
@@ -779,6 +798,7 @@ input_onTextInput event nid = do
       modifyElement nid $ inputModify (`T.append` input)
       documentRedraw nid
 
+{- HLINT ignore "Use camelCase" -}
 body_onKeyReleased :: EventHandler
 body_onKeyReleased event _nid = do
   page <- gets evctxPage

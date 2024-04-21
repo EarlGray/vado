@@ -24,33 +24,35 @@ library
   other-modules:       Paths_vado
   ghc-options:         -Wall
   default-language:    Haskell2010
-  build-depends:       attoparsec
-                     , base
-                     , base64-bytestring
-                     , bytestring
-                     , cairo
-                     , containers
-                     , css-text
-                     , html-conduit
-                     , http-api-data
-                     , http-client
-                     , http-client-tls
-                     , http-types
-                     , linear
-                     , mtl
-                     , network-uri
-                     , rosezipper
-                     , sdl2
-                     , sdl2-cairo
-                     , sdl2-image
-                     , text
-                     , unordered-containers
-                     , xml-conduit
-                     , conduit
-                     , resourcet
-                     , stm
-                     , stm-conduit
-                     , xml-types
+  build-depends:
+      attoparsec
+    , base
+    , base64-bytestring
+    , bytestring
+    , cairo
+    , containers
+    , css-text
+    , html-conduit
+    , http-api-data
+    , http-client
+    , http-client-tls
+    , http-types
+    , linear
+    , mtl
+    , network-uri
+    , rosezipper
+    , sdl2
+    , sdl2-cairo
+    , sdl2-image
+    , text
+    , unordered-containers
+    , xml-conduit
+    , conduit
+    , resourcet
+    , StateVar
+    , stm
+    , stm-conduit
+    , xml-types
 
 executable vado
   hs-source-dirs:      app

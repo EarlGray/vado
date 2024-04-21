@@ -1,6 +1,12 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+
+{- HLINT ignore "Avoid lambda using `infix`" -}   -- more is less
+{- HLINT ignore "Use camelCase" -}                -- CSS isn't a word
+{- HLINT ignore "Use first", "Use second" -}      -- plain Haskell
+{- HLINT ignore "Use tuple-section" -}            -- more is less
+
 module Vado.CSS where
 
 import           Control.Applicative
@@ -149,7 +155,7 @@ noStyling :: (StyleDiff, StyleDiff)
 noStyling = (M.empty, M.empty)
 
 applyDiff :: Style -> StyleDiff -> Style
-applyDiff st diff = st { styleInherit = diff `M.union` (styleInherit st) }
+applyDiff st diff = st { styleInherit = diff `M.union` styleInherit st }
 
 -- | A uniform interface to CSSProperty and CSSOwnProperty
 class IsCSSProperty prop where
@@ -390,10 +396,10 @@ stylesheetOwnValue = stylesheetValue noStyle
 
 computedStyle :: Stylesheet -> Style
 computedStyle Stylesheet{..} = mconcat
-  [ fst $ stylesheetUserBrowser                     -- OriginImportantUser
-  , fst $ stylesheetAttr, fst $ stylesheetAuthor    -- OriginImportantAuthor
-  , snd $ stylesheetAttr, snd $ stylesheetAuthor    -- OriginAuthor
-  , snd $ stylesheetUserBrowser                     -- OriginUser, OriginBrowser
+  [ fst stylesheetUserBrowser                     -- OriginImportantUser
+  , fst stylesheetAttr, fst stylesheetAuthor    -- OriginImportantAuthor
+  , snd stylesheetAttr, snd stylesheetAuthor    -- OriginAuthor
+  , snd stylesheetUserBrowser                     -- OriginUser, OriginBrowser
   ]
 
 
