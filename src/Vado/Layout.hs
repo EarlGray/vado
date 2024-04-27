@@ -2,6 +2,10 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+
+{-# HLINT ignore "Use list comprehension" #-}
+{-# HLINT ignore "Eta reduce" #-}
 
 module Vado.Layout where
 
@@ -145,7 +149,7 @@ instance CanMeasureText Canvas.Canvas where
     return width
 
 -- Immutable parameters for a block layuot:
-data LayoutParams = LayoutParams
+newtype LayoutParams = LayoutParams
   { ltWidth :: Width
   }
 
@@ -174,7 +178,7 @@ data LineState = LS
   }
 
 -- | A global layout context for a page
-data LayoutCtx = LayoutCtx
+newtype LayoutCtx = LayoutCtx
   { ltResources :: DOMResourceMap
   }
 
@@ -232,7 +236,7 @@ layoutElement :: CanMeasureText m => ElementRef -> LayoutOver m ()
 layoutElement elt = do
     let node = elementDeref elt
         content = elementContent node
-        display = (elementStylesheet node) `stylesheetOwnValue` CSSDisplay
+        display = elementStylesheet node `stylesheetOwnValue` CSSDisplay
     if display == CSS_Keyword "none" then
       return ()
     else case (content, display) of
@@ -275,12 +279,12 @@ layoutElement elt = do
       (Left (ImageContent href mbSize), _) -> do
         -- TODO: block <img>
         resources <- gets (ltResources . ltCtx)
-        let mbResSize = (\(ImageResource wh _, _) -> wh) <$> M.lookup href resources
-        case mbSize <|> mbResSize of
-          Just wh -> do
-            let baseline = imgBaseline wh elt
-            layoutInlineBox wh baseline elt (BoxInline $ ImageBox wh href) []
-          _ -> return ()
+        let mbResSize = case M.lookup href resources of
+              Just (res, _) -> fst <$> asImageResource res
+              _ -> Nothing
+        whenJust (mbSize <|> mbResSize) $ \wh -> do
+          let baseline = imgBaseline wh elt
+          layoutInlineBox wh baseline elt (BoxInline $ ImageBox wh href) []
 
       (Right _, CSS_Keyword kw) | kw `elem` ["inline", "inline-block"] -> do
         withStyle elt $ forM_ (elemrefChildren elt) layoutElement
@@ -608,9 +612,11 @@ renderTree doc (minY, maxY) (x, y, st0) box = do
     BoxInline (InputTextBox (V2 _bw bh) textX baseline nid) -> do
       node <- inDocument doc $ getElement nid
 
-      let Left (InputTextContent txt) = elementContent node
-      V2 w _ <- Canvas.textSize (T.unpack txt)
-      Canvas.textBaseline (T.unpack txt) (V2 (x + textX) (y + baseline - minY))
+      let txt = case elementContent node of
+            Left (InputTextContent t) -> T.unpack t
+            content -> warning ("expected InputTextContext, got: " ++ show content) ""
+      V2 w _ <- Canvas.textSize txt
+      Canvas.textBaseline txt (V2 (x + textX) (y + baseline - minY))
 
       V2 cursorOffsetX _ <- Canvas.textSize "."
       let cursorInsetY = bh/6
@@ -668,5 +674,5 @@ canvasFont st = Canvas.Font face size weight italic
         Just (CSS_Px px) -> px
         --Just other -> warning ("canvasFont: unknown font-size=" ++ show other) defaultFontSize
         _ -> defaultFontSize
-    weight = (st `cssValueMaybe` CSSFontWeight == Just (CSS_Keyword "bold"))
-    italic = (st `cssValueMaybe` CSSFontStyle == Just (CSS_Keyword "italic"))
+    weight = st `cssValueMaybe` CSSFontWeight == Just (CSS_Keyword "bold")
+    italic = st `cssValueMaybe` CSSFontStyle == Just (CSS_Keyword "italic")

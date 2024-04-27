@@ -29,6 +29,7 @@ import qualified SDL
 
 import           Vado.Types
 import           Vado.CSS
+import qualified Data.Text as SDL
 
 
 intmapAppend :: a -> IM.IntMap a -> IM.IntMap a
@@ -252,6 +253,8 @@ instance Show DOMContent where
   show (ImageContent href wh) = "ImageContent " ++ show href ++ " (" ++ show wh ++ ")"
   show (InputTextContent t) = "InputTextContent \"" ++ T.unpack t ++ "\""
 
+asInputTextContext :: DOMContent -> Maybe Text
+asInputTextContext = \case InputTextContent txt -> Just txt; _ -> Nothing
 
 -- Map from a URI to the resource and the list of elements that use this resource
 type DOMResourceMap = M.Map URI (HTTPResource, S.Set ElementID)
@@ -263,6 +266,9 @@ data HTTPResource
 instance Show HTTPResource where
   show (ImageResource dim _) = "ImageResource " ++ show dim
   show (CSSResource blocks) = "CSSResource " ++ show blocks
+
+asImageResource :: HTTPResource -> Maybe (V2 Double, SDL.Texture)
+asImageResource = \case ImageResource wh texture -> Just (wh, texture); _ -> Nothing
 
 -- | ElementRef is useful for traversing the DOM without Document in context.
 -- ElementRef should not live longer that the current version of the IntMap storage.

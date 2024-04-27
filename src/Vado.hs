@@ -299,7 +299,7 @@ vadoWindow = do
     SDL.createWindow
       "Vado"
       SDL.defaultWindow
-      { SDL.windowHighDPI = True
+      { SDL.windowHighDPI = False
       , SDL.windowResizable = True
       , SDL.windowInitialSize = defaultWindowSize
       }
@@ -771,32 +771,41 @@ input_onKeyReleased :: EventHandler
 input_onKeyReleased event nid =
   eventHandlerWithPage $ \page -> runPageDocument page $ do
     -- TODO: it's not always a text input
-    let Right evsdl = event
-    let KeyboardEvent e = SDL.eventPayload evsdl
-    let keysym = SDL.keyboardEventKeysym e
-    case SDL.keysymKeycode keysym of
-      SDL.KeycodeBackspace ->
-        modifyElement nid $ inputModify (\case "" -> ""; t -> T.init t)
-      SDL.KeycodeReturn ->
-        documentEnqueue $ DocEmitEvent nid "change"
-      -- TODO: Mac (GUI) keyboard layout support:
-      SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
-        clipboard <- lift SDL.getClipboardText
-        modifyElement nid $ inputModify (const clipboard)
-      _ -> return ()
-      --  lift $ putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
+    let mbKeysym = case event of
+          Right evsdl ->
+            case SDL.eventPayload evsdl of
+              KeyboardEvent e -> Just (SDL.keyboardEventKeysym e)
+              _ -> Nothing
+          _ -> Nothing
+    --let Right evsdl = event
+    --let KeyboardEvent e = SDL.eventPayload evsdl
+    --let keysym = SDL.keyboardEventKeysym e
+    whenJust mbKeysym $ \keysym ->
+      case SDL.keysymKeycode keysym of
+        SDL.KeycodeBackspace ->
+          modifyElement nid $ inputModify (\case "" -> ""; t -> T.init t)
+        SDL.KeycodeReturn ->
+          documentEnqueue $ DocEmitEvent nid "change"
+        -- TODO: Mac (GUI) keyboard layout support:
+        SDL.KeycodeV | isKeyCtrlPressed (SDL.keysymModifier keysym) -> do
+          clipboard <- lift SDL.getClipboardText
+          modifyElement nid $ inputModify (const clipboard)
+        _ -> return ()
+        --  lift $ putStrLn $ "input_onKeyReleased $ " ++ show (SDL.keysymKeycode keysym)
     documentRedraw nid
 
 input_onTextInput :: EventHandler
-input_onTextInput event nid = do
+input_onTextInput event nid =
   eventHandlerWithPage $ \page ->
-    runPageDocument page $ do
-      let Right evsdl = event
-      let TextInputEvent e = SDL.eventPayload evsdl
-      let input = SDL.textInputEventText e
-      -- lift $ putStrLn $ "input_onTextInput: " ++ T.unpack input
-      modifyElement nid $ inputModify (`T.append` input)
-      documentRedraw nid
+    runPageDocument page $
+      forM_ event $ \evsdl -> do
+        case SDL.eventPayload evsdl of
+          TextInputEvent e -> do
+            let input = SDL.textInputEventText e
+            -- lift $ putStrLn $ "input_onTextInput: " ++ T.unpack input
+            modifyElement nid $ inputModify (`T.append` input)
+            documentRedraw nid
+          _ -> pure ()
 
 {- HLINT ignore "Use camelCase" -}
 body_onKeyReleased :: EventHandler
