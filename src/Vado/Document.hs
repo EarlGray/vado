@@ -29,7 +29,6 @@ import qualified SDL
 
 import           Vado.Types
 import           Vado.CSS
-import qualified Data.Text as SDL
 
 
 intmapAppend :: a -> IM.IntMap a -> IM.IntMap a
@@ -97,7 +96,7 @@ instance HasDebugView Document where
   showdbg doc = unlines $
       [ "documentHead = @" ++ show (documentHead doc)
       , "documentBody = @" ++ show (documentBody doc)
-      , "documentTitle = " ++ T.unpack (documentTitle doc)
+      , "documentTitle = " ++ show (documentTitle doc)
       , "documentNewID = @" ++ show (documentNewID doc)
       , "documentFocus = @" ++ show (documentFocus doc)
       , "documentCSSRules: " ++ show (documentCSSRules doc)
@@ -157,7 +156,7 @@ getElementRef nid = do
 -- TODO: populate and use the `documentElementById` cache
 getElementById :: Monad m => Text -> DocumentT m (Maybe ElementID)
 getElementById eid = do
-  nodes <- IM.toList <$> gets documentAllNodes
+  nodes <- gets (IM.toList . documentAllNodes)
   return $ fst <$> L.find (\(_, elt) -> M.lookup "id" (elementAttrs elt) == Just eid) nodes
 
 alterNode :: Monad m => ElementID -> (Maybe Element -> Maybe Element) -> DocumentT m ()
@@ -458,7 +457,7 @@ domtreeStartElement pid node0 = do
       node{ elementSiblings = ElementSiblings{ prevSibling = nid, nextSibling = nid } }
   else do
     parent <- getElement pid
-    let Right fid = elementContent parent   -- Left should not be in opened, ever.
+    let fid = either (error "a leaf node opens") id $ elementContent parent
     if fid == noElement then do
       setElement pid parent{ elementContent = Right nid }
       setElement nid $
@@ -532,7 +531,7 @@ htmlDOMFromEvents = \case
 domStartHTMLElement :: Monad m => TagAttrs -> DocumentT m ()
 domStartHTMLElement (tag, attrs) = do
   -- DOM fixing:
-  mbPid <- mbHead <$> gets documentBuildState
+  mbPid <- gets (mbHead . documentBuildState)
   mbParent <- mapM getElement mbPid
   case (tag, fmap elementTag mbParent) of
     ("li", Just "li") -> domEndHTMLElement "li"
@@ -574,7 +573,7 @@ domEndHTMLElement name = do
 
     case elementTag node of
       "title" -> do
-        let Right fid = elementContent node
+        let fid = either (error "<title> is not a leaf") id $ elementContent node
         tnode <- getElement fid
         case elementContent tnode of
           Left (TextContent title) | nextSibling (elementSiblings tnode) == fid ->
@@ -598,7 +597,7 @@ domEndHTMLElement name = do
             inpty -> warning ("Unknown input type: " ++ show inpty) $ TextContent ""
 
       "style" -> do
-        let Right fid = elementContent node
+        let fid = either (error "<style> is not a leaf") id $ elementContent node
         if fid == noElement then return ()  -- empty style
         else do
           tnode <- getElement fid
@@ -637,7 +636,7 @@ domEndHTMLElement name = do
           Just href | "data:" `T.isPrefixOf` href ->
             -- A hack: pass "blob:data@12" to domResourceFetch
             -- and let handlePageStreaming in `Browser` to actually decode it.
-            let Just bloburi = URI.parseURI ("blob:data@" ++ show nid)
+            let bloburi = fromJust $ URI.parseURI ("blob:data@" ++ show nid)
             in ImageContent bloburi wh
           Just href ->
             case URI.parseURIReference (T.unpack href) of

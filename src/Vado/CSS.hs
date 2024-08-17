@@ -785,9 +785,7 @@ css properties = Style
 -- | Parses a CSSValue from text for a CSS value
 cssReadValue :: Text -> Either Text CSSValue
 cssReadValue txtval =
-  case Atto.parseOnly cssparseValue txtval of
-    Left _ -> Left txtval
-    Right val -> Right val
+  either (Left . const txtval) Right (Atto.parseOnly cssparseValue txtval)
 
 cssparseValue :: Atto.Parser CSSValue
 cssparseValue = valp <* Atto.endOfInput

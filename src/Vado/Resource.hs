@@ -3,6 +3,13 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+{- HLINT ignore "Eta reduce" -}
+-- more is less
+{- HLINT ignore "Use fmap" -}
+-- plain Haskell
+{- HLINT ignore "Use second" -}
+-- plain Haskell
+
 module Vado.Resource where
 
 import           Control.Applicative hiding (empty)
@@ -44,6 +51,7 @@ import qualified Text.HTML.DOM as HTML
 
 
 import           Vado.Types
+import Data.Functor (($>))
 
 -- | Names
 type Chan a = Ch.TMChan a
@@ -53,7 +61,7 @@ send chan message = liftIO $ atomically $ Ch.writeTMChan chan message
 
 -- | Utils
 httpHeader :: [HTTP.Header] -> HTTP.HeaderName -> Maybe Text
-httpHeader headers which = (T.toLower . T.decodeLatin1) <$> L.lookup which headers
+httpHeader headers which = T.toLower . T.decodeLatin1 <$> L.lookup which headers
 
 httpResponseContentType :: HTTP.Response HTTP.BodyReader -> Text
 httpResponseContentType resp =
@@ -274,9 +282,9 @@ attoDataUrl = do
   _ <- Atto.string "data:"
   (mty, msub, _mparams) <- Atto.option ("text", "plain", []) attoMimeType
   -- TODO: use charset from _mparams?
-  isBase64 <- Atto.option False (Atto.string ";base64" *> pure True)
+  isBase64 <- Atto.option False (Atto.string ";base64" $> True)
   _ <- Atto.char ','
-  bytes <- (Bc.pack . T.unpack) <$> Atto.takeText
+  bytes <- Bc.pack . T.unpack <$> Atto.takeText
   let dayta = (if isBase64 then B64.decodeLenient else urlDecode False) bytes
   return (T.concat [mty, "/", msub], dayta)
 
@@ -289,7 +297,7 @@ attoMimeType = do
     return (mtype, msubtype, params)
   where
     tsspecials = "()<>@,;:\\\"/[]?="  -- see RFC 2045
-    token = T.pack <$> (Atto.many1 $ Atto.satisfy $ \c -> Atto.notInClass tsspecials c && not (C.isSpace c))
+    token = T.pack <$> Atto.many1 (Atto.satisfy (\c -> Atto.notInClass tsspecials c && not (C.isSpace c)))
     qstr = fail "TODO: quoted strings as mime/type;parameter='value'"
     parameter = do
       attr <- token
@@ -301,15 +309,17 @@ attoMimeType = do
 test :: Text -> IO ()
 test address = do
   resman <- runManager
-  let Just uri = URI.parseAbsoluteURI $ T.unpack address
+  let uri = fromJust $ URI.parseAbsoluteURI $ T.unpack address
   requestGet resman uri ["text/html", "text"]
   runResourceT $ do
     let sink (u, r) = do
           case r of
             EventStreamChunk (ChunkHtml (XML.EventBeginElement name attrs)) | name == "img" -> do
-              let Just ((XML.ContentText href):_) = L.lookup "src" attrs
+              let href = case head $ fromJust $ L.lookup "src" attrs of
+                    XML.ContentText h -> h
+                    content -> error $ "wrong content " ++ show content
               putStrLn $ "@@@ image: src=" ++ show href
-              let Just rel = URI.parseURIReference $ T.unpack href
+              let rel = fromJust $ URI.parseURIReference $ T.unpack href
               let imguri = rel `URI.relativeTo` u
               requestGet resman imguri []
             _ -> return ()
@@ -319,7 +329,7 @@ test address = do
 testPost :: Text -> IO ()
 testPost address = do
   resman <- runManager
-  let Just uri = URI.parseAbsoluteURI $ T.unpack address
+  let uri = fromJust $ URI.parseAbsoluteURI $ T.unpack address
   requestPost resman uri (ContentForm $ M.fromList [("hello", ["world", "світ"])]) []
   evt <- waitEvent resman
   print evt

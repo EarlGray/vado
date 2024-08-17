@@ -12,16 +12,24 @@
 module Vado where
 
 import           Control.Applicative
+import qualified Control.Exception as Err
 import           Control.Monad.RWS.Strict as RWS
-import           Control.Monad.State (StateT(..))
+import           Control.Monad.State (StateT (..))
 import qualified Control.Monad.State as St
+import           Control.Monad.Except (ExceptT)
+import qualified Control.Monad.Except as Exc
+import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Bc
 import qualified Data.Either as Ei
 import qualified Data.HashMap.Strict as HM
-import qualified Data.Map.Strict as M
 import qualified Data.IntMap.Strict as IM
+import qualified Data.Map.Strict as M
 import           Data.Maybe
 import qualified Data.Set as S
+-- import qualified SDL.Video.Renderer as SDL
+
+-- import           System.CPUTime (getCPUTime)
+import qualified Data.StateVar as SV
 import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -33,20 +41,16 @@ import qualified SDL
 import qualified SDL.Cairo as Cairo
 import qualified SDL.Cairo.Canvas as Canvas
 import           SDL.Event as SDL
---import qualified SDL.Video.Renderer as SDL
 import qualified SDL.Image as Image
 import           SDL.Vect
---import           System.CPUTime (getCPUTime)
-import qualified Data.StateVar as SV
 import qualified System.Environment as Env
 import           System.Exit (exitSuccess)
 
-import           Vado.Types
-import qualified Vado.Resource as Resource
 import           Vado.CSS
 import           Vado.Document
 import           Vado.Layout
-
+import qualified Vado.Resource as Resource
+import           Vado.Types
 
 --------------------------------------------------------------------------------
 -- Navigator, Window, DOM
@@ -120,21 +124,22 @@ logDebug msg = do
 
 -- | Entry point for layout procedure
 layoutPage :: Page -> IO Page
-layoutPage page@Page{..} | documentBody pageDocument == noElement =
-  return $ warning "layoutPage: no body" page
+layoutPage page@Page {..}
+  | documentBody pageDocument == noElement =
+      return $ warning "layoutPage: no body" page
 layoutPage page = do
-    let doc = pageDocument page
-    let ctx = LayoutCtx { ltResources = documentResources doc }
-    let VadoWindow { windowViewport = V2 w _, windowTexture = texture } = pageWindow page
-    let params = LayoutParams { ltWidth = w }
-    let body = elementRef doc (documentBody doc)
-    (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle body
-    return page{ pageBoxes=Just boxes }
+  let doc = pageDocument page
+  let ctx = LayoutCtx {ltResources = documentResources doc}
+  let VadoWindow {windowViewport = V2 w _, windowTexture = texture} = pageWindow page
+  let params = LayoutParams {ltWidth = w}
+  let body = elementRef doc (documentBody doc)
+  (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle body
+  return page {pageBoxes = Just boxes}
 
-renderPage :: MonadIO m => Page -> m ()
-renderPage Page{ pageBoxes = Nothing } =
+renderPage :: (MonadIO m) => Page -> m ()
+renderPage Page {pageBoxes = Nothing} =
   logWarn "renderPage: page is not layed out yet"
-renderPage page@Page{ pageBoxes = Just body, pageDocument = doc, pageWindow = win } = liftIO $ do
+renderPage page@Page {pageBoxes = Just body, pageDocument = doc, pageWindow = win} = liftIO $ do
   let minY = pageScroll page
   let (texture, renderer) = (windowTexture win, windowRenderer win)
 
@@ -160,9 +165,9 @@ renderPage page@Page{ pageBoxes = Just body, pageDocument = doc, pageWindow = wi
             let dim = V2 (cint dx) (cint dy)
             let rect' = SDL.Rectangle pos dim
             SDL.copy renderer imgtexture Nothing (Just rect')
-
-          _ | href `M.member` documentResourcesLoading doc ->
-            return ()     -- Still loading
+          _
+            | href `M.member` documentResourcesLoading doc ->
+                return () -- Still loading
           _ ->
             logWarn $ "renderPage: no resource for <img src=" ++ show href ++ ">"
       other ->
@@ -389,7 +394,9 @@ handlePageStreaming st event = do
 
     (PageStreaming, Resource.EventStreamChunk (Resource.ChunkHtml update)) -> do
       -- grow the DOM tree:
-      logWarn $ show update
+      debug <- gets pageDebugNetwork
+      when debug $
+        logWarn $ show update
       withBrowserDocument $ htmlDOMFromEvents update
 
     (PageStreaming, Resource.EventStreamClose) ->
@@ -415,46 +422,51 @@ handleResourceEvent st uri event =
       withBrowserDocument $ do
         loading <- gets (M.delete uri . documentResourcesLoading)
         when (null loading) $ logInfo "All resources are ready"
-        modify $ \doc -> doc{ documentResourcesLoading = loading }
+        modify $ \doc -> doc {documentResourcesLoading = loading}
 
       let contentType = Resource.httpResponseContentType resp
-      logDebug $ "OK: "++show uri++" ("++T.unpack contentType++") loaded: " ++
-                 show (HTTP.responseStatus resp)
+      logDebug $
+        "OK: "
+          ++ show uri
+          ++ " ("
+          ++ T.unpack contentType
+          ++ ") loaded: "
+          ++ show (HTTP.responseStatus resp)
 
       mbRes <- decodeResourceContent contentType content
       case mbRes of
-        Left oops -> logWarn $ "ERROR: <"++show uri++">: " ++ oops
-
+        Left oops -> logWarn $ "ERROR: <" ++ show uri ++ ">: " ++ oops
         Right (CSSResource blocks) -> do
-          logWarn $ "Parsed "++show (length blocks)++" CSS rules from "++show uri
+          logWarn $ "Parsed " ++ show (length blocks) ++ " CSS rules from " ++ show uri
           withBrowserDocument $ modify $ \doc ->
-            doc{ documentCSSRules = addCSSRules blocks $ documentCSSRules doc }
+            doc {documentCSSRules = addCSSRules blocks $ documentCSSRules doc}
 
           -- re-match the rules in the document
           allNodes <- fmap IM.toList $ inBrowserDocument $ gets documentAllNodes
           rules <- inBrowserDocument $ gets documentCSSRules
           changed <- fmap concat $ forM allNodes $ \(nid, node) -> do
-              eltref <- inBrowserDocument $ getElementRef nid
-              let tagattrs = (elementTag node, elementAttrs node)
-              let newchains = rulechainsForMatcher rules tagattrs $ domMatchSelector eltref
+            eltref <- inBrowserDocument $ getElementRef nid
+            let tagattrs = (elementTag node, elementAttrs node)
+            let newchains = rulechainsForMatcher rules tagattrs $ domMatchSelector eltref
 
-              let sheet0 = elementStylesheet node
-              if newchains == stylesheetAuthorChain sheet0 then return []
+            let sheet0 = elementStylesheet node
+            if newchains == stylesheetAuthorChain sheet0
+              then return []
               else do
                 let (impchain, regchain) = newchains
                 let style = (styleFromRulechain rules impchain, styleFromRulechain rules regchain)
-                let sheet = sheet0{ stylesheetAuthor = style }
-                withBrowserDocument $ setElement nid $
-                  node{ elementStylesheet = sheet{ stylesheetComputed = computedStyle sheet } }
+                let sheet = sheet0 {stylesheetAuthor = style}
+                withBrowserDocument $
+                  setElement nid $
+                    node {elementStylesheet = sheet {stylesheetComputed = computedStyle sheet}}
                 return [nid]
 
           when (nonEmpty changed) $ do
             logDebug $ "Relayout needed for nodes: " ++ show changed
             changePage $ \p -> Just <$> layoutPage p
-
         Right res@(ImageResource _ _) -> do
           withBrowserDocument $ modify $ \doc ->
-            doc{ documentResources = M.insert uri (res, nodes) (documentResources doc) }
+            doc {documentResources = M.insert uri (res, nodes) (documentResources doc)}
 
           -- TODO: replace with re-layout requests when incremental layout is ready.
           -- Are there <img>s without specified width= and height= that need relayout?
@@ -464,68 +476,70 @@ handleResourceEvent st uri event =
                   let attrs = elementAttrs $ elementDeref $ elementRef doc nid
                       mbW = decodeAttr "width" attrs :: Maybe Double
                       mbH = decodeAttr "height" attrs :: Maybe Double
-                  in liftA2 V2 mbW mbH
+                   in liftA2 V2 mbW mbH
             return $ any (isNothing . maybeWH) $ S.toList nodes
           when needsLayout $ do
             logDebug $ "Relayout caused by " ++ show uri
             modifyPage $ \p -> Just <$> layoutPage p
-          get >>= renderPage   -- new image must be shown in any case
-
+          get >>= renderPage -- new image must be shown in any case
     (_, Resource.EventConnectionError exc) | st /= PageConnecting -> do
-      logDebug $ "ERROR: "++show uri++" : " ++ show exc
+      logDebug $ "ERROR: " ++ show uri ++ " : " ++ show exc
       withBrowserDocument $ do
         loading <- gets (M.delete uri . documentResourcesLoading)
         when (null loading) $ logInfo "All resources are ready"
-        modify $ \doc -> doc{ documentResourcesLoading = loading }
-
+        modify $ \doc -> doc {documentResourcesLoading = loading}
     _ ->
       logWarn $ "eventloop: invalid state " ++ show st ++ " for event " ++ show event
 
 -- TODO: move out of browser, pass the renderer only
 decodeResourceContent :: Text -> Resource.Content -> Browser (Either String HTTPResource)
 decodeResourceContent contentType = \case
-  Resource.ContentBytes bs | T.isPrefixOf "image/" contentType ->
-    if isJust (Image.format bs) then do
-      renderer <- gets (windowRenderer . pageWindow)
-      (texture, wh) <- liftIO $ do
-        bitmap <- Image.decode bs
-        texture <- SDL.createTextureFromSurface renderer bitmap
-        V2 w h <- SDL.surfaceDimensions bitmap
-        return (texture, V2 (fromIntegral w) (fromIntegral h))
-      return $ Right (ImageResource wh texture)
-    else
-      return $ Left ("decodeResourceContent: an unknown image format " ++ T.unpack contentType)
-
+  Resource.ContentBytes bs
+    | T.isPrefixOf "image/" contentType -> do
+        renderer <- gets (windowRenderer . pageWindow)
+        liftIO $ Exc.runExceptT $ withImageSurface (contentType, bs) $ \bitmap -> do
+          texture <- SDL.createTextureFromSurface renderer bitmap
+          V2 w h <- SDL.surfaceDimensions bitmap
+          let wh = V2 (fromIntegral w) (fromIntegral h)
+          pure $ ImageResource wh texture
   Resource.ContentBytes bs | T.isPrefixOf "text/css" contentType -> do
     -- TODO: handle non-utf8 encodings properly
     let txt = Ei.fromRight (TE.decodeLatin1 bs) $ TE.decodeUtf8' bs
     let rules = cssParser txt
     return $ Right (CSSResource rules)
-
   _content ->
     return $ Left ("decodeResourceContent: unknown Content-Type=" ++ T.unpack contentType)
+
+withImageSurface :: (Text, ByteString) -> (SDL.Surface -> IO a) -> ExceptT String IO a
+withImageSurface (contentType, bs) action =
+  if isJust (Image.format bs) then do
+    result <- liftIO (Err.try (Image.decode bs) :: IO (Either Err.SomeException SDL.Surface))
+    case result of
+      Right sfc -> Exc.liftIO $ action sfc
+      Left e -> Exc.liftEither $ Left $ "Image.decode error: " ++ show e
+  else Exc.liftEither $ Left $ "decodeResourceContent: an unknown image format: " ++ T.unpack contentType
 
 --------------------------------------------------------------------------------
 -- DOM events, event handlers, event dispatch.
 
 handleDOMEvent :: DocumentEvent -> Browser ()
-
 handleDOMEvent (DocEmitEvent nid evt) = do
   modifyPage (\p -> Just <$> dispatchEvent (Left evt) nid p)
-
 handleDOMEvent (DocResourceRequest nid resuri) = do
-    resman <- gets pageResMan
-    if URI.uriScheme resuri /= "blob:" then do
+  resman <- gets pageResMan
+  if URI.uriScheme resuri /= "blob:"
+    then do
       logDebug $ "eventloop: @" ++ show nid ++ " requests " ++ show resuri
       withBrowserDocument $ do
         resources <- gets documentResources
         wereLoading <- gets documentResourcesLoading
         unless (resuri `M.member` wereLoading || resuri `M.member` resources) $
-          liftIO $ Resource.requestGet resman resuri []
+          liftIO $
+            Resource.requestGet resman resuri []
 
         let multimapAdd v = M.alter (\vs -> Just (v `S.insert` fromMaybe S.empty vs))
         let nowLoading = multimapAdd nid resuri wereLoading
-        modify $ \doc -> doc{ documentResourcesLoading = nowLoading }
+        modify $ \doc -> doc {documentResourcesLoading = nowLoading}
     else do
       -- assumption: the only source of blobs are <img src="data:...">
       node <- inBrowserDocument $ getElement nid
@@ -809,124 +823,133 @@ input_onTextInput event nid =
 
 {- HLINT ignore "Use camelCase" -}
 body_onKeyReleased :: EventHandler
-body_onKeyReleased event _nid = do
-  page <- gets evctxPage
-  let Right evsdl = event
-  let SDL.KeyboardEvent e = SDL.eventPayload evsdl
+body_onKeyReleased (Right (SDL.Event _ (SDL.KeyboardEvent e))) _nid = do
   let modifiers = SDL.keysymModifier $ SDL.keyboardEventKeysym e
-  --putStrLn $ "body_onKeyReleased: " ++ show e
+  page <- gets evctxPage
+  -- putStrLn $ "body_onKeyReleased: " ++ show e
   page' <- liftIO $ case SDL.keysymKeycode $ SDL.keyboardEventKeysym e of
     SDL.KeycodeE | isKeyCtrlShiftPressed modifiers -> do
       let debug = not $ pageDebugNetwork page
       putStrLn $ "Setting pageDebugNetwork to " ++ show debug
-      return page{ pageDebugNetwork = debug }
-    SDL.KeycodeEnd ->
-      let pageH = maybe 0 boxHeight $ pageBoxes page
-      in return $ vadoScroll pageH page
+      return page {pageDebugNetwork = debug}
+    SDL.KeycodeEnd
+      | modifiers == noKeyModifiers ->
+          let pageH = maybe 0 boxHeight $ pageBoxes page
+            in return $ vadoScroll pageH page
     SDL.KeycodeH | isKeyCtrlShiftPressed modifiers -> do
       printHistory (pageHistory page) (pageUrl page) -- show History
       return page
-    SDL.KeycodeHome | isKeyAltPressed modifiers ->
-      navigatePage (fromJust $ URI.parseURI "vado:home") page
-    SDL.KeycodeHome ->
-      return $ vadoScroll (negate $ pageScroll page) page
+    SDL.KeycodeHome
+      | isKeyAltPressed modifiers ->
+          navigatePage (fromJust $ URI.parseURI "vado:home") page
+    SDL.KeycodeHome
+      | modifiers == noKeyModifiers ->
+          return $ vadoScroll (negate $ pageScroll page) page
     SDL.KeycodeI | isKeyCtrlShiftPressed modifiers -> do
-      putStrLn (showdbg $ pageDocument page)   -- Inspect the DOM tree:
+      putStrLn (showdbg $ pageDocument page) -- Inspect the DOM tree:
       return page
-    SDL.KeycodeK | isKeyCtrlShiftPressed modifiers ->
-      -- Inspect rendering boxes:
-      print (pageBoxes page) >> return page
+    SDL.KeycodeK
+      | isKeyCtrlShiftPressed modifiers ->
+          -- Inspect rendering boxes:
+          print (pageBoxes page) >> return page
     SDL.KeycodeLeft | isKeyAltPressed modifiers ->
       case pageHistory page of
-        (prevurl:_, _) -> navigatePage prevurl page
+        (prevurl : _, _) -> navigatePage prevurl page
         _ -> return page
     SDL.KeycodePageDown -> do
       return $ vadoScroll (vadoViewHeight page) page
     SDL.KeycodePageUp -> do
       return $ vadoScroll (negate $ vadoViewHeight page) page
-    SDL.KeycodeQ | isKeyCtrlPressed modifiers ->
-      SDL.quit >> liftIO exitSuccess >> return page
-    SDL.KeycodeR | isKeyCtrlPressed modifiers ->
-      navigatePage (pageUrl page) page
+    SDL.KeycodeQ
+      | isKeyCtrlPressed modifiers ->
+          SDL.quit >> liftIO exitSuccess >> return page
+    SDL.KeycodeR
+      | isKeyCtrlPressed modifiers ->
+          navigatePage (pageUrl page) page
     SDL.KeycodeRight | isKeyAltPressed modifiers ->
       case pageHistory page of
-        (_, nexturl:_) -> navigatePage nexturl page
+        (_, nexturl : _) -> navigatePage nexturl page
         _ -> return page
     _ ->
       return page
-  modify $ \ctx -> ctx{ evctxPage = page' }
+  modify $ \ctx -> ctx {evctxPage = page'}
+
+body_onKeyReleased event _nid =
+  logWarn $ "onKeyReleased: wrong event " ++ show event
 
 form_onSubmit :: EventHandler
 form_onSubmit event formID = do
-    logWarn $ "form_onSubmit: @"++show formID++" event="++show event
-    page <- gets evctxPage
+  logWarn $ "form_onSubmit: @" ++ show formID ++ " event=" ++ show event
+  page <- gets evctxPage
 
-    -- gather the parameters:
-    formref <- inPageDocument page $ getElementRef formID
-    let controls = querySelectorsAllRef formControlSelectors formref
-    let values = mapMaybe (nodeFormValue . elementDeref) controls
+  -- gather the parameters:
+  formref <- inPageDocument page $ getElementRef formID
+  let controls = querySelectorsAllRef formControlSelectors formref
+  let values = mapMaybe (nodeFormValue . elementDeref) controls
 
-    let attrs = elementAttrs $ elementDeref formref
-    let formAction = fromMaybe undefined $ M.lookup "action" attrs -- TODO: default to docuri
-    case URI.parseURIReference $ T.unpack formAction of
-      Nothing ->
-        logWarn $ "form_onSubmit: cannot parse action="++T.unpack formAction
-      Just formURI -> do
-        page' <- liftIO $ case maybe "get" T.toLower $ M.lookup "method" attrs of
-          "get" -> do
-            let values' = map (\(k, v) -> (k, listToMaybe v)) values
-            let bsQuery = URIh.renderQuery True $ URIh.queryTextToQuery values'
-            let queryURI = formURI{ uriQuery = Bc.unpack bsQuery }
-            logWarn $ "form_onSubmit: method=GET action="++show queryURI
-            navigatePage queryURI page
-          "post" -> do
-            -- TODO: check enctype
-            let fields = M.fromListWith mappend values
-            logWarn $ "form_onSubmit: method=POST action="++show formURI++" form="++show fields
-            liftIO $ navigate (Just $ Resource.ContentForm fields) formURI page
-          other ->
-            return $ warning ("form_onSubmit: invalid method="++T.unpack other) page
+  let attrs = elementAttrs $ elementDeref formref
+  let formAction = fromMaybe undefined $ M.lookup "action" attrs -- TODO: default to docuri
+  case URI.parseURIReference $ T.unpack formAction of
+    Nothing ->
+      logWarn $ "form_onSubmit: cannot parse action=" ++ T.unpack formAction
+    Just formURI -> do
+      page' <- liftIO $ case maybe "get" T.toLower $ M.lookup "method" attrs of
+        "get" -> do
+          let values' = map (\(k, v) -> (k, listToMaybe v)) values
+          let bsQuery = URIh.renderQuery True $ URIh.queryTextToQuery values'
+          let queryURI = formURI {uriQuery = Bc.unpack bsQuery}
+          logWarn $ "form_onSubmit: method=GET action=" ++ show queryURI
+          navigatePage queryURI page
+        "post" -> do
+          -- TODO: check enctype
+          let fields = M.fromListWith mappend values
+          logWarn $ "form_onSubmit: method=POST action=" ++ show formURI ++ " form=" ++ show fields
+          liftIO $ navigate (Just $ Resource.ContentForm fields) formURI page
+        other ->
+          return $ warning ("form_onSubmit: invalid method=" ++ T.unpack other) page
 
-        put EventContext
-          { evctxPage = page'
-          , evctxStopPropagation = True
-          , evctxPreventDefault = True
+      put
+        EventContext
+          { evctxPage = page',
+            evctxStopPropagation = True,
+            evctxPreventDefault = True
           }
   where
     formControlSelectors = [SelTag "input", SelTag "select", SelTag "textarea"]
 
     nodeFormValue :: Element -> Maybe (Text, [Text])
-    nodeFormValue node | elementTag node == "input" =
-      let attrs = elementAttrs node
-      in case M.lookup "name" attrs <|> M.lookup "id" attrs of    -- TODO: check if can use "id"
-          Nothing -> warning ("Form control without name"++show node) Nothing
-          Just name ->
-            case M.lookup "type" attrs of
-              Just ty | ty `elem` ["hidden", "submit"] ->
-                Just (name, maybeToList $ M.lookup "value" attrs)
-              _ ->
-                case elementContent node of
-                  Left (InputTextContent value) -> Just (name, [value])
-                  other -> warning ("Unexpected content in <input>: "++ show other) $ Just (name, [])
+    nodeFormValue node
+      | elementTag node == "input" =
+          let attrs = elementAttrs node
+           in case M.lookup "name" attrs <|> M.lookup "id" attrs of -- TODO: check if can use "id"
+                Nothing -> warning ("Form control without name" ++ show node) Nothing
+                Just name ->
+                  case M.lookup "type" attrs of
+                    Just ty
+                      | ty `elem` ["hidden", "submit"] ->
+                          Just (name, maybeToList $ M.lookup "value" attrs)
+                    _ ->
+                      case elementContent node of
+                        Left (InputTextContent value) -> Just (name, [value])
+                        other -> warning ("Unexpected content in <input>: " ++ show other) $ Just (name, [])
     nodeFormValue node =
-      warning ("form_onSubmit: cannot extract value from "++show node) Nothing
+      warning ("form_onSubmit: cannot extract value from " ++ show node) Nothing
 
 --------------------------------------------------------------------------------
 -- vado: builtin pages
 
 builtinPage :: Document -> Page -> Page
-builtinPage doc page = page
-  { pageState = PageReady
-  , pageDocument = doc
-  , pageBoxes = Nothing
-  , pageEvents = IM.empty
-  , pageWindow = (pageWindow page){ windowScroll = 0 }
-  }
+builtinPage doc page =
+  page
+    { pageState = PageReady,
+      pageDocument = doc,
+      pageBoxes = Nothing,
+      pageEvents = IM.empty,
+      pageWindow = (pageWindow page) {windowScroll = 0}
+    }
 
 vadoHome_onKeyReleased :: EventHandler
-vadoHome_onKeyReleased event nid = do
-  let Right evsdl = event
-  let KeyboardEvent e = SDL.eventPayload evsdl
+vadoHome_onKeyReleased (Right (Event _ (KeyboardEvent e))) nid = do
   let keysym = SDL.keyboardEventKeysym e
   case SDL.keysymKeycode keysym of
     SDL.KeycodeReturn -> do
@@ -934,18 +957,25 @@ vadoHome_onKeyReleased event nid = do
       page <- gets evctxPage
       node <- inPageDocument page $ getElement nid
       liftIO $ print node
-      let Left (InputTextContent address) = elementContent node
+      let address =
+            case elementContent node of
+              Left (InputTextContent addr) -> addr
+              content -> error $ "vadoHome_onKeyReleased: wrong node content " ++ show content
       -- set up the waiting page
-      liftIO (layoutPage (builtinPage vadoWait page) >>= renderPage)
+      liftIO $ do
+        page' <- layoutPage $ builtinPage vadoWait page
+        renderPage page'
       -- decide where to go
-      let mbHref =  URI.parseURI $ T.unpack address
+      let mbHref = URI.parseURI $ T.unpack address
       let href = fromMaybe (webSearch $ T.unpack address) mbHref
       page' <- liftIO $ navigatePage href page
-      put EventContext
-        { evctxPage = page'
-        , evctxStopPropagation = True
-        , evctxPreventDefault = True
-        }
+      put
+        EventContext
+          { evctxPage = page',
+            evctxStopPropagation = True,
+            evctxPreventDefault = True
+          }
     _ ->
       return ()
-
+vadoHome_onKeyReleased event _nid =
+  logWarn $ "vddo:home onKeyReleased: wrong event " ++ show event
