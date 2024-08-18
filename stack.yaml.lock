@@ -5,12 +5,12 @@
 
 packages:
 - completed:
-    hackage: cairo-0.13.8.1@sha256:1938aaeb5d3504678d995774dfe870f6b66cbd43d336b692fa8779b23b2b67a9,4075
+    hackage: cairo-0.13.10.0@sha256:7bce41dbfb1aa9a6723cd4373b3cfb55ecd3564df3a668afe74692f3b32f32c7,4271
     pantry-tree:
-      sha256: 8f6344da4c578a4dd3a49c333e2158b695bfae32a74d34a76bbc6e531b70c95c
-      size: 2830
+      sha256: 10dea7c5189d913ae553e2f82276bc45eee9c11123f0626be09b85e5d2e56a5a
+      size: 2831
   original:
-    hackage: cairo-0.13.8.1
+    hackage: cairo-0.13.10.0
 - completed:
     hackage: gtk2hs-buildtools-0.13.10.0@sha256:7e99ef093ad53121e3ce2874f3100700b5bf4f279ad4fc2a316d5d1323cc9399,5466
     pantry-tree:
@@ -26,16 +26,12 @@ packages:
   original:
     hackage: html-conduit-1.3.2.2
 - completed:
-    commit: fab0d5128feefe0941336af79d8b3ad63c5db00c
-    git: https://github.com/chrisdone/sdl2-cairo.git
-    name: sdl2-cairo
+    hackage: sdl2-cairo-0.1.1.0@sha256:7a45e41b646ed1f3bfbfc761344c96fae9a367b35e0cfec4b7d2fde1595f9bd2,2072
     pantry-tree:
-      sha256: 0cbce98db391e6a7cfbf831d7ff6c86330ef9810b12c2ff109b9697a4ec6f8f0
-      size: 770
-    version: 0.1.0.3
+      sha256: 5ee2102dfbdeddd266fc8474f2f5e92c5ae334778fff7a58bcada458d0de293f
+      size: 408
   original:
-    commit: fab0d5128feefe0941336af79d8b3ad63c5db00c
-    git: https://github.com/chrisdone/sdl2-cairo.git
+    hackage: sdl2-cairo-0.1.1.0
 snapshots:
 - completed:
     sha256: a81fb3877c4f9031e1325eb3935122e608d80715dc16b586eb11ddbff8671ecd

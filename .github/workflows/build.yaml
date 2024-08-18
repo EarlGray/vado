@@ -12,11 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: git config user.name "Dmytro S"
-      - run: git config user.email "me@dmytrish.net"
       - uses: haskell-actions/setup@v2
         with:
           ghc-version: '9.4.8'
           enable-stack: true
           stack-version: 'latest'
+      - run: stack config set install-ghc false --global && stack config set system-ghc true --global 
       - run: stack build

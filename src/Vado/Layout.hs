@@ -1,7 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Use list comprehension" #-}
@@ -19,6 +18,7 @@ import           Data.Text (Text)
 import qualified Data.Text as T
 
 import           Network.URI as URI
+import qualified Graphics.Rendering.Cairo as Cairo
 import qualified SDL.Cairo.Canvas as Canvas
 import qualified SDL.Video.Renderer as SDL
 import           SDL.Vect
@@ -138,9 +138,9 @@ class Monad m => CanMeasureText m where
 instance CanMeasureText Canvas.Canvas where
   measureHeightAndBaseline font = do
     Canvas.textFont font
-    extents <- Canvas.fontExtents
-    let h = Canvas.fontExtentsHeight extents
-    let desc = h - Canvas.fontExtentsDescent extents
+    extents <- lift Cairo.fontExtents
+    let h = Cairo.fontExtentsHeight extents
+    let desc = Cairo.fontExtentsDescent extents
     return (h, desc)
 
   measureTextWidth font text = do
@@ -602,8 +602,7 @@ renderTree doc (minY, maxY) (x, y, st0) box = do
       return $ concat replaced
 
     BoxInline (TextBox txt baseline) -> do
-      Canvas.textBaseline (T.unpack txt) (V2 x (y + baseline - minY))
-
+      _ <- Canvas.text (T.unpack txt) (V2 x (y + baseline - minY))
       return []
     BoxInline content@(ImageBox (V2 w h) _) ->
       let rect = SDL.Rectangle (P $ V2 x y) (V2 w h)
@@ -616,7 +615,7 @@ renderTree doc (minY, maxY) (x, y, st0) box = do
             Left (InputTextContent t) -> T.unpack t
             content -> warning ("expected InputTextContext, got: " ++ show content) ""
       V2 w _ <- Canvas.textSize txt
-      Canvas.textBaseline txt (V2 (x + textX) (y + baseline - minY))
+      _ <- Canvas.text txt (V2 (x + textX) (y + baseline - minY))
 
       V2 cursorOffsetX _ <- Canvas.textSize "."
       let cursorInsetY = bh/6

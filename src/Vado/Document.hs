@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedStrings  #-}
-{-# LANGUAGE LambdaCase         #-}
-
 {- HLINT ignore "Eta reduce" -}           -- more is less
 
 module Vado.Document where

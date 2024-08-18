@@ -1,7 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-
 {- HLINT ignore "Avoid lambda using `infix`" -}   -- more is less
 {- HLINT ignore "Use camelCase" -}                -- CSS isn't a word
 {- HLINT ignore "Use first", "Use second" -}      -- plain Haskell
