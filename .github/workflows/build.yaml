@@ -6,16 +6,102 @@ on:
     paths-ignore:
       - "test/html/**"
 
+env:
+  GHC_VERSION: '9.4.8'
+
 jobs:
   build:
     name: Build Vado
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: haskell-actions/setup@v2
+      - name: Set all tracked file modification times to the time of their last commit
+        run: |
+          rev=HEAD
+          for f in $(git ls-tree -r -t --full-name --name-only "$rev") ; do
+              touch -d $(git log --pretty=format:%cI -1 "$rev" -- "$f") "$f";
+          done
+
+      - uses: actions/cache@v4
+        name: Cache stack
         with:
-          ghc-version: '9.4.8'
+          path: ~/.stack
+          key: ${{ runner.os }}-stack-global-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-stack-global-
+      - uses: actions/cache@v4
+        id: ghcup
+        name: Cache ghcup
+        with:
+          path: /usr/local/.ghcup
+          key: ${{ runner.os }}-ghcup-global-${{ hashFiles('config.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-ghcup-global-
+      - uses: actions/cache@v4
+        name: Cache ~/.local/bin
+        with:
+          path: ~/.local/bin
+          key: ${{ runner.os }}-local-global-${{ hashFiles('gtk2hsChs') }}
+          restore-keys: |
+            ${{ runner.os }}-local-global-
+
+      - uses: haskell-actions/setup@v2
+        if: steps.ghcup.outputs.cache-hit != 'true'
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
           enable-stack: true
           stack-version: 'latest'
-      - run: stack config set install-ghc false --global && stack config set system-ghc true --global 
+
+      - run: stack config set install-ghc false --global && stack config set system-ghc true --global
+      - run: test -x ~/.local/bin/gtk2hsC2hs || stack install gtk2hs-buildtools
+      - run: sudo apt install -y libcairo2-dev libsdl2-dev libsdl2-image-dev
+
       - run: stack build
+
+  test:
+    name: Test Vado
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set all tracked file modification times to the time of their last commit
+        run: |
+          rev=HEAD
+          for f in $(git ls-tree -r -t --full-name --name-only "$rev") ; do
+              touch -d $(git log --pretty=format:%cI -1 "$rev" -- "$f") "$f";
+          done
+
+      - uses: actions/cache@v4
+        name: Cache stack
+        with:
+          path: ~/.stack
+          key: ${{ runner.os }}-stack-global-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-stack-global-
+      - uses: actions/cache@v4
+        name: Cache ghcup
+        id: ghcup
+        with:
+          path: /usr/local/.ghcup
+          key: ${{ runner.os }}-ghcup-global-${{ hashFiles('config.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-ghcup-global-
+      - uses: actions/cache@v4
+        name: Cache ~/.local/bin
+        with:
+          path: ~/.local/bin
+          key: ${{ runner.os }}-local-global-${{ hashFiles('gtk2hsChs') }}
+          restore-keys: |
+            ${{ runner.os }}-local-global-
+
+      - uses: haskell-actions/setup@v2
+        #if: steps.ghcup.outputs.cache-hit != 'true'
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          enable-stack: true
+          stack-version: 'latest'
+      - run: stack config set install-ghc false --global && stack config set system-ghc true --global
+      - run: test -x ~/.local/bin/gtk2hsC2hs || stack install gtk2hs-buildtools
+      - run: sudo apt install -y libcairo2-dev libsdl2-dev libsdl2-image-dev
+
+      - run: stack test --fast
