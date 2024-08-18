@@ -23,7 +23,6 @@ import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as M
 import           Data.Maybe
 import qualified Data.Set as S
--- import qualified SDL.Video.Renderer as SDL
 
 -- import           System.CPUTime (getCPUTime)
 import qualified Data.StateVar as SV

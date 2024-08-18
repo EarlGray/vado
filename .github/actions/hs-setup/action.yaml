@@ -1,0 +1,58 @@
+name: Setup Haskell
+description: Setup Haskell
+
+runs:
+  using: "composite"
+  steps:
+      - name: Install system dependencies of ghc and vado
+        shell: bash
+        run: |
+          sudo apt install -y libncurses5 libtinfo5 libcairo2-dev libsdl2-dev libsdl2-image-dev
+
+      - uses: actions/cache@v4
+        name: Cache stack
+        env:
+          MANUAL_RESET: ${{ env.MANUAL_CACHE_RESET_STACK }}
+        with:
+          path: ~/.stack
+          key: ${{ runner.os }}-stack-global-${{ env.MANUAL_RESET }}-${{ hashFiles('config.yaml') }}
+          restore-keys: ${{ runner.os }}-stack-global-${{ env.MANUAL_RESET }}-
+      - uses: actions/cache@v4
+        id: ghcup
+        name: Cache ghcup
+        env:
+          MANUAL_RESET: ${{ env.MANUAL_CACHE_RESET_GHC }}
+        with:
+          path: ~/.ghcup
+          key: ${{ runner.os }}-ghcup-global-${{ env.MANUAL_RESET }}-${{ hashFiles('config.yaml') }}
+          restore-keys: ${{ runner.os }}-ghcup-global-${{ env.MANUAL_RESET }}-
+      - uses: actions/cache@v4
+        id: ghc
+        name: Cache ghc
+        env:
+          MANUAL_RESET: ${{ env.MANUAL_CACHE_RESET_GHC }}
+        with:
+          path: /usr/local/.ghcup
+          key: ${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-global-${{ env.MANUAL_RESET }}
+          restore-keys: ${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-global-${{ env.MANUAL_RESET }}
+      - uses: actions/cache@v4
+        name: Cache ~/.local/bin
+        env:
+          MANUAL_RESET: ${{ env.MANUAL_CACHE_RESET_BIN }}
+        with:
+          path: ~/.local/bin
+          key: ${{ runner.os }}-local-global-${{ env.MANUAL_RESET }}-${{ hashFiles('gtk2hsC2hs') }}
+          restore-keys: ${{ runner.os }}-local-global-${{ env.MANUAL_RESET }}-
+
+      - uses: haskell-actions/setup@v2
+        #if: steps.ghcup.outputs.cache-hit != 'true'
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          enable-stack: true
+          stack-version: 'latest'
+
+      - run: stack config set install-ghc false --global && stack config set system-ghc true --global
+        shell: bash
+
+      - run: test -x ~/.local/bin/gtk2hsC2hs || stack install gtk2hs-buildtools
+        shell: bash
