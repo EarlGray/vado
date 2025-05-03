@@ -35,6 +35,7 @@ library
     , base64-bytestring
     , bytestring
     , cairo
+    , cairo-canvas
     , containers
     , css-text
     , html-conduit

@@ -644,7 +644,7 @@ css properties = Style
           let Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases
           in Left (prop, color')
       Right (prop, CSS_Keyword color) | prop `elem` [CSSColor, CSSBackgroundColor] ->
-        let Right color' = cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases
+        let color' = Ei.fromRight (error $ "cssReadValue " ++ show color) $ cssReadValue $ fromMaybe color $ M.lookup color cssColorAliases
         in Right (prop, color')
       Right (CSSFontSize, pt@(CSS_Pt _)) ->
         Right (CSSFontSize, CSS_Px $ fromMaybe undefined $ cssLength pt)

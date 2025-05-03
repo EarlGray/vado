@@ -9,6 +9,7 @@
 module Vado.Layout where
 
 import           Control.Applicative
+import           Control.Monad (when, unless, forM_, forM)
 import           Control.Monad.RWS.Strict as RWS
 import qualified Data.Char as C
 import qualified Data.List as L
@@ -19,7 +20,7 @@ import qualified Data.Text as T
 
 import           Network.URI as URI
 import qualified Graphics.Rendering.Cairo as Cairo
-import qualified SDL.Cairo.Canvas as Canvas
+import qualified Graphics.Rendering.Cairo.Canvas as Canvas
 import qualified SDL.Video.Renderer as SDL
 import           SDL.Vect
 

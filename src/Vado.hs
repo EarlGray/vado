@@ -10,6 +10,7 @@ module Vado where
 
 import           Control.Applicative
 import qualified Control.Exception as Err
+import           Control.Monad
 import           Control.Monad.RWS.Strict as RWS
 import           Control.Monad.State (StateT (..))
 import qualified Control.Monad.State as St
@@ -35,7 +36,8 @@ import qualified Network.HTTP.Types.URI as URIh
 import           Network.URI as URI
 import qualified SDL
 import qualified SDL.Cairo as Cairo
-import qualified SDL.Cairo.Canvas as Canvas
+import qualified Graphics.Rendering.Cairo as Cairo
+import qualified Graphics.Rendering.Cairo.Canvas as Canvas
 import           SDL.Event as SDL
 import qualified SDL.Image as Image
 import           SDL.Vect
@@ -129,7 +131,7 @@ layoutPage page = do
   let VadoWindow {windowViewport = V2 w _, windowTexture = texture} = pageWindow page
   let params = LayoutParams {ltWidth = w}
   let body = elementRef doc (documentBody doc)
-  (boxes, _ctx) <- Canvas.withCanvas texture $ elementToBoxes ctx params noStyle body
+  (boxes, _ctx) <- Cairo.withCairoTexture' texture $ Canvas.runCanvas $ elementToBoxes ctx params noStyle body
   return page {pageBoxes = Just boxes}
 
 renderPage :: (MonadIO m) => Page -> m ()
@@ -144,7 +146,7 @@ renderPage page@Page {pageBoxes = Just body, pageDocument = doc, pageWindow = wi
         Just (CSS_RGB r g b) -> Canvas.rgb r g b
         _ -> Canvas.rgb 255 255 255
 
-  replaced <- Canvas.withCanvas texture $ do
+  replaced <- Cairo.withCairoTexture' texture $ Canvas.runCanvas $ do
     Canvas.background backgroundColor
     withStyling body (0, 0, noStyle) $ \st ->
       renderTree doc (minY, minY + vadoViewHeight page) (0, 0, st) body
@@ -511,7 +513,7 @@ withImageSurface (contentType, bs) action =
   if isJust (Image.format bs) then do
     result <- liftIO (Err.try (Image.decode bs) :: IO (Either Err.SomeException SDL.Surface))
     case result of
-      Right sfc -> Exc.liftIO $ action sfc
+      Right sfc -> liftIO $ action sfc
       Left e -> Exc.liftEither $ Left $ "Image.decode error: " ++ show e
   else Exc.liftEither $ Left $ "decodeResourceContent: an unknown image format: " ++ T.unpack contentType
 
