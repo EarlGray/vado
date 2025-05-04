@@ -206,7 +206,7 @@ navigatePage :: URI -> Page -> IO Page
 navigatePage = navigate Nothing
 
 webSearch :: String -> URI
-webSearch s = fromJust $ URI.parseAbsoluteURI $ "https://google.com/search?q=" ++ es
+webSearch s = fromJust $ URI.parseAbsoluteURI $ "https://html.duckduckgo.com/html?q=" ++ es
   where es = URI.escapeURIString URI.isAllowedInURI s
 
 --------------------------------------------------------------------------------
