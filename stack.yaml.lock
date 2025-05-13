@@ -33,16 +33,12 @@ packages:
   original:
     hackage: sdl2-cairo-0.2
 - completed:
-    name: cairo-canvas
+    hackage: cairo-canvas-0.1.0.1@sha256:d49ca5ccd33795b3b48e89451d3f3fd901aecd736aa1479694a71d396b1ca841,1812
     pantry-tree:
-      sha256: db129723448ac00d65ad22858eaa88acc8c3c3f1e2b87154ee8f1f5bc878924a
-      size: 796
-    sha256: 52bf238bcee2efe8271e0bea6991944d25ab497fed7160bab8ef7e105ad53e8a
-    size: 14422
-    url: https://github.com/EarlGray/cairo-canvas/archive/8e031fd5682c5c5d3e7310a4e3ac49f60f193982.tar.gz
-    version: 0.1.0.1
+      sha256: b5508a16c629bdd1328db68fc651c389630cb58ef47e36a96d169806786e887c
+      size: 292
   original:
-    url: https://github.com/EarlGray/cairo-canvas/archive/8e031fd5682c5c5d3e7310a4e3ac49f60f193982.tar.gz
+    hackage: cairo-canvas-0.1.0.1
 snapshots:
 - completed:
     sha256: 238fa745b64f91184f9aa518fe04bdde6552533d169b0da5256670df83a0f1a9
